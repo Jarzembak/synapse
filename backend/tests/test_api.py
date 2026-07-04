@@ -255,6 +255,79 @@ def test_quickref_concept_kind(client):
     assert hit["updated"] is not None
 
 
+def test_tag_project_propagates_and_caches(client, monkeypatch):
+    """Project-level tagging: one LLM call from the richest doc, propagated to
+    all project artifacts (metadata artifacts inherit rather than re-tag)."""
+    from app.tasks.generate import tag_project
+    from app import llm
+    from app.models import Artifact
+
+    with get_session() as session:
+        project = Project(slug="tagdemo", title="Tag demo", source="x", source_type="url")
+        session.add(project)
+        session.commit()
+        session.refresh(project)
+        pid = project.id
+        t = library.write_artifact(
+            session, project_id=pid, project_slug="tagdemo", type="transcript",
+            title="Transcript — Tag demo", body="[00:00:01] all about wireguard tunnels",
+        )
+        v = library.write_artifact(
+            session, project_id=pid, project_slug="tagdemo", type="source_video",
+            title="Source video — Tag demo", body="Archived video download.",
+        )
+        tid, vid = t.id, v.id
+
+    calls = []
+    # "Wireguard"/"wireguard" slugify identically — regression for the
+    # IntegrityError this used to raise on the artifacttag primary key
+    monkeypatch.setattr(llm, "complete_json",
+                        lambda *a, **k: (calls.append(1) or
+                                         {"tags": ["Wireguard", "wireguard", "networking"]}))
+    tag_project(pid)
+    assert len(calls) == 1
+
+    with get_session() as session:
+        assert library.current_tags(session, tid) == ["networking", "wireguard"]
+        # metadata artifact inherited the same set, no independent LLM call
+        assert library.current_tags(session, vid) == ["networking", "wireguard"]
+
+    # second run: cached marker → no new LLM call, tags intact
+    monkeypatch.setattr(llm, "complete_json",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not re-call LLM")))
+    tag_project(pid)
+    with get_session() as session:
+        assert library.current_tags(session, vid) == ["networking", "wireguard"]
+
+    # manual edits survive later propagations
+    with get_session() as session:
+        art = session.get(Artifact, vid)
+        library.apply_tags(session, art, ["my-custom-tag"])
+    tag_project(pid)
+    with get_session() as session:
+        assert library.current_tags(session, vid) == ["my-custom-tag"]
+        assert library.current_tags(session, tid) == ["networking", "wireguard"]
+
+
+def test_logging_and_tail_endpoint(client):
+    """Central logging writes a rotating file per service; /api/logs tails it."""
+    import logging
+
+    logging.getLogger("synapse.test").info("hello from the test suite")
+    for h in logging.getLogger().handlers:
+        h.flush()
+
+    listed = client.get("/api/logs").json()
+    assert listed["file_logging"] is True
+    assert "test" in listed["services"]
+
+    tail = client.get("/api/logs/test?lines=50").json()
+    assert any("hello from the test suite" in line for line in tail["lines"])
+
+    assert client.get("/api/logs/nosuchservice").status_code == 404
+    assert client.get("/api/logs/..%2Fetc").status_code in (400, 404)
+
+
 def test_model_override(client):
     r = client.put("/api/settings/models/summarize",
                    json={"provider": "anthropic", "model": "claude-haiku-4-5"})

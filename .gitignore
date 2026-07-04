@@ -6,5 +6,6 @@ __pycache__/
 backend/tests/_lib/
 backend/tests/_media/
 backend/tests/_db/
+backend/tests/_logs/
 node_modules/
 frontend/dist/

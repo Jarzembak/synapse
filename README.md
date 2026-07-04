@@ -29,6 +29,7 @@ without touching code.
 - [Configuring models](#configuring-models)
 - [Local files, cookies, and remote GPUs](#local-files-cookies-and-remote-gpus)
 - [Development](#development)
+- [Logging](#logging)
 - [Troubleshooting](#troubleshooting)
 - [Current limitations](#current-limitations)
 
@@ -71,10 +72,15 @@ model and regenerate just that step):
 12. **Trim audio** — takes the original source audio, has an LLM identify off-topic spans from the timestamped transcript (intro chatter, sponsor reads, subscribe requests, tangents — conservatively, keeping anything it's unsure about), cuts those spans out with ffmpeg, and removes silence.
 13. **Mind map** — an LLM turns the merged deep dive into a topic graph (concepts, tools, techniques, technologies as nodes, with labeled relationships), rendered as a clickable, pannable diagram; clicking a node shows its description and links straight to its quick-reference doc if one exists.
 
-Every artifact written by any step is also passed through **auto-tagging**: an
-LLM proposes tags from a shared, editable vocabulary (only inventing a new tag
-when nothing existing fits), so tags stay consistent across your whole library
-instead of drifting into synonyms.
+Every artifact is also **auto-tagged** from a shared, editable vocabulary.
+Tagging is project-level: one LLM call reads the project's richest document
+(the merged deep dive once it exists, else the corrected/raw transcript) and
+the resulting tag set is propagated to *all* of that project's artifacts —
+so metadata-only artifacts like the archived video or the podcast MP3 inherit
+accurate tags instead of being guessed at from their (nearly empty) own
+content. The set is recomputed automatically when a richer document appears.
+Quick-reference docs are the exception: they're cross-project and are tagged
+individually from their own content.
 
 ## Quick start
 
@@ -360,6 +366,25 @@ step assigned to the `ollama` provider then runs there — no code changes,
 just point Settings at bigger model names (e.g. `qwen3:30b-a3b-instruct`)
 once they're pulled on that box.
 
+**Local NVIDIA GPU:** if the machine running Docker has an NVIDIA GPU, start
+the stack with the GPU overlay instead:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.gpu.yml up --build
+```
+
+This grants the `ollama` and `worker` containers GPU access (requires the
+NVIDIA Container Toolkit — bundled with Docker Desktop on Windows when an
+NVIDIA driver is present) and builds the worker with the CUDA libraries
+faster-whisper needs. Ollama then uses the GPU automatically for every
+`ollama`-assigned step; Whisper transcription is controlled from
+**Settings → Advanced → Compute** (device `auto`/`cpu`/`cuda` and compute
+type — `float16` for best GPU quality, `int8` for CPU). The default `auto`
+settings are safe either way: they use the GPU when it's available and fall
+back to CPU when it isn't. Note that consumer GPUs around 8 GB VRAM speed up
+the *same-size* local models dramatically but don't unlock meaningfully
+bigger ones — 7–8B-class quantized models remain the practical ceiling.
+
 ## Development
 
 Backend tests (pure Python, no Docker needed):
@@ -385,6 +410,23 @@ Wiping all data (library, media, database, Ollama/Whisper model caches) to
 start fresh: `docker compose down -v` (destructive — confirm you want to lose
 the library before running this).
 
+## Logging
+
+Both backend services write structured, timestamped logs to two places at
+once: container stdout (visible via `docker compose logs api` /
+`docker compose logs worker`) and rotating log files on a shared volume —
+`data/logs/synapse-api.log` and `data/logs/synapse-worker.log` (5 MB × 3
+rotations each). Every pipeline step logs its start/completion/failure, LLM
+calls log at debug level, and previously-silent background failures (cloud
+sync enqueueing, auto-tagging, caption fetch fallback) now leave a warning
+trace instead of vanishing.
+
+- **Log level**: set `LOG_LEVEL=DEBUG` (or WARNING/ERROR) in `.env` and
+  restart; default is INFO.
+- **Without docker CLI**: `GET /api/logs` lists services with log files, and
+  `GET /api/logs/worker?lines=200` tails one — handy for a quick look from
+  any browser on the network (`http://localhost:8080/api/logs/worker`).
+
 ## Troubleshooting
 
 - **A step fails immediately with "missing prerequisite artifact"** — steps depend on earlier ones (e.g. the merge step needs both deep dives). Run the pipeline board top to bottom.
@@ -402,10 +444,11 @@ the library before running this).
   placeholder for that later addition.
 - No authentication — this is designed to run on a trusted local network for a
   single user, not to be exposed to the internet.
-- No GPU passthrough is configured in `docker-compose.yml` (matching the
-  CPU-only hardware this was built for); if you later add a GPU, faster
-  local ASR (Parakeet) and better local dialogue TTS (Dia2/VibeVoice) become
-  worth adding.
+- GPU support covers Ollama and faster-whisper via the
+  `docker-compose.gpu.yml` overlay; Kokoro TTS still runs CPU-only (it's
+  faster than realtime there anyway). With a GPU present, faster local ASR
+  (Parakeet) and better local dialogue TTS (Dia2/VibeVoice) become worth
+  adding as future options.
 - Cloud sync only pushes — there's no pull/bidirectional sync, and no
   scheduled sync (auto-upload-per-artifact or the manual "sync now" button
   are the only triggers). The backend image's rclone package (Debian's

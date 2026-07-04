@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import functools
+import logging
 import traceback
 
 from sqlmodel import Session, select
@@ -9,6 +10,8 @@ from sqlmodel import Session, select
 from ..db import get_session
 from ..models import Artifact, Job, Project, utcnow
 from .. import library
+
+log = logging.getLogger("synapse.pipeline")
 
 
 def set_job(session: Session, job_id: int, **fields) -> None:
@@ -32,14 +35,17 @@ def pipeline_task(fn):
 
     @functools.wraps(fn)
     def wrapper(job_id: int, project_id: int, *args, **kwargs):
+        log.info("step %s starting (job=%s project=%s)", fn.__name__, job_id, project_id)
         with get_session() as session:
             set_job(session, job_id, status="running")
         try:
             result = fn(job_id, project_id, *args, **kwargs)
             with get_session() as session:
                 set_job(session, job_id, status="done", progress="complete")
+            log.info("step %s done (job=%s project=%s)", fn.__name__, job_id, project_id)
             return result
         except Exception as e:  # surface the real error to the UI
+            log.exception("step %s failed (job=%s project=%s)", fn.__name__, job_id, project_id)
             with get_session() as session:
                 set_job(
                     session, job_id, status="error",
@@ -78,8 +84,19 @@ def best_transcript(session: Session, project_id: int) -> str:
         return artifact_body(session, project_id, "transcript")
 
 
-def auto_tag(project_id: int, artifact_id: int) -> None:
-    """Fire-and-forget tagging of a freshly written artifact."""
-    from .generate import tag_task
+def auto_tag(project_id: int | None, artifact_id: int) -> None:
+    """Fire-and-forget tagging of a freshly written artifact.
 
-    tag_task.delay(artifact_id)
+    Quick-ref docs are tagged individually from their own content; everything
+    else triggers project-level tagging (one canonical set derived from the
+    project's richest document, propagated to all of its artifacts — see
+    generate.tag_project).
+    """
+    from .generate import tag_project, tag_task
+
+    with get_session() as session:
+        art = session.get(Artifact, artifact_id)
+    if art and art.type.startswith("quickref_"):
+        tag_task.delay(artifact_id)
+    elif project_id:
+        tag_project.delay(project_id)

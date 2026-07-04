@@ -74,7 +74,11 @@ def fetch_site_captions(url: str, project_slug: str) -> str | None:
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             ydl.download([url])
-    except Exception:
+    except Exception as e:
+        import logging
+
+        logging.getLogger(__name__).info(
+            "no site captions for %s (falling back to ASR): %s", url, e)
         return None
     vtts = sorted(wd.glob("captions*.vtt"))
     if not vtts:
@@ -88,9 +92,25 @@ def whisper_transcribe(audio: Path, on_progress) -> str:
 
     from ..config import advanced
 
+    import logging
+
+    log = logging.getLogger(__name__)
     asr = advanced("asr")
+    compute = advanced("compute")
+    device = compute.get("whisper_device") or "auto"
+    compute_type = compute.get("whisper_compute_type") or "auto"
+    if device == "cpu" and compute_type in ("float16", "int8_float16"):
+        compute_type = "int8"  # float16 kernels are GPU-only
     _, model_name = llm.resolve_model("asr")
-    model = WhisperModel(model_name, device="cpu", compute_type="int8")
+    on_progress(f"loading whisper {model_name} (device={device}, compute={compute_type})")
+    try:
+        model = WhisperModel(model_name, device=device, compute_type=compute_type)
+    except (ValueError, RuntimeError) as e:
+        # e.g. float16 requested but resolved device is CPU, or CUDA missing
+        log.warning("whisper load failed with device=%s compute=%s (%s); "
+                    "falling back to cpu/int8", device, compute_type, e)
+        on_progress("whisper falling back to cpu/int8")
+        model = WhisperModel(model_name, device="cpu", compute_type="int8")
     segments, info = model.transcribe(
         str(audio),
         vad_filter=bool(asr.get("vad", True)),
@@ -141,7 +161,7 @@ def transcribe(job_id: int, project_id: int):
             body = gemini_transcribe(audio)
             source = "gemini-asr"
         else:
-            progress(job_id, "transcribing with faster-whisper (CPU)")
+            progress(job_id, "transcribing with faster-whisper")
             body = whisper_transcribe(audio, lambda msg: progress(job_id, msg))
             source = "faster-whisper"
 

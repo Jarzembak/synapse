@@ -68,6 +68,13 @@ ADVANCED_DEFAULTS: dict[str, dict] = {
         "vad": True,             # voice-activity-detection filter
         "language": "",          # language hint; "" = auto-detect
     },
+    "compute": {
+        # faster-whisper device: "auto" picks CUDA when available, else CPU.
+        # GPU use additionally requires the docker-compose.gpu.yml overlay
+        # (NVIDIA runtime + CUDA libraries in the worker image).
+        "whisper_device": "auto",        # auto | cpu | cuda
+        "whisper_compute_type": "auto",  # auto | int8 | int8_float16 | float16
+    },
 }
 
 

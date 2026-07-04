@@ -317,6 +317,10 @@ def rename_tag(tag_id: int, req: TagRename):
             art = session.get(Artifact, aid)
             if art:
                 library.apply_tags(session, art, library.current_tags(session, aid))
+    # cached project tag sets may hold the old name — recompute on next run
+    from ..settings_store import delete_settings_prefix
+
+    delete_settings_prefix("projtags.")
     return {"ok": True}
 
 
@@ -329,4 +333,8 @@ def delete_tag(tag_id: int):
         session.exec(text("DELETE FROM artifacttag WHERE tag_id = :id").bindparams(id=tag_id))
         session.delete(tag)
         session.commit()
+    # cached project tag sets may resurrect the deleted tag — invalidate them
+    from ..settings_store import delete_settings_prefix
+
+    delete_settings_prefix("projtags.")
     return {"ok": True}

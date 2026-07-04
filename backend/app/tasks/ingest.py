@@ -9,7 +9,7 @@ from ..db import get_session
 from .. import library
 from ..settings_store import get_setting
 from .celery_app import celery
-from .common import get_project, pipeline_task, progress
+from .common import auto_tag, get_project, pipeline_task, progress
 from . import media
 
 
@@ -160,7 +160,7 @@ def download(job_id: int, project_id: int):
                 "max_height_setting": max_height,
             },
         )
-        library.write_artifact(
+        art = library.write_artifact(
             session,
             project_id=project_id,
             project_slug=project.slug,
@@ -171,3 +171,4 @@ def download(job_id: int, project_id: int):
             media_rel=f"media:{project.slug}/{audio.name}",
             extra_meta={**source_meta, "filesize_bytes": audio.stat().st_size},
         )
+        auto_tag(project_id, art.id)  # inherits the project's canonical tag set

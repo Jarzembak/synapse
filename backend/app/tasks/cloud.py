@@ -16,9 +16,12 @@ For the OAuth providers the user pastes the token JSON produced by running
 from __future__ import annotations
 
 import json
+import logging
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
+
+log = logging.getLogger("synapse.cloud")
 
 from ..config import settings
 from ..db import get_session
@@ -134,8 +137,10 @@ def sync_paths(paths: list[str]):
             if src.exists():
                 _rclone(["copyto", str(src), dest])
         _record("ok", f"synced {len(paths)} file(s)")
+        log.info("cloud sync: uploaded %d file(s)", len(paths))
     except Exception as e:
         _record("error", str(e)[:500])
+        log.error("cloud sync failed for %s: %s", paths, e)
         raise
 
 

@@ -5,11 +5,15 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from sqlmodel import select
 
-from .config import SEED_TAGS, settings
-from .db import get_session, init_db
-from .models import Tag
-from .routers import artifacts, jobs, projects, quickrefs
-from .routers.settings import router as settings_router, tags_router
+from .logging_setup import setup_logging
+
+setup_logging()
+
+from .config import SEED_TAGS, settings  # noqa: E402
+from .db import get_session, init_db  # noqa: E402
+from .models import Tag  # noqa: E402
+from .routers import artifacts, jobs, logs, projects, quickrefs  # noqa: E402
+from .routers.settings import router as settings_router, tags_router  # noqa: E402
 
 
 @asynccontextmanager
@@ -32,6 +36,7 @@ app.include_router(artifacts.router)
 app.include_router(quickrefs.router)
 app.include_router(settings_router)
 app.include_router(tags_router)
+app.include_router(logs.router)
 
 
 @app.get("/api/health")

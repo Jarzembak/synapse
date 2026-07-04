@@ -9,10 +9,14 @@ services:
       - LIBRARY_DIR=/data/library
       - MEDIA_DIR=/data/media
       - DB_PATH=/data/db/vst.sqlite3
+      - LOG_DIR=/data/logs
+      - LOG_NAME=api
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
     volumes:
       - ./data/library:/data/library
       - ./data/media:/data/media
       - ./data/db:/data/db
+      - ./data/logs:/data/logs
       - ${HOST_MEDIA_DIR:-./data/media}:/host-media:ro
     depends_on:
       - redis
@@ -28,10 +32,14 @@ services:
       - LIBRARY_DIR=/data/library
       - MEDIA_DIR=/data/media
       - DB_PATH=/data/db/vst.sqlite3
+      - LOG_DIR=/data/logs
+      - LOG_NAME=worker
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
     volumes:
       - ./data/library:/data/library
       - ./data/media:/data/media
       - ./data/db:/data/db
+      - ./data/logs:/data/logs
       - whisper-models:/root/.cache/huggingface
       - ${HOST_MEDIA_DIR:-./data/media}:/host-media:ro
     depends_on:

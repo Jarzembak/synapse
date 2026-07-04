@@ -10,10 +10,13 @@ the output parses, since local models are fence-happy.
 from __future__ import annotations
 
 import json
+import logging
 import re
 
 from .config import FUNCTION_DEFAULTS, settings
 from .settings_store import get_setting
+
+log = logging.getLogger("synapse.llm")
 
 MAX_TOKENS = 16384
 
@@ -49,6 +52,8 @@ def complete(
     if max_tokens is None:
         max_tokens = cfg_max
 
+    log.debug("completing %s via %s/%s (max_tokens=%s, temperature=%s)",
+              function, provider, model, max_tokens, temperature)
     if provider == "ollama":
         return _ollama(system, user, model, max_tokens, temperature)
     if provider == "anthropic":
@@ -67,6 +72,7 @@ def complete_json(function: str, system: str, user: str, *, retries: int = 2, **
             return json.loads(_strip_fences(raw))
         except json.JSONDecodeError as e:
             last_err = e
+            log.warning("%s produced invalid JSON (retrying): %s", function, e)
             user = user + "\n\nYour previous reply was not valid JSON. JSON only."
     raise ValueError(f"{function}: model never produced valid JSON: {last_err}")
 

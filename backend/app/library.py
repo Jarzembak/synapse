@@ -157,6 +157,8 @@ def write_artifact(
 
 def _queue_cloud_sync(artifact: Artifact) -> None:
     """Best-effort: when cloud auto-sync is on, upload this artifact's files."""
+    import logging
+
     from .settings_store import get_setting
 
     if not get_setting("cloud.auto"):
@@ -168,8 +170,10 @@ def _queue_cloud_sync(artifact: Artifact) -> None:
 
         paths = [artifact.path] + ([artifact.media_path] if artifact.media_path else [])
         celery.send_task("cloud_sync_paths", args=[paths])
-    except Exception:
-        pass  # a broker hiccup must never fail an artifact write
+    except Exception as e:
+        # a broker hiccup must never fail an artifact write — but leave a trace
+        logging.getLogger(__name__).warning(
+            "could not queue cloud sync for %s: %s", artifact.path, e)
 
 
 def current_tags(session: Session, artifact_id: int | None) -> list[str]:
@@ -184,22 +188,31 @@ def current_tags(session: Session, artifact_id: int | None) -> list[str]:
 
 
 def apply_tags(session: Session, artifact: Artifact, names: list[str]) -> None:
-    """Replace an artifact's tags and rewrite its frontmatter tag list."""
+    """Replace an artifact's tags and rewrite its frontmatter tag list.
+
+    Defensive on two fronts: LLM tag lists may contain names that slugify to
+    the same tag ("Docker"/"docker"), and mid-loop autoflushes can persist a
+    pending pair before the batch commits — both used to raise IntegrityError
+    on the (artifact_id, tag_id) primary key.
+    """
     session.exec(
         text("DELETE FROM artifacttag WHERE artifact_id = :id").bindparams(id=artifact.id)
     )
-    clean = []
+    clean: list[str] = []
+    seen: set[str] = set()
     for name in names:
         norm = make_slug(name)
-        if not norm:
+        if not norm or norm in seen:
             continue
+        seen.add(norm)
         tag = session.exec(select(Tag).where(Tag.name == norm)).first()
         if not tag:
             tag = Tag(name=norm, kind="topic")
             session.add(tag)
             session.commit()
             session.refresh(tag)
-        session.add(ArtifactTag(artifact_id=artifact.id, tag_id=tag.id))
+        if session.get(ArtifactTag, (artifact.id, tag.id)) is None:
+            session.add(ArtifactTag(artifact_id=artifact.id, tag_id=tag.id))
         clean.append(norm)
     session.commit()
 

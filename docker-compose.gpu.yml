@@ -1,0 +1,34 @@
+# GPU overlay: NVIDIA acceleration for local models (Ollama + faster-whisper).
+#
+# Requires the NVIDIA Container Toolkit on the host (bundled with Docker
+# Desktop on Windows when an NVIDIA driver is installed; on Linux install
+# nvidia-container-toolkit). Then run:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up --build
+#
+# Ollama uses the GPU automatically once it can see one. faster-whisper is
+# controlled by Settings → Advanced → Compute (whisper_device: auto/cpu/cuda);
+# the worker image is built with GPU=1 here so the CUDA libraries it needs are
+# present.
+services:
+  worker:
+    build:
+      context: ./backend
+      args:
+        GPU: "1"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  ollama:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

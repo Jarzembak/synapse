@@ -385,6 +385,39 @@ export default function Settings() {
       </details>
 
       <details className="advanced">
+        <summary>Compute <small>— GPU vs CPU for local models</small></summary>
+        {adv.compute && (
+          <div className="knobs">
+            <label>Whisper device
+              <select value={adv.compute.whisper_device}
+                onChange={(e) => setAdvValue("compute", "whisper_device", e.target.value)}>
+                <option value="auto">auto (GPU if available)</option>
+                <option value="cpu">cpu</option>
+                <option value="cuda">cuda</option>
+              </select>
+            </label>
+            <label>Whisper compute type
+              <select value={adv.compute.whisper_compute_type}
+                onChange={(e) => setAdvValue("compute", "whisper_compute_type", e.target.value)}>
+                <option value="auto">auto</option>
+                <option value="int8">int8 (CPU / lowest memory)</option>
+                <option value="int8_float16">int8_float16 (GPU)</option>
+                <option value="float16">float16 (GPU / best quality)</option>
+              </select>
+            </label>
+            <p className="meta">
+              GPU use requires starting the stack with the GPU overlay:&nbsp;
+              <code>docker compose -f docker-compose.yml -f docker-compose.gpu.yml up --build</code>.
+              That overlay also gives the Ollama container GPU access — Ollama
+              uses it automatically for every step assigned to the ollama provider.
+              Without the overlay, "auto" safely falls back to CPU.
+            </p>
+            <button onClick={() => saveAdvanced("compute")}>Save compute settings</button>
+          </div>
+        )}
+      </details>
+
+      <details className="advanced">
         <summary>Cloud storage <small>— sync artifacts to S3 / Nextcloud / Drive / Dropbox / OneDrive</small></summary>
         {cloud && (
           <div className="knobs">

@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from celery import Celery
 
-from ..config import settings
+from ..logging_setup import setup_logging
+
+setup_logging()
+
+from ..config import settings  # noqa: E402
 
 celery = Celery("vst", broker=settings.redis_url, backend=settings.redis_url)
 celery.conf.task_track_started = True

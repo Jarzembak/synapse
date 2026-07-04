@@ -13,7 +13,7 @@ from ..db import get_session
 from .. import library, llm
 from ..settings_store import get_setting
 from .celery_app import celery
-from .common import artifact_body, get_project, pipeline_task, progress
+from .common import artifact_body, auto_tag, get_project, pipeline_task, progress
 from .ingest import source_audio
 from .prompts import get_prompt
 from . import media
@@ -257,7 +257,7 @@ def _store_audio(project_id: int, slug: str, title: str, produced: Path, *,
     dest.write_bytes(produced.read_bytes())
 
     with get_session() as session:
-        library.write_artifact(
+        art = library.write_artifact(
             session,
             project_id=project_id,
             project_slug=slug,
@@ -269,3 +269,4 @@ def _store_audio(project_id: int, slug: str, title: str, produced: Path, *,
             model=model,
             extra_meta={"duration_seconds": media.duration_seconds(dest), **(extra or {})},
         )
+        auto_tag(project_id, art.id)  # inherits the project's canonical tag set

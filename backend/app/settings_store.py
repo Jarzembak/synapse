@@ -40,3 +40,17 @@ def all_settings() -> dict:
     with get_session() as session:
         rows = session.exec(select(Setting)).all()
         return {r.key: json.loads(r.value) for r in rows if r.value}
+
+
+def delete_settings_prefix(prefix: str) -> None:
+    """Remove every setting whose key starts with prefix (e.g. cached project
+    tag markers when the tag vocabulary changes)."""
+    from sqlmodel import text
+
+    from .db import get_session
+
+    with get_session() as session:
+        session.exec(
+            text("DELETE FROM setting WHERE key LIKE :p").bindparams(p=prefix + "%")
+        )
+        session.commit()

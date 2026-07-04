@@ -165,4 +165,7 @@ def delete_project(project_id: int):
                      .bindparams(id=project_id))
         session.delete(project)
         session.commit()
+    from ..settings_store import set_setting
+
+    set_setting(f"projtags.{project_id}", None)  # drop the cached tag marker
     return {"ok": True}

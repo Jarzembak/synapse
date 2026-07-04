@@ -3,8 +3,11 @@ mind map, tagging."""
 from __future__ import annotations
 
 import json
+import logging
 
 from sqlmodel import select
+
+log = logging.getLogger(__name__)
 
 from ..db import get_session
 from .. import library, llm, tagging
@@ -194,6 +197,8 @@ def mindmap(job_id: int, project_id: int):
 
 @celery.task(name="tag_artifact")
 def tag_task(artifact_id: int):
+    """Individual tagging — used for quick-ref docs only (their content is
+    their own; project artifacts are tagged via tag_project)."""
     with get_session() as session:
         art = session.get(Artifact, artifact_id)
         if not art:
@@ -203,4 +208,69 @@ def tag_task(artifact_id: int):
             tagging.tag_artifact(session, art, body)
         except Exception:
             # tagging is best-effort; never fail the pipeline over it
-            pass
+            log.warning("tagging failed for artifact %s (%s)",
+                        artifact_id, art.title, exc_info=True)
+
+
+# Richest-first ranking of documents a project's canonical tag set derives from.
+TAG_SOURCE_RANK = ["deepdive_merged", "corrected", "transcript", "summary"]
+
+
+@celery.task(name="tag_project")
+def tag_project(project_id: int):
+    """Project-level tagging: one LLM call over the richest document the
+    project has, propagated to ALL its artifacts (quick-refs excluded).
+
+    Metadata-only artifacts (source video/audio, podcast/trimmed audio, mind
+    map) have near-empty bodies and used to pick up unrelated tags when tagged
+    independently — they now inherit this canonical set instead. The result is
+    cached (keyed on the source doc's type + updated stamp) so repeated
+    pipeline steps propagate without re-running the LLM.
+    """
+    from ..settings_store import get_setting, set_setting
+
+    try:
+        with get_session() as session:
+            arts = session.exec(
+                select(Artifact).where(Artifact.project_id == project_id)
+            ).all()
+            by_type = {a.type: a for a in arts}
+            source = next(
+                (by_type[t] for t in TAG_SOURCE_RANK if t in by_type), None
+            )
+            if source is None:
+                return  # nothing substantive to tag from yet
+
+            marker_key = f"projtags.{project_id}"
+            marker = get_setting(marker_key) or {}
+            prev_slugs = marker.get("slugs")  # canonical set last propagated
+            fresh = (marker.get("source_type") == source.type
+                     and marker.get("updated") == source.updated.isoformat())
+            if fresh:
+                tags = marker.get("tags", [])
+            else:
+                _, body = library.read_doc(source.path)
+                tags = tagging.tag_text(session, source.title, source.type, body)
+            slugs = sorted({library.make_slug(t) for t in tags if library.make_slug(t)})
+            set_setting(marker_key, {
+                "source_type": source.type,
+                "updated": source.updated.isoformat(),
+                "tags": tags,
+                "slugs": slugs,
+            })
+
+            for art in arts:
+                if art.type.startswith("quickref_"):
+                    continue  # cross-project docs keep their own tags
+                current = library.current_tags(session, art.id)
+                if current and prev_slugs is not None and current != prev_slugs:
+                    continue  # user curated this artifact's tags by hand — keep them
+                try:
+                    library.apply_tags(session, art, tags)
+                except Exception:
+                    session.rollback()  # one bad artifact must not stop the rest
+                    log.warning("tag propagation failed for artifact %s (%s)",
+                                art.id, art.title, exc_info=True)
+    except Exception:
+        # tagging is best-effort; never fail the pipeline over it
+        log.warning("project tagging failed for project %s", project_id, exc_info=True)
