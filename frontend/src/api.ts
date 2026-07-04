@@ -68,4 +68,6 @@ export const TYPE_LABELS: Record<string, string> = {
   mindmap: "Mind map",
   quickref_tool: "Quick-ref: tool",
   quickref_technique: "Quick-ref: technique",
+  source_video: "Source video",
+  source_audio: "Source audio",
 };

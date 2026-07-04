@@ -28,12 +28,23 @@ from .models import Artifact, Tag, ArtifactTag, utcnow
 ARTIFACT_TYPES = [
     "transcript", "corrected", "summary", "deepdive_claude", "deepdive_gemini",
     "deepdive_merged", "podcast_script", "podcast_audio", "trimmed_audio",
-    "mindmap", "quickref_tool", "quickref_technique",
+    "mindmap", "quickref_tool", "quickref_technique", "source_video", "source_audio",
 ]
 
 
 def lib_path(rel: str) -> Path:
     return settings.library_dir / rel
+
+
+def resolve_media_path(media_path: str) -> Path:
+    """Locate an artifact's binary payload.
+
+    Values prefixed 'media:' live in MEDIA_DIR (large archived source files);
+    unprefixed values are library-relative (podcast/trimmed audio).
+    """
+    if media_path.startswith("media:"):
+        return settings.media_dir / media_path.removeprefix("media:")
+    return lib_path(media_path)
 
 
 def make_slug(name: str) -> str:

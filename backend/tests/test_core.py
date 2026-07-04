@@ -14,7 +14,9 @@ os.environ.setdefault("DB_PATH", str(Path(__file__).parent / "_db" / "test.sqlit
 
 from app.tasks.transcribe import parse_vtt, ts  # noqa: E402
 from app.tasks.audio import hms_to_s, keep_spans, parse_script  # noqa: E402
+from app.tasks.ingest import video_format_string  # noqa: E402
 from app.llm import chunk_text, _strip_fences  # noqa: E402
+from app.routers.artifacts import media_mime  # noqa: E402
 from app import library  # noqa: E402
 
 
@@ -107,3 +109,23 @@ def test_snapshot_history(tmp_path, monkeypatch):
 def test_make_slug():
     assert library.make_slug("Nmap NSE!") == "nmap-nse"
     assert library.make_slug("") == "untitled"
+
+
+def test_video_format_string():
+    assert video_format_string(1080) == \
+        "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best"
+    assert video_format_string(0) == "bestvideo+bestaudio/best"
+
+
+def test_resolve_media_path():
+    lib = library.resolve_media_path("projects/demo/podcast_audio.mp3")
+    assert lib == library.settings.library_dir / "projects/demo/podcast_audio.mp3"
+    med = library.resolve_media_path("media:demo/source_video.mp4")
+    assert med == library.settings.media_dir / "demo/source_video.mp4"
+
+
+def test_media_mime():
+    assert media_mime("source_video.mp4") == "video/mp4"
+    assert media_mime("source_audio.m4a") == "audio/mp4"
+    assert media_mime("podcast_audio.mp3") == "audio/mpeg"
+    assert media_mime("weird.xyz") == "application/octet-stream"

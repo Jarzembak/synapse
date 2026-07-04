@@ -63,16 +63,21 @@ export default function ProjectDetail() {
       <div className="board">
         {steps.map((s) => {
           const status = s.job?.status ?? (s.artifact ? "done" : "—");
+          const notApplicable = s.name === "download" && project.source_type === "local";
           return (
             <div key={s.name} className={`step ${status}`}>
               <div className="step-head">
                 <strong>{s.label}</strong>
-                <button
-                  onClick={() => run(s.name)}
-                  disabled={status === "running" || status === "queued"}
-                >
-                  {s.artifact || s.job ? "re-run" : "run"}
-                </button>
+                {notApplicable ? (
+                  <span className="meta">already local</span>
+                ) : (
+                  <button
+                    onClick={() => run(s.name)}
+                    disabled={status === "running" || status === "queued"}
+                  >
+                    {s.artifact || s.job ? "re-run" : "run"}
+                  </button>
+                )}
               </div>
               <div className="step-status">
                 {status}

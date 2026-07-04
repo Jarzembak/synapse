@@ -11,6 +11,18 @@ from .. import library
 
 router = APIRouter(prefix="/api", tags=["artifacts"])
 
+MIME_BY_EXT = {
+    ".mp4": "video/mp4", ".webm": "video/webm", ".mkv": "video/x-matroska",
+    ".m4a": "audio/mp4", ".mp3": "audio/mpeg", ".wav": "audio/wav",
+    ".flac": "audio/flac", ".ogg": "audio/ogg", ".opus": "audio/opus",
+}
+
+
+def media_mime(filename: str) -> str:
+    from pathlib import PurePath
+
+    return MIME_BY_EXT.get(PurePath(filename).suffix.lower(), "application/octet-stream")
+
 
 @router.get("/artifacts/{artifact_id}")
 def get_artifact(artifact_id: int):
@@ -91,7 +103,7 @@ def get_media(artifact_id: int):
         art = session.get(Artifact, artifact_id)
         if not art or not art.media_path:
             raise HTTPException(404)
-        path = library.lib_path(art.media_path)
+        path = library.resolve_media_path(art.media_path)
         if not path.exists():
             raise HTTPException(410)
-        return FileResponse(path, media_type="audio/mpeg", filename=path.name)
+        return FileResponse(path, media_type=media_mime(path.name), filename=path.name)

@@ -75,7 +75,17 @@ export default function ArtifactView() {
       </header>
 
       {d.artifact.media_path && (
-        <audio controls src={`/api/media/${d.artifact.id}`} style={{ width: "100%" }} />
+        <>
+          {d.artifact.type === "source_video" ? (
+            <video controls src={`/api/media/${d.artifact.id}`}
+                   style={{ width: "100%", maxHeight: "70vh", background: "#000" }} />
+          ) : (
+            <audio controls src={`/api/media/${d.artifact.id}`} style={{ width: "100%" }} />
+          )}
+          <p>
+            <a href={`/api/media/${d.artifact.id}`} download>⬇ download file</a>
+          </p>
+        </>
       )}
 
       {graph ? (

@@ -43,23 +43,24 @@ call never blocks the UI.
 
 ### The pipeline
 
-A "project" is one video/audio source. Its pipeline is twelve independent
+A "project" is one video/audio source. Its pipeline is thirteen independent
 steps, run in order from the project's pipeline board — each writes an
 artifact you can open immediately, and each can be re-run on its own (e.g. if
 you edit the glossary and want to re-run correction, or swap the deep-dive
 model and regenerate just that step):
 
 1. **Ingest** — downloads the source with `yt-dlp` (best audio track) or copies/extracts audio from a local file.
-2. **Transcript** — tries the site's own captions first (manual subtitles preferred, auto-captions as fallback, parsed from WebVTT with rolling-caption dedup). If none exist, falls back to ASR: **faster-whisper** locally on CPU, or Gemini's native audio transcription if you've configured that step to use Gemini.
-3. **Correction pass** — an LLM re-reads the transcript and fixes transcription errors only (misheard words, mangled shell commands, wrong acronyms, garbled product names) using your glossary of known-correct terms. It does not summarize or edit for style — meaning and structure are preserved.
-4. **Summary** — a short (150–250 word) summary of the video.
-5. **Deep dive (Claude)** and **6. Deep dive (Gemini)** — two independent, structured deep-dive documents generated from the corrected transcript. Both are instructed to focus on **core concepts, tools, and technologies**, and critically: any procedural content in the source (a step-by-step tutorial, a walkthrough of a methodology, a config recipe) must be captured **in full** — every step, every command, the reasoning behind it, and the expected result — never compressed into a summary sentence.
-7. **Merge** — an LLM combines both deep dives into one unified document: redundant material is deduplicated (keeping the clearer telling of each point), unique content from each is folded in, and the **union of all procedures is preserved** — two procedures are only merged if they describe the literal same steps.
-8. **Quick-references** — reads the merged deep dive, identifies every tool and technique discussed in substance, and for each one either creates a new quick-reference doc or **merges new material into an existing one** if that tool/technique has appeared before (matching handles name variants — e.g. "Nmap", "nmap NSE" — by showing the LLM the existing doc index and letting it match or justify a new entry; matched variants are recorded as aliases). Before any merge, the previous version of the doc is snapshotted so you can view or revert it later.
-9. **Podcast script** — a long two-host script (`HOST_A` / `HOST_B`) covering the merged deep dive, written as an outline first (so it has real structure and covers every segment) then expanded segment by segment for natural, technically accurate dialogue.
-10. **Podcast audio** — text-to-speech of that script. Local default is **Kokoro** (fast, CPU-friendly, runs per line then stitches with ffmpeg); Gemini's native multi-speaker TTS is available as a cloud alternative.
-11. **Trim audio** — takes the original source audio, has an LLM identify off-topic spans from the timestamped transcript (intro chatter, sponsor reads, subscribe requests, tangents — conservatively, keeping anything it's unsure about), cuts those spans out with ffmpeg, and removes silence.
-12. **Mind map** — an LLM turns the merged deep dive into a topic graph (concepts, tools, techniques, technologies as nodes, with labeled relationships), rendered as a clickable, pannable diagram; clicking a node shows its description and links straight to its quick-reference doc if one exists.
+2. **Download & keep media** *(optional, URL sources only)* — archives the source permanently: the full video (best quality up to your configured resolution cap, merged to mp4) **and** an audio-only copy. Both are stored under `data/media/<project>/` and registered as library artifacts, so they're searchable, playable in the browser (the video player supports seeking), and downloadable. Local-file projects show "already local" instead.
+3. **Transcript** — tries the site's own captions first (manual subtitles preferred, auto-captions as fallback, parsed from WebVTT with rolling-caption dedup). If none exist, falls back to ASR: **faster-whisper** locally on CPU, or Gemini's native audio transcription if you've configured that step to use Gemini.
+4. **Correction pass** — an LLM re-reads the transcript and fixes transcription errors only (misheard words, mangled shell commands, wrong acronyms, garbled product names) using your glossary of known-correct terms. It does not summarize or edit for style — meaning and structure are preserved.
+5. **Summary** — a short (150–250 word) summary of the video.
+6. **Deep dive (Claude)** and **7. Deep dive (Gemini)** — two independent, structured deep-dive documents generated from the corrected transcript. Both are instructed to focus on **core concepts, tools, and technologies**, and critically: any procedural content in the source (a step-by-step tutorial, a walkthrough of a methodology, a config recipe) must be captured **in full** — every step, every command, the reasoning behind it, and the expected result — never compressed into a summary sentence.
+8. **Merge** — an LLM combines both deep dives into one unified document: redundant material is deduplicated (keeping the clearer telling of each point), unique content from each is folded in, and the **union of all procedures is preserved** — two procedures are only merged if they describe the literal same steps.
+9. **Quick-references** — reads the merged deep dive, identifies every tool and technique discussed in substance, and for each one either creates a new quick-reference doc or **merges new material into an existing one** if that tool/technique has appeared before (matching handles name variants — e.g. "Nmap", "nmap NSE" — by showing the LLM the existing doc index and letting it match or justify a new entry; matched variants are recorded as aliases). Before any merge, the previous version of the doc is snapshotted so you can view or revert it later.
+10. **Podcast script** — a long two-host script (`HOST_A` / `HOST_B`) covering the merged deep dive, written as an outline first (so it has real structure and covers every segment) then expanded segment by segment for natural, technically accurate dialogue.
+11. **Podcast audio** — text-to-speech of that script. Local default is **Kokoro** (fast, CPU-friendly, runs per line then stitches with ffmpeg); Gemini's native multi-speaker TTS is available as a cloud alternative.
+12. **Trim audio** — takes the original source audio, has an LLM identify off-topic spans from the timestamped transcript (intro chatter, sponsor reads, subscribe requests, tangents — conservatively, keeping anything it's unsure about), cuts those spans out with ffmpeg, and removes silence.
+13. **Mind map** — an LLM turns the merged deep dive into a topic graph (concepts, tools, techniques, technologies as nodes, with labeled relationships), rendered as a clickable, pannable diagram; clicking a node shows its description and links straight to its quick-reference doc if one exists.
 
 Every artifact written by any step is also passed through **auto-tagging**: an
 LLM proposes tags from a shared, editable vocabulary (only inventing a new tag
@@ -108,7 +109,7 @@ Docker volume, so subsequent runs are fast.
 **Projects** is where you start: paste a URL (YouTube, Vimeo, Udemy, or
 anything [yt-dlp supports](https://github.com/yt-dlp/yt-dlp)) or give a local
 file path, and a project is created. Opening a project shows its **pipeline
-board** — twelve step cards you run in order (each is disabled while
+board** — thirteen step cards you run in order (each is disabled while
 running/queued; a card turns green once its artifact exists, red on error with
 the full error message expandable inline). Progress updates live via
 server-sent events, so you can watch "transcribing 43%" or "writing segment
@@ -129,7 +130,8 @@ alias list, and its version history (view or one-click revert any prior
 snapshot).
 
 **Settings** holds everything that changes how the pipeline behaves:
-per-function model selection, the correction glossary, TTS voice choices, and
+per-function model selection, the correction glossary, TTS voice choices, the
+media-download resolution cap (720p / 1080p / 1440p / best, default 1080p), and
 the tag vocabulary (add/rename/delete — renaming merges into an existing tag
 of the new name if one exists, and propagates to every artifact's frontmatter).
 
@@ -154,6 +156,8 @@ data/library/
 │   ├── podcast_audio.md         # sidecar metadata; audio itself is podcast_audio.mp3
 │   ├── podcast_audio.mp3
 │   ├── trimmed_audio.md / .mp3
+│   ├── source_video.md          # sidecar for the archived download; the video/audio
+│   ├── source_audio.md          #   files themselves live in data/media/<slug>/
 │   └── mindmap.md               # topic-graph JSON in a code fence
 ├── tools/<tool-slug>.md         # cross-project quick-references
 ├── techniques/<technique-slug>.md
@@ -164,8 +168,13 @@ Frontmatter on every file includes `type`, `title`, `project`, `created`,
 `updated`, `provider`, `model`, and `tags`; quick-refs additionally track
 `aliases` (name variants matched to this doc).
 
-Raw downloaded/working media (source audio, yt-dlp temp files, cookies) lives
-separately under `data/media/`, and is not part of the searchable library.
+Working media and archived downloads live separately under `data/media/<slug>/`:
+the ingest step's working audio, yt-dlp temp files, and cookies, plus — once
+you've run **Download & keep media** — the permanent `source_video.mp4` and
+`source_audio.m4a`. Keeping the large binaries out of `data/library/` means
+your Obsidian-openable vault stays lightweight, while the sidecar `.md` files
+above keep the downloads searchable and playable from the Library UI. Back up
+`data/media/` too if the archived videos matter to you.
 
 ## Configuring models
 
@@ -195,8 +204,8 @@ directory** — e.g. if `HOST_MEDIA_DIR=D:\Videos` and your file is
 
 **Authenticated sites (Udemy, etc.):** on the project detail page, upload a
 `cookies.txt` (Netscape format, exportable with any browser cookie-export
-extension) before running **Ingest** or **Transcript** — yt-dlp uses it for
-that project's requests.
+extension) before running **Ingest**, **Download & keep media**, or
+**Transcript** — yt-dlp uses it for that project's requests.
 
 **Bigger local models on other hardware:** if you have a GPU box elsewhere on
 your network already running Ollama, set `OLLAMA_BASE_URL` in `.env` to its

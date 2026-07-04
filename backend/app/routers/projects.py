@@ -16,6 +16,7 @@ router = APIRouter(prefix="/api/projects", tags=["projects"])
 # step name → (celery task name, human label); order defines the pipeline board
 STEPS: list[tuple[str, str]] = [
     ("ingest", "Ingest media"),
+    ("download", "Download & keep media"),
     ("transcribe", "Transcript"),
     ("correct", "Correction pass"),
     ("summarize", "Summary"),
@@ -94,6 +95,7 @@ def get_project(project_id: int):
                     "label": label,
                     "job": latest.get(name),
                     "artifact": next((a for a in artifacts if a.type == name or
+                                      (name == "download" and a.type == "source_video") or
                                       (name == "transcribe" and a.type == "transcript") or
                                       (name == "correct" and a.type == "corrected") or
                                       (name == "summarize" and a.type == "summary") or

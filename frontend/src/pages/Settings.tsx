@@ -24,6 +24,7 @@ export default function Settings() {
   const [providers, setProviders] = useState<string[]>([]);
   const [glossary, setGlossary] = useState("");
   const [tags, setTags] = useState<TagInfo[]>([]);
+  const [maxHeight, setMaxHeight] = useState(1080);
   const [saved, setSaved] = useState("");
 
   function load() {
@@ -31,8 +32,15 @@ export default function Settings() {
       .then((r) => { setFunctions(r.functions); setProviders(r.providers); });
     api<{ terms: string[] }>("/settings/glossary").then((r) => setGlossary(r.terms.join("\n")));
     api<TagInfo[]>("/tags").then(setTags);
+    api<{ max_height: number }>("/settings/download").then((r) => setMaxHeight(r.max_height));
   }
   useEffect(load, []);
+
+  async function saveMaxHeight(v: number) {
+    setMaxHeight(v);
+    await api("/settings/download", { method: "PUT", body: JSON.stringify({ max_height: v }) });
+    flash("download quality saved");
+  }
 
   async function saveModel(fn: string, cfg: ModelCfg) {
     setFunctions((prev) => ({ ...prev, [fn]: cfg }));
@@ -111,6 +119,18 @@ export default function Settings() {
           ))}
         </tbody>
       </table>
+
+      <h2>Media downloads</h2>
+      <p className="meta">
+        Resolution cap for the "Download &amp; keep media" step (video is merged to mp4;
+        an audio-only copy is always kept alongside it).
+      </p>
+      <select value={maxHeight} onChange={(e) => saveMaxHeight(Number(e.target.value))}>
+        <option value={720}>720p</option>
+        <option value={1080}>1080p</option>
+        <option value={1440}>1440p</option>
+        <option value={0}>best available</option>
+      </select>
 
       <h2>Correction glossary</h2>
       <p className="meta">One term per line — known-correct commands, acronyms, product names.</p>

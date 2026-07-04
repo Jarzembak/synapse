@@ -72,6 +72,23 @@ def set_voices(req: Voices):
     return {"ok": True}
 
 
+@router.get("/download")
+def get_download():
+    return {"max_height": get_setting("download.max_height", 1080)}
+
+
+class DownloadPrefs(BaseModel):
+    max_height: int  # 0 = best available
+
+
+@router.put("/download")
+def set_download(req: DownloadPrefs):
+    if req.max_height < 0:
+        raise HTTPException(400, "max_height must be >= 0 (0 = best)")
+    set_setting("download.max_height", req.max_height)
+    return {"ok": True}
+
+
 # --- tag vocabulary management ---
 
 tags_router = APIRouter(prefix="/api/tags", tags=["tags"])

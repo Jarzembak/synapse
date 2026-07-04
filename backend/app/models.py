@@ -24,11 +24,13 @@ class Artifact(SQLModel, table=True):
     project_id: int | None = Field(default=None, foreign_key="project.id", index=True)
     # transcript | corrected | summary | deepdive_claude | deepdive_gemini |
     # deepdive_merged | podcast_script | podcast_audio | trimmed_audio |
-    # mindmap | quickref_tool | quickref_technique
+    # mindmap | quickref_tool | quickref_technique | source_video | source_audio
     type: str = Field(index=True)
     title: str
     path: str  # library-relative path of the .md (or sidecar .md for binaries)
-    media_path: str | None = None  # library-relative path of binary payload
+    # binary payload location: library-relative, or MEDIA_DIR-relative when
+    # prefixed with "media:" (large archived source files)
+    media_path: str | None = None
     provider: str | None = None
     model: str | None = None
     created: datetime = Field(default_factory=utcnow)

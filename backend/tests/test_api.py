@@ -50,8 +50,9 @@ def test_project_create_and_steps(client):
     assert r.json()["slug"] == "test-video"
     steps = client.get("/api/projects/steps").json()
     assert steps[0]["name"] == "ingest" and steps[-1]["name"] == "mindmap"
+    assert steps[1]["name"] == "download"
     detail = client.get(f"/api/projects/{r.json()['id']}").json()
-    assert len(detail["steps"]) == 12
+    assert len(detail["steps"]) == 13
 
 
 def test_fts_search_and_filters(client):
@@ -89,6 +90,38 @@ def test_tag_rename_propagates(client):
 def test_glossary_roundtrip(client):
     client.put("/api/settings/glossary", json={"terms": ["Fortigate", "  RKE2 ", "Fortigate"]})
     assert client.get("/api/settings/glossary").json()["terms"] == ["Fortigate", "RKE2"]
+
+
+def test_download_prefs_roundtrip(client):
+    assert client.get("/api/settings/download").json() == {"max_height": 1080}
+    assert client.put("/api/settings/download", json={"max_height": 0}).status_code == 200
+    assert client.get("/api/settings/download").json() == {"max_height": 0}
+    assert client.put("/api/settings/download", json={"max_height": -1}).status_code == 400
+    client.put("/api/settings/download", json={"max_height": 1080})  # restore
+
+
+def test_media_prefix_serving(client):
+    from app.config import settings as app_settings
+
+    media_file = app_settings.media_dir / "demo" / "source_audio.m4a"
+    media_file.parent.mkdir(parents=True, exist_ok=True)
+    media_file.write_bytes(b"fake-m4a-bytes")
+
+    with get_session() as session:
+        from sqlmodel import select
+        project = session.exec(select(Project).where(Project.slug == "demo")).first()
+        art = library.write_artifact(
+            session, project_id=project.id if project else None, project_slug="demo",
+            type="source_audio", title="Source audio — Demo",
+            body="archived copy", rel_path="projects/demo/source_audio.md",
+            media_rel="media:demo/source_audio.m4a",
+        )
+        aid = art.id
+
+    r = client.get(f"/api/media/{aid}")
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("audio/mp4")
+    assert r.content == b"fake-m4a-bytes"
 
 
 def test_model_override(client):
