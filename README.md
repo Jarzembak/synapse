@@ -4,20 +4,27 @@ A self-hosted, containerized web app for turning any video or audio source — a
 local file, or a URL from YouTube, Vimeo, Udemy, or similar — into a permanent,
 searchable knowledge library. Point it at a talk once; it produces a transcript,
 a corrected transcript, a summary, two independent deep dives that get merged
-into one, a growing set of per-tool/per-technique quick-reference docs, a
+into one, a growing set of tool/technique/concept quick-reference docs, a
 two-host podcast script with generated audio, a trimmed audio-only copy, and an
 interactive mind map. Everything accumulates in one browsable, taggable,
-full-text-searchable library instead of living as scattered files.
+full-text-searchable library instead of living as scattered files — with an
+optional push to your own cloud storage.
 
 Fully vibe coded by Fable and inspired by Jeff McJunkin's methodology.
 
 It supports both local models (via Ollama, CPU-friendly by default) and
 frontier APIs (Claude, Gemini), configurable **per pipeline step**, so you can
 run cheaply on local hardware and reserve API spend for the steps that need it.
+Nearly every behavior — the prompts each step sends its model, generation
+temperature, audio pacing, tagging rules — is tunable from **Settings → Advanced**
+without touching code.
 
 - [How it works](#how-it-works)
 - [Quick start](#quick-start)
 - [Using the app](#using-the-app)
+- [Themes](#themes)
+- [Advanced settings](#advanced-settings)
+- [Cloud storage](#cloud-storage)
 - [The library on disk](#the-library-on-disk)
 - [Configuring models](#configuring-models)
 - [Local files, cookies, and remote GPUs](#local-files-cookies-and-remote-gpus)
@@ -58,7 +65,7 @@ model and regenerate just that step):
 5. **Summary** — a short (150–250 word) summary of the video.
 6. **Deep dive (Claude)** and **7. Deep dive (Gemini)** — two independent, structured deep-dive documents generated from the corrected transcript. Both are instructed to focus on **core concepts, tools, and technologies**, and critically: any procedural content in the source (a step-by-step tutorial, a walkthrough of a methodology, a config recipe) must be captured **in full** — every step, every command, the reasoning behind it, and the expected result — never compressed into a summary sentence.
 8. **Merge** — an LLM combines both deep dives into one unified document: redundant material is deduplicated (keeping the clearer telling of each point), unique content from each is folded in, and the **union of all procedures is preserved** — two procedures are only merged if they describe the literal same steps.
-9. **Quick-references** — reads the merged deep dive, identifies every tool and technique discussed in substance, and for each one either creates a new quick-reference doc or **merges new material into an existing one** if that tool/technique has appeared before (matching handles name variants — e.g. "Nmap", "nmap NSE" — by showing the LLM the existing doc index and letting it match or justify a new entry; matched variants are recorded as aliases). Before any merge, the previous version of the doc is snapshotted so you can view or revert it later.
+9. **Quick-references** — reads the merged deep dive, identifies every **tool**, **technique**, and **concept** discussed in substance, and for each one either creates a new quick-reference doc or **merges new material into an existing one** if it has appeared before (matching handles name variants — e.g. "Nmap", "nmap NSE" — by showing the LLM the existing doc index and letting it match or justify a new entry; matched variants are recorded as aliases). The three kinds get deliberately different documents: a **tool** doc is a user-friendly instruction manual (what it is, getting started, core usage, examples, gotchas) for something you actually run; a **technique** doc is a step-by-step recipe for one specific task (goal, prerequisites, numbered steps with exact commands, verification); a **concept** doc is a crisp explainer for an idea or principle you understand rather than execute (definition, why it matters, how it works, related tools/techniques). Before any merge, the previous version of the doc is snapshotted so you can view or revert it later.
 10. **Podcast script** — a long two-host script (`HOST_A` / `HOST_B`) covering the merged deep dive, written as an outline first (so it has real structure and covers every segment) then expanded segment by segment for natural, technically accurate dialogue.
 11. **Podcast audio** — text-to-speech of that script. Local default is **Kokoro** (fast, CPU-friendly, runs per line then stitches with ffmpeg); Gemini's native multi-speaker TTS is available as a cloud alternative.
 12. **Trim audio** — takes the original source audio, has an LLM identify off-topic spans from the timestamped transcript (intro chatter, sponsor reads, subscribe requests, tangents — conservatively, keeping anything it's unsure about), cuts those spans out with ffmpeg, and removes silence.
@@ -118,24 +125,160 @@ server-sent events, so you can watch "transcribing 43%" or "writing segment
 4/11" without refreshing. Each completed step links straight to its artifact.
 
 **Library** is the home page and the point of the whole app: every artifact
-from every project, in one searchable list. Full-text search hits the SQLite
-FTS5 index (so searching for a command or a specific phrase from a transcript
-works, not just titles); filter by type, tag, or project, and sort by date,
-title, or type. Click through to render markdown, play audio, or open the
-mind map.
+from every project, in one searchable, sortable, filterable list. Full-text
+search hits the SQLite FTS5 index, so searching for a command or a specific
+phrase from a transcript works, not just titles. It opens **grouped by
+project by default** — each project is a collapsible section, like a folder
+in a file explorer (▶/▼ to expand/collapse one, or "expand all"/"collapse
+all" for the whole table); toggle "group by project" off for a flat sorted
+list instead. Every column header (Title, Type, Project, Tags, Updated) is
+clickable to sort — click again to reverse direction (▲/▼ shows current
+order) — and Title/Type/Project/Tags each have a small filter funnel: a text
+box for Title, a checklist of the actual values present (with counts) for
+Type/Project/Tags. Tag chips are clickable everywhere they appear — in the
+table rows and in the left-rail tag cloud — and the tag cloud supports
+multi-select (shows items matching *any* selected tag); a "clear all filters"
+button appears whenever something's active. Click through to render
+markdown, play audio/video, or open the mind map.
 
-**Quick-refs** is the accumulating tool/technique library — separate from the
-per-project pipeline because these documents are *cross-project*: the nmap
-quick-ref started from your first networking video keeps growing every time
-nmap comes up again. Each entry shows which videos contributed to it, its
-alias list, and its version history (view or one-click revert any prior
-snapshot).
+**Quick-refs** is the accumulating tool/technique/concept library — separate
+from the per-project pipeline because these documents are *cross-project*:
+the nmap quick-ref started from your first networking video keeps growing
+every time nmap comes up again. The page has its own search box (matches
+name, alias, or tag), toggle buttons to filter by kind (🔧 Tools / 🎯
+Techniques / 💡 Concepts), a sort dropdown (name / recently updated / most
+sources), and a tag cloud with counts — documents are tagged the same way
+library artifacts are. Results are grouped into per-kind sections in the
+sidebar. Each entry shows which videos contributed to it, its alias list,
+and its version history (view or one-click revert any prior snapshot).
 
 **Settings** holds everything that changes how the pipeline behaves:
 per-function model selection, the correction glossary, TTS voice choices, the
-media-download resolution cap (720p / 1080p / 1440p / best, default 1080p), and
+media-download resolution cap (720p / 1080p / 1440p / best, default 1080p),
 the tag vocabulary (add/rename/delete — renaming merges into an existing tag
-of the new name if one exists, and propagates to every artifact's frontmatter).
+of the new name if one exists, and propagates to every artifact's
+frontmatter), and an **Advanced** section covering prompts, generation
+parameters, audio/pipeline/ASR tuning, and cloud storage — see below.
+
+## Themes
+
+A dropdown in the top-right corner of the nav bar switches the whole UI
+between six themes: **Light**, **Dark**, **Cyberpunk** (neon magenta/cyan on
+near-black), **Synthwave** (purple/pink/orange), **Terminal** (green CRT with
+scanlines), and **Amber CRT**. Your choice is saved in the browser
+(`localStorage`) and applied instantly with no reload; the mind map, markdown
+rendering, and code blocks all follow the active theme.
+
+## Advanced settings
+
+**Settings → Advanced** exposes six collapsible groups for fine-tuning
+pipeline behavior beyond the model matrix:
+
+- **Prompt editor** — the exact system prompt sent to the model for every
+  pipeline step (correction, both deep-dive generators, the merge, entity
+  extraction, each quick-ref template, podcast outline/segments, trim-span
+  detection, mind map, tagging) in an editable textarea. A "modified" badge
+  marks any prompt you've changed from the shipped default; "reset to
+  default" clears your edit and reverts instantly. Edits take effect the next
+  time that step runs — nothing needs restarting.
+- **Generation parameters** — per-function temperature and max-output-tokens
+  overrides, for when you want a specific step more deterministic (lower
+  temperature) or more creative, or need to raise the output ceiling for an
+  unusually long transcript.
+- **Audio tuning** — Kokoro TTS speaking speed and the pause length inserted
+  between dialogue lines, plus the trim step's silence threshold (dB) and
+  minimum silence duration to cut.
+- **Pipeline behavior** — the correction pass's chunk size (characters per
+  LLM call), deep-dive depth (concise / standard / exhaustive), a target
+  podcast segment count (0 = let the model decide), the max tags applied per
+  artifact, and whether the auto-tagger is allowed to invent new vocabulary
+  tags or must only choose from existing ones.
+- **ASR options** — toggle the voice-activity-detection filter (disable if
+  faster-whisper is dropping quiet words) and set a language hint for
+  non-English sources (blank = auto-detect). The Whisper model size itself
+  (tiny → large) is set in the Model matrix, on the `asr` row.
+- **Cloud storage** — see the next section.
+
+## Cloud storage
+
+Synapse can push every artifact it produces to your own cloud storage,
+either automatically as each one is written or on demand. This runs on
+[rclone](https://rclone.org/) inside the worker container, which is why one
+integration covers five very different backends — no separate SDK or app
+registration burden per provider beyond what's described below.
+
+**What syncs:** the entire `data/library/` tree (transcripts, deep dives,
+quick-refs, podcast script/audio, mind maps — everything) plus the archived
+`source_video`/`source_audio` files from `data/media/<project>/` if you've
+run the Download & keep media step. Working files (yt-dlp temp files,
+cookies, the transcription-only audio copy) are never uploaded.
+
+**When it runs:** turn on **auto-upload** and each artifact is queued for
+upload the moment its pipeline step finishes writing it — no separate click
+per file. Independently, the **"Sync everything now"** button does a full
+pass over the whole library and archived media at once, useful for backfilling
+artifacts that existed before you configured cloud storage, or for a periodic
+full resync. There's no scheduled/bidirectional sync — Synapse only ever
+pushes up.
+
+### Setup, step by step
+
+1. Open **Settings → Advanced → Cloud storage** and pick a **Provider** from
+   the dropdown. Below are the exact fields for each:
+
+   **S3-compatible** (AWS S3, self-hosted MinIO, Backblaze B2, Wasabi, or
+   anything else that speaks the S3 API):
+   - `endpoint` — the S3 API URL (e.g. `https://s3.us-east-1.amazonaws.com`
+     for AWS, `https://minio.yourdomain.com` for a self-hosted MinIO, or your
+     B2/Wasabi endpoint)
+   - `bucket` — the bucket name (create it in your provider's console first)
+   - `access_key_id` / `secret_access_key` — from your provider (IAM user for
+     AWS, an access key you generate in MinIO's console, an application key
+     for B2, etc.)
+   - `region` — optional; leave blank for MinIO/most non-AWS providers
+
+   **WebDAV** (Nextcloud, ownCloud, or any generic WebDAV server):
+   - `url` — your WebDAV endpoint, e.g. for Nextcloud:
+     `https://your-nextcloud.example.com/remote.php/dav/files/<your-username>`
+   - `vendor` — `nextcloud` or `owncloud` (blank defaults to `nextcloud`)
+   - `user` — your Nextcloud/ownCloud username
+   - `password` — an **app password**, not your login password: in
+     Nextcloud, go to Settings → Security → "Create new app password"
+
+   **Google Drive / Dropbox / OneDrive** (OAuth-based — no Synapse-side app
+   registration, but you generate a token once using rclone itself):
+   1. Install rclone on any machine with a web browser (`https://rclone.org/downloads/` —
+      this can be your everyday laptop, it doesn't need to be near Synapse).
+   2. Run `rclone authorize "drive"` (or `"dropbox"` / `"onedrive"`) in a
+      terminal. It opens your browser, asks you to sign in and approve
+      access, then prints a block of JSON to the terminal like
+      `{"access_token":"...","token_type":"Bearer",...}`.
+   3. Copy that entire JSON block and paste it into the **token** field in
+      Synapse's Settings.
+   4. Google Drive only: `root_folder_id` is optional — leave blank to sync
+      into "My Drive"'s root, or paste a folder ID to sync into a specific
+      existing folder. OneDrive only: `drive_type` is `personal` (default) or
+      `business`.
+   5. These tokens expire; if a sync starts failing after a long time, repeat
+      steps 1–3 to get a fresh token.
+
+2. Set **Remote base folder** (default `synapse`) — the top-level folder name
+   created inside your bucket/Drive/Nextcloud where everything lands
+   (`<remote_base>/library/...` and `<remote_base>/media/...`).
+3. Check **auto-upload each artifact when it's produced** if you want zero
+   manual steps going forward, or leave it off and rely on manual syncs.
+4. Click **Save cloud settings**.
+5. Click **Sync everything now** to do an initial full backfill of whatever's
+   already in your library. Progress shows in the job ticker (top-right of
+   the nav) same as any pipeline step; a status line under the cloud section
+   shows the result and timestamp of the last sync attempt, including the
+   error message if one failed.
+
+Secrets you enter are **masked** as soon as you save them — the API never
+echoes a saved `secret_access_key`, `password`, or `token` back to the
+browser (you'll see `•set•` instead). To rotate a credential, just type the
+new value over the masked field and save again; leaving it as `•set•` or
+blank keeps the previously stored value.
 
 ## The library on disk
 
@@ -161,8 +304,9 @@ data/library/
 │   ├── source_video.md          # sidecar for the archived download; the video/audio
 │   ├── source_audio.md          #   files themselves live in data/media/<slug>/
 │   └── mindmap.md               # topic-graph JSON in a code fence
-├── tools/<tool-slug>.md         # cross-project quick-references
-├── techniques/<technique-slug>.md
+├── tools/<tool-slug>.md         # cross-project quick-references — instruction manuals
+├── techniques/<technique-slug>.md  #   — step-by-step recipes
+├── concepts/<concept-slug>.md      #   — explainers
 └── .history/                    # timestamped snapshots taken before every quick-ref merge
 ```
 
@@ -248,6 +392,7 @@ the library before running this).
 - **A frontier-model step errors with an auth/key message** — check the corresponding `_API_KEY` in `.env` and that you restarted (`docker compose up`) after editing it.
 - **yt-dlp fails on a URL** — the site may need cookies (see above) or may not be supported; check `docker compose logs worker` for the underlying yt-dlp error.
 - **JSON-producing steps (trim spans, mind map, quick-ref matching) occasionally fail** — local models are more prone to malformed JSON than frontier ones; the app retries automatically, but if a local model consistently fails structured-output steps, assign those specific functions to a frontier provider instead.
+- **Cloud sync fails** — check the status line under Settings → Advanced → Cloud storage for the specific rclone error. Common causes: an S3 `endpoint`/`bucket` typo, a WebDAV `password` that's your login password instead of an app password, or an expired Drive/Dropbox/OneDrive token (re-run `rclone authorize` and paste the fresh token).
 
 ## Current limitations
 
@@ -261,3 +406,10 @@ the library before running this).
   CPU-only hardware this was built for); if you later add a GPU, faster
   local ASR (Parakeet) and better local dialogue TTS (Dia2/VibeVoice) become
   worth adding.
+- Cloud sync only pushes — there's no pull/bidirectional sync, and no
+  scheduled sync (auto-upload-per-artifact or the manual "sync now" button
+  are the only triggers). The backend image's rclone package (Debian's
+  packaged v1.60) covers all five supported providers but is a few years
+  behind upstream; if Google/Microsoft ever change their token format in a
+  way it can't parse, switching the Dockerfile to rclone's official install
+  script would pull the latest release.
