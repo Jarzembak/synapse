@@ -1,0 +1,77 @@
+* { box-sizing: border-box; }
+body { margin: 0; font-family: system-ui, sans-serif; color: #222; background: #f6f7f9; }
+.app { min-height: 100vh; display: flex; flex-direction: column; }
+main { flex: 1; padding: 1.2rem 2rem; max-width: 1400px; width: 100%; margin: 0 auto; }
+
+.topnav { display: flex; align-items: center; gap: 1.2rem; padding: 0.6rem 2rem;
+  background: #1e2530; color: #eee; }
+.topnav .brand { font-weight: 700; margin-right: 1rem; }
+.topnav a { color: #cfd8e3; text-decoration: none; }
+.topnav a.active { color: #fff; border-bottom: 2px solid #4f83cc; }
+.ticker { margin-left: auto; font-size: 0.85rem; }
+.ticker.idle { color: #7d8899; }
+.ticker.busy { color: #ffd54f; }
+
+h2 { margin-top: 1.4rem; }
+.error { color: #c62828; white-space: pre-wrap; }
+.empty { color: #888; font-style: italic; }
+.mono { font-family: monospace; font-size: 0.85rem; color: #555; }
+.meta { color: #667; font-size: 0.9rem; }
+.flash { position: fixed; top: 60px; right: 20px; background: #2e7d32; color: #fff;
+  padding: 0.5rem 1rem; border-radius: 6px; }
+
+.list { width: 100%; border-collapse: collapse; background: #fff; }
+.list th, .list td { text-align: left; padding: 0.5rem 0.7rem; border-bottom: 1px solid #e3e6ea; }
+.list th { background: #eef1f5; }
+
+.tag { display: inline-block; background: #e3ecf7; color: #2c5282; border: none;
+  border-radius: 10px; padding: 0.1rem 0.55rem; margin: 0.1rem; font-size: 0.78rem; cursor: pointer; }
+.tag.on { background: #2c5282; color: #fff; }
+.tag.managed button { background: none; border: none; cursor: pointer; font-size: 0.75rem; }
+.tagcloud { display: flex; flex-wrap: wrap; max-width: 100%; }
+
+.library { display: grid; grid-template-columns: 230px 1fr; gap: 1.5rem; }
+.filters h3 { margin: 0.8rem 0 0.3rem; font-size: 0.85rem; text-transform: uppercase; color: #667; }
+.filters select { width: 100%; margin-bottom: 0.4rem; }
+.search { width: 100%; padding: 0.6rem 0.9rem; font-size: 1rem; margin-bottom: 0.8rem;
+  border: 1px solid #cbd2da; border-radius: 6px; }
+
+.newproject { display: flex; gap: 0.5rem; }
+.newproject input { flex: 1; padding: 0.45rem; }
+
+.board { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 0.8rem; }
+.step { background: #fff; border: 1px solid #dde2e8; border-left: 4px solid #b8c0ca;
+  border-radius: 6px; padding: 0.6rem 0.8rem; }
+.step.done { border-left-color: #43a047; }
+.step.running, .step.queued { border-left-color: #ffb300; }
+.step.error { border-left-color: #c62828; }
+.step-head { display: flex; justify-content: space-between; align-items: center; }
+.step-status { font-size: 0.85rem; color: #667; margin: 0.3rem 0; }
+.step pre { max-height: 150px; overflow: auto; font-size: 0.7rem; }
+
+.markdown { background: #fff; padding: 1.2rem 1.6rem; border-radius: 8px;
+  border: 1px solid #e3e6ea; line-height: 1.55; }
+.markdown pre { background: #1e2530; color: #e6edf3; padding: 0.8rem; border-radius: 6px; overflow: auto; }
+.markdown code { background: #eef1f5; padding: 0.1rem 0.3rem; border-radius: 3px; }
+.markdown pre code { background: none; }
+
+.quickrefs { display: grid; grid-template-columns: 280px 1fr; gap: 1.5rem; }
+.quickrefs aside ul { list-style: none; padding: 0; }
+.quickrefs aside button { background: none; border: none; cursor: pointer; padding: 0.35rem 0.4rem;
+  width: 100%; text-align: left; border-radius: 4px; }
+.quickrefs aside button.on { background: #e3ecf7; }
+.kindmark { margin-right: 0.4rem; }
+
+.mindmap { position: relative; }
+.mindmap .canvas { height: 70vh; background: #fff; border: 1px solid #e3e6ea; border-radius: 8px; }
+.nodepanel { position: absolute; top: 10px; right: 10px; width: 280px; background: #fff;
+  border: 1px solid #cbd2da; border-radius: 8px; padding: 0.8rem 1rem;
+  box-shadow: 0 4px 14px rgba(0,0,0,0.12); z-index: 10; }
+.nodepanel .kind { text-transform: uppercase; font-size: 0.75rem; font-weight: 700; }
+.legend { display: flex; gap: 1rem; margin-top: 0.5rem; font-size: 0.8rem; color: #556; }
+.legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 4px; }
+
+.settings textarea { width: 100%; font-family: monospace; }
+.settings input, .settings select { padding: 0.3rem; }
+.cookies input { margin: 0 0.5rem; }
+audio { margin: 1rem 0; }
