@@ -34,7 +34,7 @@ settings = Settings()
 # The value here is the *shipping default*; the Settings table can override it.
 FUNCTION_DEFAULTS: dict[str, dict[str, str]] = {
     "correct":        {"provider": "ollama",    "model": "qwen3:8b"},
-    "summarize":      {"provider": "ollama",    "model": "qwen3:8b"},
+    "summarize":      {"provider": "anthropic", "model": "claude-sonnet-5"},
     "deepdive_claude": {"provider": "anthropic", "model": "claude-sonnet-5"},
     "deepdive_gemini": {"provider": "gemini",    "model": "gemini-3.5-flash"},
     "merge":          {"provider": "anthropic", "model": "claude-sonnet-5"},
