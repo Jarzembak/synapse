@@ -9,6 +9,8 @@ two-host podcast script with generated audio, a trimmed audio-only copy, and an
 interactive mind map. Everything accumulates in one browsable, taggable,
 full-text-searchable library instead of living as scattered files.
 
+Fully vibe coded by Fable and inspired by Jeff McJunkin's methodology.
+
 It supports both local models (via Ollama, CPU-friendly by default) and
 frontier APIs (Claude, Gemini), configurable **per pipeline step**, so you can
 run cheaply on local hardware and reserve API spend for the steps that need it.
