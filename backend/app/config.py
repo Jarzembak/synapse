@@ -48,6 +48,38 @@ FUNCTION_DEFAULTS: dict[str, dict[str, str]] = {
     "tts":            {"provider": "kokoro",   "model": "kokoro-82m"},
 }
 
+# Advanced tuning knobs (Settings → Advanced). Stored per-group in the Settings
+# table under advanced.<group>; these are the shipping defaults.
+ADVANCED_DEFAULTS: dict[str, dict] = {
+    "audio": {
+        "tts_speed": 1.0,        # Kokoro speaking rate multiplier
+        "tts_gap": 0.4,          # seconds of silence between dialogue lines
+        "trim_db": -40,          # silenceremove threshold (dBFS)
+        "trim_silence": 1.5,     # minimum silence duration to remove (s)
+    },
+    "pipeline": {
+        "chunk_chars": 24000,    # transcript chunk size for the correction pass
+        "deepdive_depth": "standard",   # concise | standard | exhaustive
+        "podcast_segments": 0,   # target segment count; 0 = model decides
+        "max_tags": 8,           # tags per artifact
+        "allow_new_tags": True,  # let the tagger extend the vocabulary
+    },
+    "asr": {
+        "vad": True,             # voice-activity-detection filter
+        "language": "",          # language hint; "" = auto-detect
+    },
+}
+
+
+def advanced(group: str) -> dict:
+    """Effective advanced settings for a group: defaults + stored overrides."""
+    from .settings_store import get_setting
+
+    merged = dict(ADVANCED_DEFAULTS[group])
+    merged.update(get_setting(f"advanced.{group}") or {})
+    return merged
+
+
 # Seed tag vocabulary (cyber / sysadmin oriented). Users can extend/edit in UI.
 SEED_TAGS: list[tuple[str, str]] = [
     ("networking", "domain"), ("kubernetes", "tech"), ("ansible", "tool"),

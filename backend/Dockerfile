@@ -1,7 +1,7 @@
 FROM python:3.12-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg git unzip \
+    ffmpeg git unzip rclone \
     && rm -rf /var/lib/apt/lists/*
 
 # deno: JS runtime yt-dlp needs for reliable YouTube extraction

@@ -8,13 +8,20 @@ from sqlmodel import select
 
 from ..db import get_session
 from .. import library, llm, tagging
+from ..config import advanced
 from ..models import Artifact
 from ..settings_store import get_setting
 from .celery_app import celery
 from .common import (
     artifact_body, auto_tag, best_transcript, get_project, pipeline_task, progress,
 )
-from . import prompts
+from .prompts import get_prompt
+
+DEPTH_HINTS = {
+    "concise": "\nKeep the document focused and tight — around 1500 words.",
+    "standard": "",
+    "exhaustive": "\nBe exhaustive — cover every concept, tool and procedure in maximum depth.",
+}
 
 
 def _write(project_id: int, type: str, title_prefix: str, body: str,
@@ -43,12 +50,12 @@ def correct(job_id: int, project_id: int):
     with get_session() as session:
         transcript = artifact_body(session, project_id, "transcript")
     glossary = get_setting("glossary", [])
-    system = prompts.CORRECT_SYSTEM
+    system = get_prompt("correct")
     if glossary:
         system += "\n\nGlossary of known-correct terms:\n" + ", ".join(glossary)
 
     provider, model = llm.resolve_model("correct")
-    chunks = llm.chunk_text(transcript)
+    chunks = llm.chunk_text(transcript, max_chars=int(advanced("pipeline")["chunk_chars"]))
     fixed: list[str] = []
     for i, chunk in enumerate(chunks):
         progress(job_id, f"correcting chunk {i + 1}/{len(chunks)}")
@@ -64,7 +71,7 @@ def summarize(job_id: int, project_id: int):
         transcript = best_transcript(session, project_id)
     provider, model = llm.resolve_model("summarize")
     progress(job_id, "summarizing")
-    body = llm.complete("summarize", prompts.SUMMARY_SYSTEM, transcript[:80000])
+    body = llm.complete("summarize", get_prompt("summary"), transcript[:80000])
     _write(project_id, "summary", "Summary", body.strip(), provider=provider, model=model)
 
 
@@ -73,7 +80,9 @@ def _deepdive(job_id: int, project_id: int, function: str, type: str, label: str
         transcript = best_transcript(session, project_id)
     provider, model = llm.resolve_model(function)
     progress(job_id, f"generating {label} deep dive ({model})")
-    body = llm.complete(function, prompts.DEEPDIVE_SYSTEM, transcript[:400000])
+    depth = str(advanced("pipeline")["deepdive_depth"])
+    system = get_prompt("deepdive") + DEPTH_HINTS.get(depth, "")
+    body = llm.complete(function, system, transcript[:400000])
     _write(project_id, type, f"Deep dive ({label})", body.strip(),
            provider=provider, model=model)
 
@@ -99,7 +108,7 @@ def merge(job_id: int, project_id: int):
     provider, model = llm.resolve_model("merge")
     progress(job_id, f"merging deep dives ({model})")
     body = llm.complete(
-        "merge", prompts.MERGE_SYSTEM,
+        "merge", get_prompt("merge"),
         f"## DOCUMENT 1 (Claude)\n\n{claude_dd}\n\n---\n\n## DOCUMENT 2 (Gemini)\n\n{gemini_dd}",
     )
     _write(project_id, "deepdive_merged", "Deep dive (merged)", body.strip(),
@@ -114,7 +123,11 @@ def podcast_script(job_id: int, project_id: int):
     provider, model = llm.resolve_model("podcast_script")
 
     progress(job_id, "outlining episode")
-    outline = llm.complete_json("podcast_script", prompts.PODCAST_OUTLINE_SYSTEM, deepdive)
+    outline_system = get_prompt("podcast_outline")
+    target = int(advanced("pipeline")["podcast_segments"])
+    outline_system += (f"\nAim for about {target} segments."
+                       if target > 0 else "\n8-14 segments.")
+    outline = llm.complete_json("podcast_script", outline_system, deepdive)
     segments = outline.get("segments", [])
     if not segments:
         raise RuntimeError("outline had no segments")
@@ -124,7 +137,7 @@ def podcast_script(job_id: int, project_id: int):
     for i, seg in enumerate(segments):
         progress(job_id, f"writing segment {i + 1}/{len(segments)}: {seg.get('heading', '')}")
         text = llm.complete(
-            "podcast_script", prompts.PODCAST_SEGMENT_SYSTEM,
+            "podcast_script", get_prompt("podcast_segment"),
             f"Episode: {outline.get('title', '')}\n"
             f"Segment {i + 1}/{len(segments)}: {seg.get('heading', '')}\n"
             f"Points to cover:\n- " + "\n- ".join(seg.get("points", [])) +
@@ -148,7 +161,7 @@ def mindmap(job_id: int, project_id: int):
         deepdive = artifact_body(session, project_id, "deepdive_merged")
     provider, model = llm.resolve_model("mindmap")
     progress(job_id, "building topic graph")
-    graph = llm.complete_json("mindmap", prompts.MINDMAP_SYSTEM, deepdive)
+    graph = llm.complete_json("mindmap", get_prompt("mindmap"), deepdive)
     if not graph.get("nodes"):
         raise RuntimeError("mind map had no nodes")
 

@@ -26,24 +26,35 @@ def resolve_model(function: str) -> tuple[str, str]:
     return d["provider"], d["model"]
 
 
+def resolve_params(function: str) -> tuple[float | None, int]:
+    """Per-function generation params (Settings → Advanced, key params.<fn>)."""
+    p = get_setting(f"params.{function}") or {}
+    temperature = p.get("temperature")
+    max_tokens = int(p.get("max_tokens") or MAX_TOKENS)
+    return temperature, max_tokens
+
+
 def complete(
     function: str,
     system: str,
     user: str,
     *,
-    max_tokens: int = MAX_TOKENS,
+    max_tokens: int | None = None,
     provider: str | None = None,
     model: str | None = None,
 ) -> str:
     if provider is None or model is None:
         provider, model = resolve_model(function)
+    temperature, cfg_max = resolve_params(function)
+    if max_tokens is None:
+        max_tokens = cfg_max
 
     if provider == "ollama":
-        return _ollama(system, user, model, max_tokens)
+        return _ollama(system, user, model, max_tokens, temperature)
     if provider == "anthropic":
-        return _anthropic(system, user, model, max_tokens)
+        return _anthropic(system, user, model, max_tokens, temperature)
     if provider == "gemini":
-        return _gemini(system, user, model, max_tokens)
+        return _gemini(system, user, model, max_tokens, temperature)
     raise ValueError(f"unknown provider {provider!r} for function {function!r}")
 
 
@@ -73,10 +84,12 @@ def _strip_fences(raw: str) -> str:
     return raw
 
 
-def _ollama(system: str, user: str, model: str, max_tokens: int) -> str:
+def _ollama(system: str, user: str, model: str, max_tokens: int,
+            temperature: float | None) -> str:
     from openai import OpenAI
 
     client = OpenAI(base_url=f"{settings.ollama_base_url}/v1", api_key="ollama")
+    kw = {} if temperature is None else {"temperature": temperature}
     resp = client.chat.completions.create(
         model=model,
         max_tokens=max_tokens,
@@ -84,24 +97,29 @@ def _ollama(system: str, user: str, model: str, max_tokens: int) -> str:
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
+        **kw,
     )
     return resp.choices[0].message.content or ""
 
 
-def _anthropic(system: str, user: str, model: str, max_tokens: int) -> str:
+def _anthropic(system: str, user: str, model: str, max_tokens: int,
+               temperature: float | None) -> str:
     import anthropic
 
     client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+    kw = {} if temperature is None else {"temperature": temperature}
     resp = client.messages.create(
         model=model,
         max_tokens=max_tokens,
         system=system,
         messages=[{"role": "user", "content": user}],
+        **kw,
     )
     return "".join(b.text for b in resp.content if b.type == "text")
 
 
-def _gemini(system: str, user: str, model: str, max_tokens: int) -> str:
+def _gemini(system: str, user: str, model: str, max_tokens: int,
+            temperature: float | None) -> str:
     from google import genai
     from google.genai import types
 
@@ -110,7 +128,8 @@ def _gemini(system: str, user: str, model: str, max_tokens: int) -> str:
         model=model,
         contents=user,
         config=types.GenerateContentConfig(
-            system_instruction=system, max_output_tokens=max_tokens
+            system_instruction=system, max_output_tokens=max_tokens,
+            temperature=temperature,
         ),
     )
     return resp.text or ""

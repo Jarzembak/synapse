@@ -44,7 +44,7 @@ export default function Library() {
   const [tagFilter, setTagFilter] = useState<Set<string>>(new Set());
   const [openFilter, setOpenFilter] = useState<Col | null>(null);
 
-  const [grouped, setGrouped] = useState(false);
+  const [grouped, setGrouped] = useState(true);
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
 
   useEffect(() => {

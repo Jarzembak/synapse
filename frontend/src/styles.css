@@ -197,12 +197,24 @@ h2 { margin-top: 1.4rem; }
 
 /* ---------- quickrefs ---------- */
 
-.quickrefs { display: grid; grid-template-columns: 280px 1fr; gap: 1.5rem; }
-.quickrefs aside ul { list-style: none; padding: 0; }
-.quickrefs aside button { background: none; border: none; cursor: pointer; padding: 0.35rem 0.4rem;
+.quickrefs { display: grid; grid-template-columns: 300px 1fr; gap: 1.5rem; }
+.quickrefs aside .search { margin-bottom: 0.5rem; }
+.quickrefs aside select { width: 100%; margin: 0.4rem 0; }
+.quickrefs aside ul { list-style: none; padding: 0; margin: 0.2rem 0; }
+.quickrefs aside ul button { background: none; border: none; cursor: pointer; padding: 0.35rem 0.4rem;
   width: 100%; text-align: left; border-radius: 4px; color: var(--text); }
-.quickrefs aside button.on { background: var(--tag-bg); }
+.quickrefs aside ul button.on { background: var(--tag-bg); }
 .kindmark { margin-right: 0.4rem; }
+.ref-section h3 { margin: 0.9rem 0 0.2rem; font-size: 0.85rem; text-transform: uppercase;
+  color: var(--muted); border-bottom: 1px solid var(--border); padding-bottom: 0.2rem; }
+.kindbadge { font-size: 0.7rem; text-transform: uppercase; background: var(--tag-bg);
+  color: var(--tag-text); border-radius: 8px; padding: 0.15rem 0.5rem; margin-left: 0.6rem;
+  vertical-align: middle; }
+
+.segmented { display: flex; gap: 0.3rem; }
+.segmented button { flex: 1; font-size: 0.8rem; padding: 0.3rem 0.2rem; }
+.segmented button.on { background: var(--accent); color: var(--accent-contrast);
+  border-color: var(--accent); }
 
 /* ---------- mind map ---------- */
 
@@ -225,3 +237,22 @@ h2 { margin-top: 1.4rem; }
 .settings input, .settings select { padding: 0.3rem; }
 .cookies input { margin: 0 0.5rem; }
 audio { margin: 1rem 0; }
+
+/* advanced settings */
+details.advanced { background: var(--panel); border: 1px solid var(--border);
+  border-radius: 8px; padding: 0.6rem 1rem; margin: 0.6rem 0; }
+details.advanced > summary { cursor: pointer; font-weight: 700; padding: 0.2rem 0; }
+details.advanced > summary small { color: var(--muted); font-weight: 400; }
+details.prompt-item { border-left: 3px solid var(--border2); padding-left: 0.8rem;
+  margin: 0.5rem 0; }
+details.prompt-item > summary { cursor: pointer; }
+.modbadge { font-size: 0.7rem; background: var(--warning); color: var(--accent-contrast);
+  border-radius: 8px; padding: 0.1rem 0.5rem; margin-left: 0.5rem; }
+.knobs { display: flex; flex-direction: column; gap: 0.6rem; max-width: 560px; }
+.knobs label { display: flex; justify-content: space-between; align-items: center; gap: 1rem; }
+.knobs label input[type="number"], .knobs label input[type="text"],
+.knobs label input[type="password"], .knobs label select { width: 14rem; }
+.knobs label textarea { width: 14rem; }
+.knobs .checkline { justify-content: flex-start; }
+.knobs button { align-self: flex-start; }
+.row { display: flex; gap: 0.5rem; margin-top: 0.4rem; }

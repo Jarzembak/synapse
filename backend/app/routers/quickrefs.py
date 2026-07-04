@@ -4,7 +4,7 @@ from fastapi import APIRouter, HTTPException
 from sqlmodel import select
 
 from ..db import get_session
-from ..models import Project, QuickRef, QuickRefSource
+from ..models import Artifact, Project, QuickRef, QuickRefSource
 from .. import library
 
 router = APIRouter(prefix="/api/quickrefs", tags=["quickrefs"])
@@ -16,10 +16,13 @@ def _serialize_ref(session, ref: QuickRef) -> dict:
         .join(QuickRefSource, QuickRefSource.project_id == Project.id)
         .where(QuickRefSource.quickref_id == ref.id)
     ).all()
+    art = session.exec(select(Artifact).where(Artifact.path == ref.path)).first()
     return {
         **ref.model_dump(),
         "aliases": library.parse_aliases(ref.aliases),
         "sources": [{"id": p.id, "title": p.title} for p in sources],
+        "tags": library.current_tags(session, art.id) if art else [],
+        "updated": art.updated.isoformat() if art else None,
     }
 
 

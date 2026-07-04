@@ -150,6 +150,111 @@ def test_quickref_detail_includes_sources(client):
     assert listed["sources"] == detail["ref"]["sources"]
 
 
+def test_prompt_editor_roundtrip(client):
+    prompts = client.get("/api/settings/prompts").json()
+    assert "deepdive" in prompts and not prompts["deepdive"]["modified"]
+    default = prompts["deepdive"]["value"]
+
+    r = client.put("/api/settings/prompts/deepdive", json={"value": "custom prompt"})
+    assert r.status_code == 200
+    after = client.get("/api/settings/prompts").json()["deepdive"]
+    assert after["modified"] and after["value"] == "custom prompt"
+
+    # saving the default text back clears the override
+    client.put("/api/settings/prompts/deepdive", json={"value": default})
+    assert not client.get("/api/settings/prompts").json()["deepdive"]["modified"]
+
+    r = client.delete("/api/settings/prompts/deepdive")
+    assert r.json()["default"] == default
+    assert client.put("/api/settings/prompts/nope", json={"value": "x"}).status_code == 400
+
+
+def test_params_and_advanced_roundtrip(client):
+    r = client.put("/api/settings/params/summarize",
+                   json={"temperature": 0.2, "max_tokens": 2048})
+    assert r.status_code == 200
+    assert client.get("/api/settings/params").json()["summarize"] == \
+        {"temperature": 0.2, "max_tokens": 2048}
+    from app.llm import resolve_params
+    assert resolve_params("summarize") == (0.2, 2048)
+    client.put("/api/settings/params/summarize", json={})
+
+    adv = client.get("/api/settings/advanced").json()
+    assert adv["groups"]["pipeline"]["chunk_chars"] == 24000
+    r = client.put("/api/settings/advanced/pipeline",
+                   json={"values": {"chunk_chars": 12000, "bogus_key": 1}})
+    assert r.status_code == 200
+    got = client.get("/api/settings/advanced").json()["groups"]["pipeline"]
+    assert got["chunk_chars"] == 12000
+    assert "bogus_key" not in got
+    client.put("/api/settings/advanced/pipeline", json={"values": {}})
+    assert client.put("/api/settings/advanced/nope", json={"values": {}}).status_code == 400
+
+
+def test_cloud_settings_masking(client):
+    r = client.put("/api/settings/cloud", json={
+        "provider": "s3",
+        "config": {"endpoint": "https://minio.local:9000", "bucket": "synapse",
+                   "access_key_id": "AK", "secret_access_key": "supersecret"},
+        "remote_base": "synapse", "auto": False,
+    })
+    assert r.status_code == 200
+    got = client.get("/api/settings/cloud").json()
+    assert got["config"]["secret_access_key"] == "•set•"      # masked
+    assert "supersecret" not in str(got)
+    assert got["config"]["endpoint"] == "https://minio.local:9000"
+
+    # writing back the mask keeps the stored secret
+    client.put("/api/settings/cloud", json={
+        "provider": "s3",
+        "config": {**got["config"]}, "remote_base": "synapse", "auto": False,
+    })
+    from app.settings_store import get_setting
+    assert get_setting("cloud.config")["secret_access_key"] == "supersecret"
+    assert client.put("/api/settings/cloud", json={
+        "provider": "nope", "config": {}, "remote_base": "x", "auto": False,
+    }).status_code == 400
+
+
+def test_rclone_config_builder():
+    from app.tasks.cloud import build_config
+
+    s3 = build_config("s3", {"endpoint": "https://x", "access_key_id": "a",
+                             "secret_access_key": "s", "region": "us-east-1"})
+    assert "type = s3" in s3 and "endpoint = https://x" in s3 and "region = us-east-1" in s3
+    dav = build_config("webdav", {"url": "https://nc/remote.php/dav/files/lee",
+                                  "user": "lee", "_obscured_password": "xyz"})
+    assert "type = webdav" in dav and "vendor = nextcloud" in dav and "pass = xyz" in dav
+    drv = build_config("drive", {"token": '{"access_token":"t"}'})
+    assert "type = drive" in drv and "scope = drive" in drv
+    import pytest as _pytest
+    with _pytest.raises(ValueError):
+        build_config("nope", {})
+
+
+def test_quickref_concept_kind(client):
+    """concept docs land in concepts/ with the quickref_concept artifact type."""
+    from sqlmodel import select
+    from app.models import QuickRef
+
+    library._write_doc("concepts/least-privilege.md", {"title": "least privilege"}, "body")
+    with get_session() as session:
+        ref = QuickRef(kind="concept", slug="least-privilege", title="least privilege",
+                       path="concepts/least-privilege.md", aliases="[]")
+        session.add(ref)
+        session.commit()
+        art = library.write_artifact(
+            session, project_id=None, project_slug=None, type="quickref_concept",
+            title="least privilege", body="body",
+            rel_path="concepts/least-privilege.md",
+        )
+        library.apply_tags(session, art, ["hardening"])
+    refs = client.get("/api/quickrefs?kind=concept").json()
+    hit = next(r for r in refs if r["slug"] == "least-privilege")
+    assert hit["tags"] == ["hardening"]
+    assert hit["updated"] is not None
+
+
 def test_model_override(client):
     r = client.put("/api/settings/models/summarize",
                    json={"provider": "anthropic", "model": "claude-haiku-4-5"})

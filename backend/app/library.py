@@ -28,7 +28,8 @@ from .models import Artifact, Tag, ArtifactTag, utcnow
 ARTIFACT_TYPES = [
     "transcript", "corrected", "summary", "deepdive_claude", "deepdive_gemini",
     "deepdive_merged", "podcast_script", "podcast_audio", "trimmed_audio",
-    "mindmap", "quickref_tool", "quickref_technique", "source_video", "source_audio",
+    "mindmap", "quickref_tool", "quickref_technique", "quickref_concept",
+    "source_video", "source_audio",
 ]
 
 
@@ -150,7 +151,25 @@ def write_artifact(
 
     sync_fts(session, artifact, body)
     session.commit()
+    _queue_cloud_sync(artifact)
     return artifact
+
+
+def _queue_cloud_sync(artifact: Artifact) -> None:
+    """Best-effort: when cloud auto-sync is on, upload this artifact's files."""
+    from .settings_store import get_setting
+
+    if not get_setting("cloud.auto"):
+        return
+    try:
+        # lazy import — library.py is used by the API, which must not pull the
+        # whole celery task tree at module import time
+        from .tasks.celery_app import celery
+
+        paths = [artifact.path] + ([artifact.media_path] if artifact.media_path else [])
+        celery.send_task("cloud_sync_paths", args=[paths])
+    except Exception:
+        pass  # a broker hiccup must never fail an artifact write
 
 
 def current_tags(session: Session, artifact_id: int | None) -> list[str]:

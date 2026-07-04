@@ -86,9 +86,16 @@ def fetch_site_captions(url: str, project_slug: str) -> str | None:
 def whisper_transcribe(audio: Path, on_progress) -> str:
     from faster_whisper import WhisperModel
 
+    from ..config import advanced
+
+    asr = advanced("asr")
     _, model_name = llm.resolve_model("asr")
     model = WhisperModel(model_name, device="cpu", compute_type="int8")
-    segments, info = model.transcribe(str(audio), vad_filter=True)
+    segments, info = model.transcribe(
+        str(audio),
+        vad_filter=bool(asr.get("vad", True)),
+        language=(asr.get("language") or None),
+    )
     total = info.duration or 1
     lines = []
     for seg in segments:

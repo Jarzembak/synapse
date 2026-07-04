@@ -8,14 +8,15 @@ from pathlib import Path
 
 import httpx
 
-from ..config import settings
+from ..config import advanced, settings
 from ..db import get_session
 from .. import library, llm
 from ..settings_store import get_setting
 from .celery_app import celery
 from .common import artifact_body, get_project, pipeline_task, progress
 from .ingest import source_audio
-from . import media, prompts
+from .prompts import get_prompt
+from . import media
 
 KOKORO_FILES = {
     "kokoro-v1.0.onnx":
@@ -24,7 +25,6 @@ KOKORO_FILES = {
         "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin",
 }
 DEFAULT_VOICES = {"HOST_A": "am_michael", "HOST_B": "af_heart"}
-GAP_SECONDS = 0.4
 
 
 def parse_script(body: str) -> list[tuple[str, str]]:
@@ -58,18 +58,21 @@ def _tts_kokoro(lines, wd: Path, on_progress) -> Path:
     import soundfile as sf
 
     voices = {**DEFAULT_VOICES, **(get_setting("tts.voices") or {})}
+    tuning = advanced("audio")
     kokoro = _kokoro_model()
     tts_dir = wd / "tts"
     tts_dir.mkdir(exist_ok=True)
 
     concat_list = tts_dir / "list.txt"
     gap = tts_dir / "gap.wav"
-    sf.write(gap, np.zeros(int(24000 * GAP_SECONDS), dtype="float32"), 24000)
+    gap_seconds = max(0.05, float(tuning["tts_gap"]))
+    sf.write(gap, np.zeros(int(24000 * gap_seconds), dtype="float32"), 24000)
 
     entries = []
     for i, (speaker, text) in enumerate(lines):
         on_progress(f"synthesizing line {i + 1}/{len(lines)}")
-        samples, rate = kokoro.create(text, voice=voices[speaker], speed=1.0)
+        samples, rate = kokoro.create(text, voice=voices[speaker],
+                                      speed=float(tuning["tts_speed"]))
         line_wav = tts_dir / f"line_{i:05d}.wav"
         sf.write(line_wav, samples, rate)
         entries.append(f"file '{line_wav.name}'")
@@ -208,11 +211,15 @@ def trim(job_id: int, project_id: int):
 
     progress(job_id, "finding off-topic spans")
     provider, model = llm.resolve_model("trim_spans")
-    result = llm.complete_json("trim_spans", prompts.TRIM_SPANS_SYSTEM, transcript[:120000])
+    result = llm.complete_json("trim_spans", get_prompt("trim_spans"), transcript[:120000])
     removed = result.get("remove", [])
     keeps = keep_spans(removed, total)
 
     progress(job_id, "cutting and removing silence with ffmpeg")
+    tuning = advanced("audio")
+    silence = (f"silenceremove=stop_periods=-1"
+               f":stop_duration={float(tuning['trim_silence'])}"
+               f":stop_threshold={int(tuning['trim_db'])}dB")
     if keeps and len(keeps) < 200:
         parts = []
         filters = []
@@ -220,10 +227,9 @@ def trim(job_id: int, project_id: int):
             filters.append(f"[0:a]atrim={a}:{b},asetpts=PTS-STARTPTS[k{i}]")
             parts.append(f"[k{i}]")
         filters.append(f"{''.join(parts)}concat=n={len(keeps)}:v=0:a=1[cat]")
-        graph = ";".join(filters) + \
-            ";[cat]silenceremove=stop_periods=-1:stop_duration=1.5:stop_threshold=-40dB[out]"
+        graph = ";".join(filters) + f";[cat]{silence}[out]"
     else:
-        graph = "[0:a]silenceremove=stop_periods=-1:stop_duration=1.5:stop_threshold=-40dB[out]"
+        graph = f"[0:a]{silence}[out]"
 
     out = wd / "trimmed.mp3"
     media.run(["ffmpeg", "-y", "-i", str(src), "-filter_complex", graph,

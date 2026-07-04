@@ -13,4 +13,4 @@ from ..db import init_db  # noqa: E402
 init_db()  # worker may start before the api; both are idempotent
 
 # Import task modules so the worker registers them.
-from . import ingest, transcribe, generate, quickref, audio  # noqa: E402,F401
+from . import ingest, transcribe, generate, quickref, audio, cloud  # noqa: E402,F401
