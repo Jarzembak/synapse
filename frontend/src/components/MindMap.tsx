@@ -27,7 +27,7 @@ function layout(graph: Graph): Node[] {
       out.push({
         id: n.id,
         position: { x: col * 320, y: row * 90 },
-        data: { label: n.label, ...n },
+        data: { ...n },
         style: {
           background: "#fff",
           border: `2px solid ${KIND_COLORS[kind]}`,
