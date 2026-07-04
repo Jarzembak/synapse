@@ -124,6 +124,32 @@ def test_media_prefix_serving(client):
     assert r.content == b"fake-m4a-bytes"
 
 
+def test_quickref_detail_includes_sources(client):
+    """Regression: detail endpoint must serialize like the list endpoint —
+    a missing 'sources' key white-screened the QuickRefs page."""
+    from sqlmodel import select
+    from app.models import QuickRef, QuickRefSource
+
+    seed_artifact("qr seed", "ensures the demo project exists")
+    library._write_doc("tools/testtool.md", {"title": "testtool"}, "quick ref body")
+    with get_session() as session:
+        project = session.exec(select(Project).where(Project.slug == "demo")).first()
+        ref = QuickRef(kind="tool", slug="testtool", title="testtool",
+                       path="tools/testtool.md", aliases='["test tool"]')
+        session.add(ref)
+        session.commit()
+        session.refresh(ref)
+        session.add(QuickRefSource(quickref_id=ref.id, project_id=project.id))
+        session.commit()
+        rid, pid, ptitle = ref.id, project.id, project.title
+
+    detail = client.get(f"/api/quickrefs/{rid}").json()
+    assert detail["ref"]["sources"] == [{"id": pid, "title": ptitle}]
+    assert detail["ref"]["aliases"] == ["test tool"]
+    listed = next(r for r in client.get("/api/quickrefs").json() if r["slug"] == "testtool")
+    assert listed["sources"] == detail["ref"]["sources"]
+
+
 def test_model_override(client):
     r = client.put("/api/settings/models/summarize",
                    json={"provider": "anthropic", "model": "claude-haiku-4-5"})

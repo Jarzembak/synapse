@@ -29,7 +29,8 @@ function layout(graph: Graph): Node[] {
         position: { x: col * 320, y: row * 90 },
         data: { ...n },
         style: {
-          background: "#fff",
+          background: "var(--panel)",
+          color: "var(--text)",
           border: `2px solid ${KIND_COLORS[kind]}`,
           borderRadius: 8,
           padding: 6,
@@ -56,8 +57,8 @@ export default function MindMap({ graph }: { graph: Graph }) {
           source: e.source,
           target: e.target,
           label: e.label,
-          style: { stroke: "#999" },
-          labelStyle: { fontSize: 10, fill: "#666" },
+          style: { stroke: "var(--border2)" },
+          labelStyle: { fontSize: 10, fill: "var(--muted)" },
         })),
     [graph]
   );

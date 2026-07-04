@@ -10,26 +10,26 @@ from .. import library
 router = APIRouter(prefix="/api/quickrefs", tags=["quickrefs"])
 
 
+def _serialize_ref(session, ref: QuickRef) -> dict:
+    sources = session.exec(
+        select(Project)
+        .join(QuickRefSource, QuickRefSource.project_id == Project.id)
+        .where(QuickRefSource.quickref_id == ref.id)
+    ).all()
+    return {
+        **ref.model_dump(),
+        "aliases": library.parse_aliases(ref.aliases),
+        "sources": [{"id": p.id, "title": p.title} for p in sources],
+    }
+
+
 @router.get("")
 def list_quickrefs(kind: str = ""):
     with get_session() as session:
         stmt = select(QuickRef).order_by(QuickRef.kind, QuickRef.title)
         if kind:
             stmt = stmt.where(QuickRef.kind == kind)
-        refs = session.exec(stmt).all()
-        out = []
-        for r in refs:
-            sources = session.exec(
-                select(Project)
-                .join(QuickRefSource, QuickRefSource.project_id == Project.id)
-                .where(QuickRefSource.quickref_id == r.id)
-            ).all()
-            out.append({
-                **r.model_dump(),
-                "aliases": library.parse_aliases(r.aliases),
-                "sources": [{"id": p.id, "title": p.title} for p in sources],
-            })
-        return out
+        return [_serialize_ref(session, r) for r in session.exec(stmt).all()]
 
 
 def _versions(ref: QuickRef) -> list[str]:
@@ -51,7 +51,7 @@ def get_quickref(ref_id: int):
             raise HTTPException(404)
         meta, body = library.read_doc(ref.path)
         return {
-            "ref": {**ref.model_dump(), "aliases": library.parse_aliases(ref.aliases)},
+            "ref": _serialize_ref(session, ref),
             "meta": meta,
             "body": body,
             "versions": _versions(ref),

@@ -6,6 +6,7 @@ import ArtifactView from "./pages/ArtifactView";
 import QuickRefs from "./pages/QuickRefs";
 import Settings from "./pages/Settings";
 import JobTicker from "./components/JobTicker";
+import ThemeSelect from "./components/ThemeSelect";
 
 export default function App() {
   return (
@@ -17,6 +18,7 @@ export default function App() {
         <NavLink to="/quickrefs">Quick-refs</NavLink>
         <NavLink to="/settings">Settings</NavLink>
         <JobTicker />
+        <ThemeSelect />
       </nav>
       <main>
         <Routes>

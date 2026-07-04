@@ -79,11 +79,11 @@ export default function QuickRefs() {
       {open && (
         <section>
           <h2>{open.ref.title}</h2>
-          {open.ref.aliases.length > 0 && (
+          {(open.ref.aliases ?? []).length > 0 && (
             <p className="meta">aka: {open.ref.aliases.join(", ")}</p>
           )}
           <p className="meta">
-            from: {open.ref.sources.map((s) => s.title).join(" · ")}
+            from: {(open.ref.sources ?? []).map((s) => s.title).join(" · ")}
           </p>
           {open.versions.length > 0 && (
             <details>
