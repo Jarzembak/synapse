@@ -111,6 +111,20 @@ def test_make_slug():
     assert library.make_slug("") == "untitled"
 
 
+def test_whisper_config_chain():
+    from app.tasks.transcribe import _whisper_configs
+
+    # auto GPU prefers float16 (Blackwell-safe) before int8, ends on cpu net
+    assert _whisper_configs("auto", "auto") == [
+        ("cuda", "float16"), ("cuda", "int8_float16"), ("cuda", "int8"), ("cpu", "int8")]
+    # explicit cuda int8 retries float16 before falling to cpu
+    assert _whisper_configs("cuda", "int8") == [
+        ("cuda", "int8"), ("cuda", "float16"), ("cpu", "int8")]
+    # cpu never emits gpu-only float16 kernels
+    assert _whisper_configs("cpu", "float16") == [("cpu", "int8")]
+    assert _whisper_configs("cpu", "int8") == [("cpu", "int8")]
+
+
 def test_video_format_string():
     assert video_format_string(1080) == \
         "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best"

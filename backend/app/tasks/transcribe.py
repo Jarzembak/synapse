@@ -87,41 +87,75 @@ def fetch_site_captions(url: str, project_slug: str) -> str | None:
     return parsed or None
 
 
+def _whisper_configs(device: str, compute_type: str) -> list[tuple[str, str]]:
+    """Ordered (device, compute_type) attempts, most-preferred first.
+
+    Auto GPU deliberately prefers float16 over int8: on Blackwell (RTX 50xx,
+    sm_120) faster-whisper's int8 path raises CUBLAS_STATUS_NOT_SUPPORTED
+    during inference, and float16 is the documented workaround while staying
+    valid on all CUDA GPUs. cpu/int8 is always the final safety net.
+    """
+    if device == "cpu":
+        ct = "int8" if compute_type in ("auto", "float16", "int8_float16") else compute_type
+        return [("cpu", ct)]
+    configs: list[tuple[str, str]] = []
+    if device in ("cuda", "auto"):
+        if compute_type == "auto":
+            configs += [("cuda", "float16"), ("cuda", "int8_float16"), ("cuda", "int8")]
+        else:
+            configs.append(("cuda", compute_type))
+            if compute_type != "float16":
+                configs.append(("cuda", "float16"))  # Blackwell-safe retry
+    # always fall back to CPU so a GPU that's absent/unsupported still works
+    configs.append(("cpu", "int8"))
+    # de-dupe preserving order
+    seen, out = set(), []
+    for c in configs:
+        if c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out
+
+
 def whisper_transcribe(audio: Path, on_progress) -> str:
+    import logging
+
     from faster_whisper import WhisperModel
 
     from ..config import advanced
-
-    import logging
 
     log = logging.getLogger(__name__)
     asr = advanced("asr")
     compute = advanced("compute")
     device = compute.get("whisper_device") or "auto"
     compute_type = compute.get("whisper_compute_type") or "auto"
-    if device == "cpu" and compute_type in ("float16", "int8_float16"):
-        compute_type = "int8"  # float16 kernels are GPU-only
     _, model_name = llm.resolve_model("asr")
-    on_progress(f"loading whisper {model_name} (device={device}, compute={compute_type})")
-    try:
-        model = WhisperModel(model_name, device=device, compute_type=compute_type)
-    except (ValueError, RuntimeError) as e:
-        # e.g. float16 requested but resolved device is CPU, or CUDA missing
-        log.warning("whisper load failed with device=%s compute=%s (%s); "
-                    "falling back to cpu/int8", device, compute_type, e)
-        on_progress("whisper falling back to cpu/int8")
-        model = WhisperModel(model_name, device="cpu", compute_type="int8")
-    segments, info = model.transcribe(
-        str(audio),
-        vad_filter=bool(asr.get("vad", True)),
-        language=(asr.get("language") or None),
-    )
-    total = info.duration or 1
-    lines = []
-    for seg in segments:
-        lines.append(f"[{ts(seg.start)}] {seg.text.strip()}")
-        on_progress(f"transcribing {int(seg.end / total * 100)}%")
-    return "\n".join(lines)
+
+    # int8 on Blackwell fails during INFERENCE, not model load, so each config
+    # is attempted through a full transcription before moving to the next.
+    configs = _whisper_configs(device, compute_type)
+    last_err: Exception | None = None
+    for i, (dev, ct) in enumerate(configs):
+        try:
+            on_progress(f"loading whisper {model_name} (device={dev}, compute={ct})")
+            model = WhisperModel(model_name, device=dev, compute_type=ct)
+            segments, info = model.transcribe(
+                str(audio),
+                vad_filter=bool(asr.get("vad", True)),
+                language=(asr.get("language") or None),
+            )
+            total = info.duration or 1
+            lines = []
+            for seg in segments:  # inference happens here — Blackwell int8 dies here
+                lines.append(f"[{ts(seg.start)}] {seg.text.strip()}")
+                on_progress(f"transcribing {int(seg.end / total * 100)}%")
+            return "\n".join(lines)
+        except (ValueError, RuntimeError) as e:
+            last_err = e
+            log.warning("whisper failed on device=%s compute=%s (%s)%s",
+                        dev, ct, e,
+                        "; trying next config" if i + 1 < len(configs) else "")
+    raise RuntimeError(f"all whisper configs failed; last error: {last_err}")
 
 
 def gemini_transcribe(audio: Path) -> str:

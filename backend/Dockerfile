@@ -11,13 +11,14 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # GPU=1 (set by docker-compose.gpu.yml) adds the CUDA runtime libraries
 # faster-whisper/CTranslate2 need for whisper_device=cuda. Default build stays
-# CPU-only and lean.
+# CPU-only and lean. The python one-liner prints each pip-installed CUDA lib
+# dir (semicolon-separated simple statements — no literal newlines, which the
+# shell would pass to python as invalid line-continuations) so ldconfig can
+# find libcublas/libcudnn at runtime.
 ARG GPU=0
 RUN if [ "$GPU" = "1" ]; then \
         pip install --no-cache-dir nvidia-cublas-cu12 nvidia-cudnn-cu12 && \
-        python -c "import os, nvidia.cublas.lib, nvidia.cudnn.lib; \
-print(os.path.dirname(nvidia.cublas.lib.__file__)); \
-print(os.path.dirname(nvidia.cudnn.lib.__file__))" > /etc/ld.so.conf.d/nvidia-pip.conf && \
+        python -c "import nvidia.cublas.lib, nvidia.cudnn.lib; print(list(nvidia.cublas.lib.__path__)[0]); print(list(nvidia.cudnn.lib.__path__)[0])" > /etc/ld.so.conf.d/nvidia-pip.conf && \
         ldconfig; \
     fi
 
