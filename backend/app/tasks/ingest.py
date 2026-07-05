@@ -17,6 +17,41 @@ def cookies_path(project_slug: str) -> Path:
     return media.workdir(project_slug) / "cookies.txt"
 
 
+def fetch_url_metadata(url: str, project_slug: str | None = None) -> dict:
+    """Lightweight metadata (no download) for auto-naming a URL project.
+    Returns {} on any failure so project creation never blocks on a bad URL."""
+    import yt_dlp
+
+    opts = {"quiet": True, "skip_download": True, "socket_timeout": 15,
+            "noplaylist": True}
+    if project_slug:
+        ck = cookies_path(project_slug)
+        if ck.exists():
+            opts["cookiefile"] = str(ck)
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+        return {
+            "title": info.get("title") or "",
+            "uploader": (info.get("uploader") or info.get("channel")
+                         or info.get("creator") or info.get("series") or ""),
+        }
+    except Exception:
+        import logging
+
+        logging.getLogger(__name__).info("metadata fetch failed for %s", url)
+        return {}
+
+
+def combined_title(meta: dict) -> str | None:
+    """'<author/podcast> - <title>' from yt-dlp metadata, or None."""
+    title = (meta.get("title") or "").strip()
+    uploader = (meta.get("uploader") or "").strip()
+    if not title:
+        return None
+    return f"{uploader} - {title}" if uploader else title
+
+
 @celery.task(name="ingest")
 @pipeline_task
 def ingest(job_id: int, project_id: int):
@@ -43,7 +78,10 @@ def ingest(job_id: int, project_id: int):
             opts["cookiefile"] = str(ck)
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(project.source, download=True)
-            title = info.get("title") or project.title
+            title = combined_title({
+                "title": info.get("title"),
+                "uploader": info.get("uploader") or info.get("channel"),
+            }) or project.title
     else:
         progress(job_id, "copying local file")
         src = media.resolve_local_source(project.source)

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Link, useParams } from "react-router-dom";
+import { Link, useNavigate, useParams } from "react-router-dom";
 import { api, Project, Step } from "../api";
 
 interface DetailStep extends Step {
@@ -19,9 +19,12 @@ interface Detail {
 
 export default function ProjectDetail() {
   const { id } = useParams();
+  const nav = useNavigate();
   const [detail, setDetail] = useState<Detail | null>(null);
   const [error, setError] = useState("");
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const [renaming, setRenaming] = useState(false);
+  const [titleDraft, setTitleDraft] = useState("");
   const fileRef = useRef<HTMLInputElement>(null);
 
   const load = useCallback(() => {
@@ -74,12 +77,67 @@ export default function ProjectDetail() {
     alert("cookies.txt uploaded — used by ingest/download/transcript for auth sites");
   }
 
+  async function saveRename() {
+    const title = titleDraft.trim();
+    if (!title) return;
+    try {
+      await api(`/projects/${id}`, { method: "PATCH", body: JSON.stringify({ title }) });
+      setRenaming(false);
+      load();
+    } catch (e: any) {
+      setError(e.message);
+    }
+  }
+
+  async function deleteProject() {
+    if (!detail) return;
+    const ok = confirm(
+      `Delete "${detail.project.title}"?\n\n` +
+      "This permanently deletes ALL of this project's artifacts — transcript, " +
+      "summary, deep dives, podcast script and audio, trimmed audio, mind map — " +
+      "and any downloaded source video/audio.\n\n" +
+      "Quick-reference docs it contributed to will remain.\n\nThis cannot be undone."
+    );
+    if (!ok) return;
+    try {
+      await api(`/projects/${id}`, { method: "DELETE" });
+      nav("/projects");
+    } catch (e: any) {
+      setError(e.message);
+    }
+  }
+
   if (!detail) return <p>{error || "loading…"}</p>;
   const { project, steps } = detail;
 
   return (
     <div className="project-detail">
-      <h2>{project.title}</h2>
+      <div className="project-head">
+        {renaming ? (
+          <span className="rename">
+            <input
+              autoFocus
+              value={titleDraft}
+              onChange={(e) => setTitleDraft(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter") saveRename(); }}
+            />
+            <button onClick={saveRename}>save</button>
+            <button onClick={() => setRenaming(false)}>cancel</button>
+          </span>
+        ) : (
+          <>
+            <h2>{project.title}</h2>
+            <button
+              className="linkish"
+              title="rename project"
+              onClick={() => { setTitleDraft(project.title); setRenaming(true); }}
+            >✎ rename</button>
+            <button className="linkish danger" title="delete project" onClick={deleteProject}>
+              🗑 delete
+            </button>
+          </>
+        )}
+      </div>
       <p className="mono">{project.source}</p>
       <div className="board-toolbar">
         <button

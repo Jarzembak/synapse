@@ -28,9 +28,25 @@ class ProjectCreate(BaseModel):
 def create_project(req: ProjectCreate):
     if req.source_type not in ("url", "local"):
         raise HTTPException(400, "source_type must be 'url' or 'local'")
-    title = req.title or (f"(pending: {req.source[:60]})" if req.source_type == "url"
-                          else req.source.rsplit("/", 1)[-1])
-    slug = library.make_slug(req.title or req.source.rsplit("/", 1)[-1].rsplit("?", 1)[0])
+
+    # URL with no explicit title → derive "<author/podcast> - <title>" from the
+    # site metadata (no download). Falls back to a pending placeholder that the
+    # ingest step later replaces once it fetches the real metadata.
+    resolved = (req.title or "").strip() or None
+    if resolved is None and req.source_type == "url":
+        from ..tasks.ingest import combined_title, fetch_url_metadata
+
+        resolved = combined_title(fetch_url_metadata(req.source))
+
+    if resolved:
+        title = slug_seed = resolved
+    elif req.source_type == "url":
+        title = f"(pending: {req.source[:60]})"
+        slug_seed = req.source.rsplit("/", 1)[-1].rsplit("?", 1)[0] or "video"
+    else:
+        title = slug_seed = req.source.rsplit("/", 1)[-1]
+
+    slug = library.make_slug(slug_seed)
     with get_session() as session:
         base, n = slug, 1
         while session.exec(select(Project).where(Project.slug == slug)).first():
@@ -38,6 +54,28 @@ def create_project(req: ProjectCreate):
             slug = f"{base}-{n}"
         project = Project(slug=slug, title=title, source=req.source,
                           source_type=req.source_type)
+        session.add(project)
+        session.commit()
+        session.refresh(project)
+        return project
+
+
+class ProjectRename(BaseModel):
+    title: str
+
+
+@router.patch("/{project_id}")
+def rename_project(project_id: int, req: ProjectRename):
+    """Rename a project (display title only — the on-disk slug and its library
+    files are left untouched, so nothing is orphaned)."""
+    new_title = req.title.strip()
+    if not new_title:
+        raise HTTPException(400, "title cannot be empty")
+    with get_session() as session:
+        project = session.get(Project, project_id)
+        if not project:
+            raise HTTPException(404)
+        project.title = new_title
         session.add(project)
         session.commit()
         session.refresh(project)
@@ -211,13 +249,20 @@ async def upload_cookies(project_id: int, file: UploadFile):
 
 @router.delete("/{project_id}")
 def delete_project(project_id: int):
-    """Remove the project's DB rows. Library files stay on disk by design."""
+    """Permanently delete a project: its DB rows AND its on-disk artifacts and
+    downloaded media. Cross-project quick-reference docs it contributed to are
+    kept (only the contribution link is removed)."""
+    import shutil
+
     from sqlmodel import text
+
+    from ..config import settings
 
     with get_session() as session:
         project = session.get(Project, project_id)
         if not project:
             raise HTTPException(404)
+        slug = project.slug
         for art in session.exec(select(Artifact).where(Artifact.project_id == project_id)).all():
             session.exec(text("DELETE FROM artifact_fts WHERE artifact_id = :id")
                          .bindparams(id=art.id))
@@ -229,6 +274,13 @@ def delete_project(project_id: int):
                      .bindparams(id=project_id))
         session.delete(project)
         session.commit()
+
+    # remove this project's own directories only — never the shared
+    # tools/techniques/concepts quick-ref trees
+    for path in (settings.library_dir / "projects" / slug,
+                 settings.media_dir / slug):
+        shutil.rmtree(path, ignore_errors=True)
+
     from ..settings_store import set_setting
 
     set_setting(f"projtags.{project_id}", None)  # drop the cached tag marker

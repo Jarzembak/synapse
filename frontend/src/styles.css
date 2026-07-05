@@ -174,6 +174,15 @@ h2 { margin-top: 1.4rem; }
 .newproject { display: flex; gap: 0.5rem; }
 .newproject input { flex: 1; padding: 0.45rem; }
 
+.project-head { display: flex; align-items: center; gap: 0.8rem; flex-wrap: wrap; }
+.project-head h2 { margin: 1rem 0 0.4rem; }
+.project-head .rename { display: flex; align-items: center; gap: 0.4rem; margin: 1rem 0 0.4rem; }
+.project-head .rename input { font-size: 1.2rem; padding: 0.3rem 0.5rem; min-width: 22rem; }
+button.linkish { background: none; border: none; color: var(--link); cursor: pointer;
+  font-size: 0.85rem; padding: 0.2rem 0.3rem; }
+button.linkish:hover { text-decoration: underline; border: none; }
+button.linkish.danger { color: var(--danger); }
+
 .board-toolbar { display: flex; align-items: center; gap: 1.2rem; margin: 0.8rem 0; }
 .runall { font-weight: 700; padding: 0.45rem 0.9rem; }
 .runall:not(:disabled) { background: var(--accent); color: var(--accent-contrast);

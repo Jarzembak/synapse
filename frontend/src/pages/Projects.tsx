@@ -14,14 +14,35 @@ export default function Projects() {
     api<Project[]>("/projects").then(setProjects).catch((e) => setError(e.message));
   }, []);
 
+  const [creating, setCreating] = useState(false);
+
   async function create(e: FormEvent) {
     e.preventDefault();
+    setCreating(true);
+    setError("");
     try {
       const p = await api<Project>("/projects", {
         method: "POST",
         body: JSON.stringify({ source, source_type: sourceType, title: title || null }),
       });
       nav(`/projects/${p.id}`);
+    } catch (err: any) {
+      setError(err.message);
+    } finally {
+      setCreating(false);
+    }
+  }
+
+  async function remove(p: Project) {
+    const ok = confirm(
+      `Delete "${p.title}"?\n\n` +
+      "This permanently deletes all of its artifacts and any downloaded media. " +
+      "Quick-reference docs it contributed to will remain.\n\nThis cannot be undone."
+    );
+    if (!ok) return;
+    try {
+      await api(`/projects/${p.id}`, { method: "DELETE" });
+      setProjects((prev) => prev.filter((x) => x.id !== p.id));
     } catch (err: any) {
       setError(err.message);
     }
@@ -43,14 +64,20 @@ export default function Projects() {
           onChange={(e) => setSource(e.target.value)}
           required
         />
-        <input placeholder="Title (optional)" value={title} onChange={(e) => setTitle(e.target.value)} />
-        <button type="submit">Create</button>
+        <input placeholder="Title (optional — auto-named from the URL)"
+               value={title} onChange={(e) => setTitle(e.target.value)} />
+        <button type="submit" disabled={creating}>
+          {creating ? "creating…" : "Create"}
+        </button>
       </form>
+      {sourceType === "url" && (
+        <p className="hint">Leave the title blank to auto-name it "author/podcast - title" from the URL.</p>
+      )}
       {error && <p className="error">{error}</p>}
 
       <h2>Projects</h2>
       <table className="list">
-        <thead><tr><th>Title</th><th>Source</th><th>Status</th><th>Created</th></tr></thead>
+        <thead><tr><th>Title</th><th>Source</th><th>Status</th><th>Created</th><th></th></tr></thead>
         <tbody>
           {projects.map((p) => (
             <tr key={p.id}>
@@ -58,6 +85,10 @@ export default function Projects() {
               <td className="mono">{p.source.slice(0, 60)}</td>
               <td>{p.status}</td>
               <td>{new Date(p.created).toLocaleDateString()}</td>
+              <td>
+                <button className="linkish danger" title="delete project"
+                        onClick={() => remove(p)}>🗑</button>
+              </td>
             </tr>
           ))}
         </tbody>

@@ -328,6 +328,83 @@ def test_logging_and_tail_endpoint(client):
     assert client.get("/api/logs/..%2Fetc").status_code in (400, 404)
 
 
+def test_combined_title():
+    from app.tasks.ingest import combined_title
+
+    assert combined_title({"title": "Kubernetes in 100s", "uploader": "Fireship"}) \
+        == "Fireship - Kubernetes in 100s"
+    assert combined_title({"title": "Solo talk", "uploader": ""}) == "Solo talk"
+    assert combined_title({"title": "", "uploader": "X"}) is None
+    assert combined_title({}) is None
+
+
+def test_create_auto_names_url(client, monkeypatch):
+    # the create endpoint does `from ..tasks.ingest import fetch_url_metadata`
+    # at call time, so patching the module attribute takes effect
+    from app.tasks import ingest as ingest_mod
+    monkeypatch.setattr(ingest_mod, "fetch_url_metadata",
+                        lambda url, project_slug=None: {"title": "Recon Basics",
+                                                        "uploader": "HackerTalks"})
+    r = client.post("/api/projects", json={
+        "source": "https://youtube.com/watch?v=abc", "source_type": "url",
+    })
+    assert r.status_code == 200
+    body = r.json()
+    assert body["title"] == "HackerTalks - Recon Basics"
+    assert body["slug"] == "hackertalks-recon-basics"
+
+    # explicit title wins, no metadata fetch
+    monkeypatch.setattr(ingest_mod, "fetch_url_metadata",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("no fetch")))
+    r2 = client.post("/api/projects", json={
+        "source": "https://youtube.com/watch?v=xyz", "source_type": "url",
+        "title": "My Title",
+    })
+    assert r2.json()["title"] == "My Title"
+
+
+def test_rename_project(client):
+    r = client.post("/api/projects", json={
+        "source": "https://e.com/r", "source_type": "url", "title": "Old Name"})
+    pid = r.json()["id"]
+    slug = r.json()["slug"]
+
+    resp = client.patch(f"/api/projects/{pid}", json={"title": "New Name"})
+    assert resp.status_code == 200
+    assert resp.json()["title"] == "New Name"
+    assert resp.json()["slug"] == slug  # slug unchanged → no orphaned files
+
+    assert client.patch(f"/api/projects/{pid}", json={"title": "  "}).status_code == 400
+    assert client.patch("/api/projects/99999", json={"title": "x"}).status_code == 404
+
+
+def test_delete_project_removes_files(client):
+    from app.config import settings
+
+    r = client.post("/api/projects", json={
+        "source": "https://e.com/d", "source_type": "url", "title": "Doomed"})
+    pid = r.json()["id"]
+    slug = r.json()["slug"]
+
+    # give it an on-disk artifact + a media file
+    with get_session() as session:
+        library.write_artifact(
+            session, project_id=pid, project_slug=slug, type="summary",
+            title="Summary — Doomed", body="body")
+    media_file = settings.media_dir / slug / "source_video.mp4"
+    media_file.parent.mkdir(parents=True, exist_ok=True)
+    media_file.write_bytes(b"x")
+    proj_dir = settings.library_dir / "projects" / slug
+    assert proj_dir.exists()
+
+    resp = client.delete(f"/api/projects/{pid}")
+    assert resp.status_code == 200
+    assert not proj_dir.exists()
+    assert not (settings.media_dir / slug).exists()
+    assert client.get(f"/api/projects/{pid}").status_code == 404
+    assert client.delete(f"/api/projects/{pid}").status_code == 404
+
+
 def test_step_graph_is_sound():
     """Every dependency is a real step and the graph has no cycles."""
     from app.tasks.orchestrate import HARD_DEPS, RUN_DEPS, STEP_NAMES, STEP_OUTPUT
