@@ -11,25 +11,11 @@ from ..tasks import media
 from ..tasks.celery_app import celery
 from ..tasks.ingest import cookies_path
 
-router = APIRouter(prefix="/api/projects", tags=["projects"])
+from ..tasks.orchestrate import (  # noqa: E402
+    STEPS, STEP_NAMES, applicable_steps, missing_deps, step_done,
+)
 
-# step name → (celery task name, human label); order defines the pipeline board
-STEPS: list[tuple[str, str]] = [
-    ("ingest", "Ingest media"),
-    ("download", "Download & keep media"),
-    ("transcribe", "Transcript"),
-    ("correct", "Correction pass"),
-    ("summarize", "Summary"),
-    ("deepdive_claude", "Deep dive (Claude)"),
-    ("deepdive_gemini", "Deep dive (Gemini)"),
-    ("merge", "Merge deep dives"),
-    ("quickref", "Quick-references"),
-    ("podcast_script", "Podcast script"),
-    ("tts", "Podcast audio"),
-    ("trim", "Trim audio"),
-    ("mindmap", "Mind map"),
-]
-STEP_NAMES = {s for s, _ in STEPS}
+router = APIRouter(prefix="/api/projects", tags=["projects"])
 
 
 class ProjectCreate(BaseModel):
@@ -86,25 +72,46 @@ def get_project(project_id: int):
         latest: dict[str, Job] = {}
         for job in reversed(jobs):
             latest[job.task] = job
+
+        artifact_types = {a.type for a in artifacts}
+        applicable = set(applicable_steps(project))
+        steps = []
+        remaining = 0
+        for name, label in STEPS:
+            job = latest.get(name)
+            missing = missing_deps(session, project, name, artifact_types)
+            done = step_done(session, project, name, artifact_types)
+            not_applicable = name not in applicable
+            if not done and not not_applicable:
+                remaining += 1
+            steps.append({
+                "name": name,
+                "label": label,
+                "job": job,
+                "missing": missing,        # unmet prerequisite step labels
+                "blocked": bool(missing),
+                "done": done,
+                "not_applicable": not_applicable,
+                "artifact": next((a for a in artifacts if a.type == name or
+                                  (name == "download" and a.type == "source_video") or
+                                  (name == "transcribe" and a.type == "transcript") or
+                                  (name == "correct" and a.type == "corrected") or
+                                  (name == "summarize" and a.type == "summary") or
+                                  (name == "merge" and a.type == "deepdive_merged") or
+                                  (name == "tts" and a.type == "podcast_audio") or
+                                  (name == "trim" and a.type == "trimmed_audio")), None),
+            })
+        run_all_active = any(
+            j.task == "run_all" and j.status in ("queued", "running") for j in jobs
+        )
+        any_active = any(j.status in ("queued", "running") for j in jobs)
         return {
             "project": project,
             "artifacts": artifacts,
-            "steps": [
-                {
-                    "name": name,
-                    "label": label,
-                    "job": latest.get(name),
-                    "artifact": next((a for a in artifacts if a.type == name or
-                                      (name == "download" and a.type == "source_video") or
-                                      (name == "transcribe" and a.type == "transcript") or
-                                      (name == "correct" and a.type == "corrected") or
-                                      (name == "summarize" and a.type == "summary") or
-                                      (name == "merge" and a.type == "deepdive_merged") or
-                                      (name == "tts" and a.type == "podcast_audio") or
-                                      (name == "trim" and a.type == "trimmed_audio")), None),
-                }
-                for name, label in STEPS
-            ],
+            "steps": steps,
+            "remaining": remaining,
+            "run_all_active": run_all_active,
+            "any_active": any_active,
         }
 
 
@@ -122,6 +129,9 @@ def run_step(project_id: int, step: str):
         ).first()
         if running:
             raise HTTPException(409, f"{step} is already {running.status}")
+        missing = missing_deps(session, project, step)
+        if missing:
+            raise HTTPException(409, f"{step} requires: {', '.join(missing)}")
         job = Job(project_id=project_id, task=step)
         session.add(job)
         session.commit()
@@ -130,7 +140,61 @@ def run_step(project_id: int, step: str):
         job.celery_id = async_result.id
         session.add(job)
         session.commit()
+        session.refresh(job)  # commit expires attributes → would serialize as {}
         return job
+
+
+@router.post("/{project_id}/run_all")
+def run_all(project_id: int):
+    """Run every remaining step; concurrent where dependencies allow."""
+    with get_session() as session:
+        project = session.get(Project, project_id)
+        if not project:
+            raise HTTPException(404)
+        active = session.exec(
+            select(Job).where(Job.project_id == project_id,
+                              Job.status.in_(("queued", "running")))
+        ).first()
+        if active:
+            raise HTTPException(409, f"{active.task} is already {active.status}")
+        # global: each orchestrator occupies a worker slot for its whole run,
+        # so several at once would starve the steps they're waiting on
+        other = session.exec(
+            select(Job).where(Job.task == "run_all",
+                              Job.status.in_(("queued", "running")))
+        ).first()
+        if other:
+            raise HTTPException(
+                409, "another project's run-all is in progress — one at a time")
+        job = Job(project_id=project_id, task="run_all")
+        session.add(job)
+        session.commit()
+        session.refresh(job)
+        async_result = celery.send_task("run_all", args=[job.id, project_id])
+        job.celery_id = async_result.id
+        session.add(job)
+        session.commit()
+        session.refresh(job)  # commit expires attributes → would serialize as {}
+        return job
+
+
+@router.post("/{project_id}/reset_jobs")
+def reset_jobs(project_id: int):
+    """Recovery hatch: mark all queued/running jobs as error (e.g. after a
+    worker crash left them stranded, blocking re-runs with 409s)."""
+    with get_session() as session:
+        if not session.get(Project, project_id):
+            raise HTTPException(404)
+        stuck = session.exec(
+            select(Job).where(Job.project_id == project_id,
+                              Job.status.in_(("queued", "running")))
+        ).all()
+        for job in stuck:
+            job.status = "error"
+            job.error = "manually reset"
+            session.add(job)
+        session.commit()
+        return {"reset": len(stuck)}
 
 
 @router.post("/{project_id}/cookies")

@@ -24,7 +24,9 @@ services:
 
   worker:
     build: ./backend
-    command: celery -A app.tasks.celery_app.celery worker --loglevel=info --concurrency=2
+    # concurrency 4: run-all's orchestrator occupies one slot while the
+    # parallel branches (e.g. both deep dives) run in the others
+    command: celery -A app.tasks.celery_app.celery worker --loglevel=info --concurrency=4
     env_file: .env
     environment:
       - REDIS_URL=redis://redis:6379/0

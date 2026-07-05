@@ -328,6 +328,127 @@ def test_logging_and_tail_endpoint(client):
     assert client.get("/api/logs/..%2Fetc").status_code in (400, 404)
 
 
+def test_step_graph_is_sound():
+    """Every dependency is a real step and the graph has no cycles."""
+    from app.tasks.orchestrate import HARD_DEPS, RUN_DEPS, STEP_NAMES, STEP_OUTPUT
+
+    for deps in (HARD_DEPS, RUN_DEPS):
+        assert set(deps) == STEP_NAMES
+        for step, ds in deps.items():
+            assert ds <= STEP_NAMES, f"{step} depends on unknown step(s) {ds - STEP_NAMES}"
+        # topological check: repeatedly remove steps with no remaining deps
+        remaining = {s: set(d) for s, d in deps.items()}
+        while remaining:
+            ready = [s for s, d in remaining.items() if not d]
+            assert ready, f"dependency cycle among {sorted(remaining)}"
+            for s in ready:
+                del remaining[s]
+            for d in remaining.values():
+                d.difference_update(ready)
+    assert set(STEP_OUTPUT) == STEP_NAMES
+
+
+def test_transitive_dependents():
+    from app.tasks.orchestrate import HARD_DEPS, RUN_DEPS, transitive_dependents
+
+    downstream = transitive_dependents("deepdive_claude", RUN_DEPS)
+    assert "merge" in downstream and "tts" in downstream and "mindmap" in downstream
+    assert "deepdive_gemini" not in downstream  # independent branch survives
+    assert "trim" not in downstream
+
+    # failure-skip uses HARD deps: a failed correction pass must NOT skip the
+    # deep dives — they fall back to the raw transcript
+    hard_downstream = transitive_dependents("correct", HARD_DEPS)
+    assert hard_downstream == set()
+
+
+def test_dep_satisfied_soft_vs_hard_failures():
+    from app.tasks.orchestrate import dep_satisfied
+
+    # correct failed → summarize (soft dep on correct) may still launch
+    assert dep_satisfied("summarize", "correct",
+                         done=set(), pending=set(), running=set(), failed={"correct"})
+    # merge hard-requires the deep dives → a failed one blocks it
+    assert not dep_satisfied("merge", "deepdive_claude",
+                             done=set(), pending=set(), running=set(),
+                             failed={"deepdive_claude"})
+    # still pending/running → wait
+    assert not dep_satisfied("summarize", "correct",
+                             done=set(), pending={"correct"}, running=set(), failed=set())
+    # finished before this run started → satisfied
+    assert dep_satisfied("summarize", "correct",
+                         done=set(), pending=set(), running=set(), failed=set())
+
+
+def test_prerequisite_gating(client):
+    r = client.post("/api/projects", json={
+        "source": "https://example.com/gating", "source_type": "url", "title": "Gating demo",
+    })
+    pid = r.json()["id"]
+    detail = client.get(f"/api/projects/{pid}").json()
+    steps = {s["name"]: s for s in detail["steps"]}
+
+    assert not steps["ingest"]["blocked"]
+    assert not steps["download"]["blocked"]
+    assert steps["transcribe"]["blocked"]
+    assert steps["transcribe"]["missing"] == ["Ingest media"]
+    assert steps["merge"]["missing"] == ["Deep dive (Claude)", "Deep dive (Gemini)"]
+    assert steps["tts"]["missing"] == ["Podcast script"]
+    assert detail["remaining"] == 13  # url project: every step applicable
+    assert detail["run_all_active"] is False
+
+    # manual run of a blocked step is refused with the prerequisite named
+    resp = client.post(f"/api/projects/{pid}/run/merge")
+    assert resp.status_code == 409
+    assert "Deep dive" in resp.json()["detail"]
+
+    # local project: download not applicable
+    r2 = client.post("/api/projects", json={
+        "source": "talks/x.mp4", "source_type": "local", "title": "Gating local",
+    })
+    d2 = client.get(f"/api/projects/{r2.json()['id']}").json()
+    dl = next(s for s in d2["steps"] if s["name"] == "download")
+    assert dl["not_applicable"] is True
+    assert d2["remaining"] == 12
+
+
+def test_run_all_endpoint(client, monkeypatch):
+    from app.tasks.celery_app import celery
+
+    class FakeResult:
+        id = "fake-celery-id"
+
+    sent = []
+    monkeypatch.setattr(celery, "send_task",
+                        lambda name, args=None, **k: (sent.append((name, args)) or FakeResult()))
+
+    r = client.post("/api/projects", json={
+        "source": "https://example.com/runall", "source_type": "url", "title": "Runall demo",
+    })
+    pid = r.json()["id"]
+    resp = client.post(f"/api/projects/{pid}/run_all")
+    assert resp.status_code == 200
+    assert sent == [("run_all", [resp.json()["id"], pid])]
+
+    # a queued/running job blocks a second run_all
+    resp2 = client.post(f"/api/projects/{pid}/run_all")
+    assert resp2.status_code == 409
+
+    # ... and run-all is global: another project can't start one concurrently
+    r3 = client.post("/api/projects", json={
+        "source": "https://example.com/runall2", "source_type": "url", "title": "Runall two",
+    })
+    resp3 = client.post(f"/api/projects/{r3.json()['id']}/run_all")
+    assert resp3.status_code == 409
+    assert "one at a time" in resp3.json()["detail"]
+
+    # recovery hatch: reset stuck jobs, then run_all is allowed again
+    reset = client.post(f"/api/projects/{pid}/reset_jobs")
+    assert reset.json()["reset"] == 1
+    resp4 = client.post(f"/api/projects/{pid}/run_all")
+    assert resp4.status_code == 200
+
+
 def test_model_override(client):
     r = client.put("/api/settings/models/summarize",
                    json={"provider": "anthropic", "model": "claude-haiku-4-5"})

@@ -174,15 +174,29 @@ h2 { margin-top: 1.4rem; }
 .newproject { display: flex; gap: 0.5rem; }
 .newproject input { flex: 1; padding: 0.45rem; }
 
-.board { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 0.8rem; }
-.step { background: var(--panel); border: 1px solid var(--border); border-left: 4px solid var(--border2);
-  border-radius: 6px; padding: 0.6rem 0.8rem; }
-.step.done { border-left-color: var(--success); }
-.step.running, .step.queued { border-left-color: var(--warning); }
-.step.error { border-left-color: var(--danger); }
-.step-head { display: flex; justify-content: space-between; align-items: center; }
-.step-status { font-size: 0.85rem; color: var(--muted); margin: 0.3rem 0; }
-.step pre { max-height: 150px; overflow: auto; font-size: 0.7rem; }
+.board-toolbar { display: flex; align-items: center; gap: 1.2rem; margin: 0.8rem 0; }
+.runall { font-weight: 700; padding: 0.45rem 0.9rem; }
+.runall:not(:disabled) { background: var(--accent); color: var(--accent-contrast);
+  border-color: var(--accent); }
+
+.steplist { display: flex; flex-direction: column; gap: 0.4rem; }
+.step-row { background: var(--panel); border: 1px solid var(--border);
+  border-left: 4px solid var(--border2); border-radius: 6px; }
+.step-row.done { border-left-color: var(--success); }
+.step-row.running, .step-row.queued { border-left-color: var(--warning); }
+.step-row.error { border-left-color: var(--danger); }
+.step-row.dim { opacity: 0.5; }
+.step-main { display: flex; align-items: center; gap: 0.8rem; padding: 0.55rem 0.9rem;
+  cursor: pointer; }
+.step-main .chev { color: var(--accent); font-size: 0.7rem; transition: transform 0.15s;
+  display: inline-block; width: 0.9rem; }
+.step-main .chev.open { transform: rotate(90deg); }
+.step-status { font-size: 0.85rem; color: var(--muted); }
+.prereq { font-size: 0.8rem; color: var(--warning); }
+.step-actions { margin-left: auto; display: flex; align-items: center; gap: 0.7rem; }
+.step-detail { border-top: 1px solid var(--border); padding: 0.6rem 0.9rem 0.8rem 2.6rem; }
+.step-detail pre { max-height: 260px; overflow: auto; font-size: 0.75rem;
+  background: var(--code-bg); color: var(--danger); padding: 0.6rem; border-radius: 6px; }
 
 /* ---------- markdown ---------- */
 
