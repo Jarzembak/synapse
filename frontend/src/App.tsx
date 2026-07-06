@@ -4,6 +4,7 @@ import Projects from "./pages/Projects";
 import ProjectDetail from "./pages/ProjectDetail";
 import ArtifactView from "./pages/ArtifactView";
 import QuickRefs from "./pages/QuickRefs";
+import Jobs from "./pages/Jobs";
 import Settings from "./pages/Settings";
 import JobTicker from "./components/JobTicker";
 import ThemeSelect from "./components/ThemeSelect";
@@ -16,6 +17,7 @@ export default function App() {
         <NavLink to="/">Library</NavLink>
         <NavLink to="/projects">Projects</NavLink>
         <NavLink to="/quickrefs">Quick-refs</NavLink>
+        <NavLink to="/jobs">Jobs</NavLink>
         <NavLink to="/settings">Settings</NavLink>
         <JobTicker />
         <ThemeSelect />
@@ -27,6 +29,7 @@ export default function App() {
           <Route path="/projects/:id" element={<ProjectDetail />} />
           <Route path="/artifacts/:id" element={<ArtifactView />} />
           <Route path="/quickrefs" element={<QuickRefs />} />
+          <Route path="/jobs" element={<Jobs />} />
           <Route path="/settings" element={<Settings />} />
         </Routes>
       </main>

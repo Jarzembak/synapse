@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react";
+import { Link } from "react-router-dom";
 import { Job } from "../api";
 
-/** Live badge in the nav showing running jobs, fed by the SSE stream. */
+/** Live badge in the nav (links to the Jobs tab), fed by the SSE stream. */
 export default function JobTicker() {
   const [active, setActive] = useState<Job[]>([]);
 
@@ -14,11 +15,18 @@ export default function JobTicker() {
     return () => es.close();
   }, []);
 
-  if (active.length === 0) return <span className="ticker idle">idle</span>;
-  const j = active[0];
+  if (active.length === 0) return <Link to="/jobs" className="ticker idle">idle</Link>;
+  const running = active.filter((a) => a.status === "running");
+  const queued = active.filter((a) => a.status === "queued");
+  const lead = running[0] ?? active[0];
   return (
-    <span className="ticker busy" title={active.map((a) => `${a.task}: ${a.progress}`).join("\n")}>
-      ⏳ {active.length} running — {j.task} {j.progress && `· ${j.progress}`}
-    </span>
+    <Link
+      to="/jobs"
+      className="ticker busy"
+      title={active.map((a) => `${a.status} · ${a.task_label ?? a.task}: ${a.progress}`).join("\n")}
+    >
+      ⏳ {running.length} running{queued.length ? `, ${queued.length} queued` : ""}
+      {lead && ` — ${lead.task_label ?? lead.task}${lead.progress ? ` · ${lead.progress}` : ""}`}
+    </Link>
   );
 }

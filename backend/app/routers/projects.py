@@ -139,8 +139,9 @@ def get_project(project_id: int):
                                   (name == "tts" and a.type == "podcast_audio") or
                                   (name == "trim" and a.type == "trimmed_audio")), None),
             })
-        run_all_active = any(
-            j.task == "run_all" and j.status in ("queued", "running") for j in jobs
+        run_all_job = next(
+            (j for j in jobs if j.task == "run_all" and j.status in ("queued", "running")),
+            None,
         )
         any_active = any(j.status in ("queued", "running") for j in jobs)
         return {
@@ -148,7 +149,8 @@ def get_project(project_id: int):
             "artifacts": artifacts,
             "steps": steps,
             "remaining": remaining,
-            "run_all_active": run_all_active,
+            "run_all_active": run_all_job is not None,
+            "run_all_state": run_all_job.status if run_all_job else None,
             "any_active": any_active,
         }
 
@@ -184,36 +186,30 @@ def run_step(project_id: int, step: str):
 
 @router.post("/{project_id}/run_all")
 def run_all(project_id: int):
-    """Run every remaining step; concurrent where dependencies allow."""
+    """Queue every remaining step for this project. Runs immediately if no
+    other project's run-all is active, otherwise waits its turn (run-alls are
+    serial — each holds a worker slot for its whole run). Individual steps
+    within the run still go concurrent where dependencies allow."""
+    from ..tasks.orchestrate import maybe_start_next_run_all
+
     with get_session() as session:
         project = session.get(Project, project_id)
         if not project:
             raise HTTPException(404)
-        active = session.exec(
-            select(Job).where(Job.project_id == project_id,
+        existing = session.exec(
+            select(Job).where(Job.project_id == project_id, Job.task == "run_all",
                               Job.status.in_(("queued", "running")))
         ).first()
-        if active:
-            raise HTTPException(409, f"{active.task} is already {active.status}")
-        # global: each orchestrator occupies a worker slot for its whole run,
-        # so several at once would starve the steps they're waiting on
-        other = session.exec(
-            select(Job).where(Job.task == "run_all",
-                              Job.status.in_(("queued", "running")))
-        ).first()
-        if other:
-            raise HTTPException(
-                409, "another project's run-all is in progress — one at a time")
-        job = Job(project_id=project_id, task="run_all")
+        if existing:
+            raise HTTPException(409, f"run-all is already {existing.status} for this project")
+        job = Job(project_id=project_id, task="run_all", status="queued")
         session.add(job)
         session.commit()
-        session.refresh(job)
-        async_result = celery.send_task("run_all", args=[job.id, project_id])
-        job.celery_id = async_result.id
-        session.add(job)
-        session.commit()
-        session.refresh(job)  # commit expires attributes → would serialize as {}
-        return job
+        job_id = job.id
+
+    maybe_start_next_run_all()  # starts now if nothing else is running
+    with get_session() as session:
+        return session.get(Job, job_id)
 
 
 @router.post("/{project_id}/reset_jobs")

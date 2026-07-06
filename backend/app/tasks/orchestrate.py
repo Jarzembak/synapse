@@ -157,6 +157,43 @@ def dep_satisfied(step: str, dep: str, done: set[str], pending: set[str],
     return True  # already done before this run started
 
 
+def maybe_start_next_run_all() -> None:
+    """Start the oldest queued whole-project run, if none is running.
+
+    Run-alls are serial by design: each orchestrator holds a worker slot for
+    its entire run, so several at once would starve the very steps they wait
+    on. Queued run_all jobs (task='run_all', status='queued') wait in line and
+    auto-chain — the finishing orchestrator calls this, and so does the enqueue
+    endpoint. A compare-and-swap on the status makes concurrent callers safe.
+    """
+    from sqlmodel import text
+
+    with get_session() as session:
+        running = session.exec(
+            select(Job).where(Job.task == "run_all", Job.status == "running")
+        ).first()
+        if running:
+            return
+        nxt = session.exec(
+            select(Job).where(Job.task == "run_all", Job.status == "queued")
+            .order_by(Job.created)
+        ).first()
+        if not nxt:
+            return
+        res = session.exec(text(
+            "UPDATE job SET status='running', progress='starting' "
+            "WHERE id=:id AND status='queued'").bindparams(id=nxt.id))
+        session.commit()
+        if getattr(res, "rowcount", 0) != 1:
+            return  # another caller won the compare-and-swap
+        try:
+            celery.send_task("run_all", args=[nxt.id, nxt.project_id])
+            log.info("run_all: started project=%s (job=%s)", nxt.project_id, nxt.id)
+        except Exception as e:  # don't strand a 'running' job with no task behind it
+            log.exception("run_all: dispatch failed for job=%s", nxt.id)
+            set_job(session, nxt.id, status="error", error=f"could not dispatch: {e}")
+
+
 @celery.task(name="run_all")
 def run_all(job_id: int, project_id: int):
     """Run every remaining step, launching each as soon as its dependencies
@@ -205,9 +242,17 @@ def run_all(job_id: int, project_id: int):
         running: set[str] = set(adopted)
         done: set[str] = set()
         failed: set[str] = set()
+        canceled = False
         deadline = time.monotonic() + 6 * 3600
 
         while (pending or running) and time.monotonic() < deadline:
+            with get_session() as session:  # user cancellation via the Jobs tab
+                me = session.get(Job, job_id)
+                if me and me.status == "canceled":
+                    _abort_leftovers(session, jobs, pending | running, "run-all canceled")
+                    canceled = True
+                    break
+
             for step in [s for s in list(pending)
                          if all(dep_satisfied(s, d, done, pending, running, failed)
                                 for d in RUN_DEPS[s])]:
@@ -230,7 +275,7 @@ def run_all(job_id: int, project_id: int):
                     if job is None or job.status == "done":
                         running.discard(step)
                         done.add(step)
-                    elif job.status == "error":
+                    elif job.status in ("error", "canceled"):  # canceled step = failed here
                         running.discard(step)
                         failed.add(step)
                         # skip only steps that HARD-require the failed one
@@ -241,8 +286,9 @@ def run_all(job_id: int, project_id: int):
                             set_job(session, jobs[dep], status="error",
                                     error=f"skipped: prerequisite step "
                                           f"'{STEP_LABELS[step]}' failed")
-                        log.warning("run_all project=%s: %s failed; skipped %s",
-                                    project_id, step, sorted(skipped))
+                        log.warning("run_all project=%s: %s %s; skipped %s",
+                                    project_id, step, job.status if job else "gone",
+                                    sorted(skipped))
                 set_job(session, job_id,
                         progress=f"{len(done)} done"
                                  + (f", running: {', '.join(sorted(running))}" if running else "")
@@ -250,7 +296,9 @@ def run_all(job_id: int, project_id: int):
                                  + (f", {len(failed)} failed/skipped" if failed else ""))
 
         with get_session() as session:
-            if pending or running:
+            if canceled:
+                pass  # status already 'canceled'
+            elif pending or running:
                 _abort_leftovers(session, jobs, pending | running, "run-all timed out")
                 set_job(session, job_id, status="error",
                         error=f"timed out with {sorted(pending | running)} unfinished")
@@ -273,6 +321,9 @@ def run_all(job_id: int, project_id: int):
                             error=f"run-all aborted: {e}")
             set_job(session, job_id, status="error", error=str(e)[:2000])
         raise
+    finally:
+        # this run is terminal now → let the next queued project run start
+        maybe_start_next_run_all()
 
 
 def _abort_leftovers(session, jobs: dict[str, int], steps: set[str], reason: str):

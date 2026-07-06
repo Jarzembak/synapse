@@ -42,9 +42,12 @@ export interface Job {
   id: number;
   project_id: number | null;
   task: string;
+  task_label?: string;
+  project_title?: string;
   status: string;
   progress: string;
   error: string;
+  created?: string;
   updated?: string;
 }
 

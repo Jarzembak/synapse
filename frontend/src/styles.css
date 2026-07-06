@@ -104,9 +104,26 @@ button:hover { border-color: var(--accent); }
 .topnav .brand { font-weight: 700; margin-right: 1rem; color: var(--nav-active); }
 .topnav a { color: var(--nav-text); text-decoration: none; }
 .topnav a.active { color: var(--nav-active); border-bottom: 2px solid var(--accent); }
-.ticker { margin-left: auto; font-size: 0.85rem; }
+.ticker { margin-left: auto; font-size: 0.85rem; text-decoration: none; }
 .ticker.idle { color: var(--muted); }
 .ticker.busy { color: var(--warning); }
+.ticker:hover { text-decoration: underline; }
+
+/* jobs tab */
+.jobsection { margin-bottom: 1.4rem; }
+.jobsection h3 { margin: 0.8rem 0 0.3rem; font-size: 0.9rem; text-transform: uppercase;
+  color: var(--muted); }
+.jobs .progress { color: var(--muted); font-size: 0.85rem; }
+.jobactions { display: flex; gap: 0.6rem; }
+.jobstatus { display: inline-block; border-radius: 10px; padding: 0.05rem 0.55rem;
+  font-size: 0.72rem; text-transform: uppercase; font-weight: 700; }
+.jobstatus.running { background: var(--warning); color: var(--accent-contrast); }
+.jobstatus.queued { background: var(--panel2); color: var(--muted); border: 1px solid var(--border2); }
+.jobstatus.done { background: var(--success); color: var(--accent-contrast); }
+.jobstatus.error { background: var(--danger); color: #fff; }
+.jobstatus.canceled { background: var(--panel2); color: var(--muted); }
+.job-error-row pre { max-height: 220px; overflow: auto; font-size: 0.72rem; margin: 0; }
+.muted { color: var(--muted); }
 .themeselect { background: var(--nav-bg); color: var(--nav-text); border-color: var(--border2); }
 
 h2 { margin-top: 1.4rem; }

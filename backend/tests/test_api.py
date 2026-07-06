@@ -5,7 +5,7 @@ from fastapi.testclient import TestClient
 from app.main import app
 from app.db import get_session
 from app import library
-from app.models import Project
+from app.models import Job, Project
 
 
 @pytest.fixture(scope="module")
@@ -489,8 +489,9 @@ def test_prerequisite_gating(client):
     assert d2["remaining"] == 12
 
 
-def test_run_all_endpoint(client, monkeypatch):
+def test_run_all_queues_and_chains(client, monkeypatch):
     from app.tasks.celery_app import celery
+    from app.tasks.orchestrate import maybe_start_next_run_all
 
     class FakeResult:
         id = "fake-celery-id"
@@ -499,31 +500,68 @@ def test_run_all_endpoint(client, monkeypatch):
     monkeypatch.setattr(celery, "send_task",
                         lambda name, args=None, **k: (sent.append((name, args)) or FakeResult()))
 
+    r1 = client.post("/api/projects", json={
+        "source": "https://example.com/ra1", "source_type": "url", "title": "RA one"})
+    p1 = r1.json()["id"]
+    r2 = client.post("/api/projects", json={
+        "source": "https://example.com/ra2", "source_type": "url", "title": "RA two"})
+    p2 = r2.json()["id"]
+
+    # first run-all starts immediately (CAS → running → dispatched)
+    a = client.post(f"/api/projects/{p1}/run_all")
+    assert a.status_code == 200 and a.json()["status"] == "running"
+    assert sent == [("run_all", [a.json()["id"], p1])]
+
+    # same project can't be double-queued
+    assert client.post(f"/api/projects/{p1}/run_all").status_code == 409
+
+    # second project QUEUES (no 409 anymore) and does NOT dispatch yet
+    b = client.post(f"/api/projects/{p2}/run_all")
+    assert b.status_code == 200 and b.json()["status"] == "queued"
+    assert len(sent) == 1  # still only the first was dispatched
+
+    # simulate the first finishing → the queued one auto-chains
+    with get_session() as session:
+        j1 = session.get(Job, a.json()["id"])
+        j1.status = "done"
+        session.add(j1)
+        session.commit()
+    maybe_start_next_run_all()
+    assert sent == [("run_all", [a.json()["id"], p1]),
+                    ("run_all", [b.json()["id"], p2])]
+    assert client.get("/api/jobs", params={"project_id": p2}).json()[0]["status"] == "running"
+
+
+def test_cancel_job(client, monkeypatch):
+    from app.tasks.celery_app import celery
+
+    monkeypatch.setattr(celery, "send_task", lambda *a, **k: type("R", (), {"id": "x"})())
+    monkeypatch.setattr(celery.control, "revoke", lambda *a, **k: None)
+
     r = client.post("/api/projects", json={
-        "source": "https://example.com/runall", "source_type": "url", "title": "Runall demo",
-    })
+        "source": "https://example.com/cancel", "source_type": "url", "title": "Cancel demo"})
     pid = r.json()["id"]
-    resp = client.post(f"/api/projects/{pid}/run_all")
+    job = client.post(f"/api/projects/{pid}/run_all").json()
+
+    resp = client.post(f"/api/jobs/{job['id']}/cancel")
     assert resp.status_code == 200
-    assert sent == [("run_all", [resp.json()["id"], pid])]
+    assert client.get("/api/jobs", params={"project_id": pid}).json()[0]["status"] == "canceled"
+    # cancelling an already-terminal job is a 409
+    assert client.post(f"/api/jobs/{job['id']}/cancel").status_code == 409
+    assert client.post("/api/jobs/99999/cancel").status_code == 404
 
-    # a queued/running job blocks a second run_all
-    resp2 = client.post(f"/api/projects/{pid}/run_all")
-    assert resp2.status_code == 409
 
-    # ... and run-all is global: another project can't start one concurrently
-    r3 = client.post("/api/projects", json={
-        "source": "https://example.com/runall2", "source_type": "url", "title": "Runall two",
-    })
-    resp3 = client.post(f"/api/projects/{r3.json()['id']}/run_all")
-    assert resp3.status_code == 409
-    assert "one at a time" in resp3.json()["detail"]
+def test_jobs_list_enriched(client, monkeypatch):
+    from app.tasks.celery_app import celery
 
-    # recovery hatch: reset stuck jobs, then run_all is allowed again
-    reset = client.post(f"/api/projects/{pid}/reset_jobs")
-    assert reset.json()["reset"] == 1
-    resp4 = client.post(f"/api/projects/{pid}/run_all")
-    assert resp4.status_code == 200
+    monkeypatch.setattr(celery, "send_task", lambda *a, **k: type("R", (), {"id": "x"})())
+    r = client.post("/api/projects", json={
+        "source": "https://example.com/enrich", "source_type": "url", "title": "Enrich demo"})
+    pid = r.json()["id"]
+    client.post(f"/api/projects/{pid}/run_all")
+    jobs = client.get("/api/jobs", params={"project_id": pid}).json()
+    assert jobs[0]["task_label"] == "Run all steps"
+    assert jobs[0]["project_title"] == "Enrich demo"
 
 
 def test_model_override(client):

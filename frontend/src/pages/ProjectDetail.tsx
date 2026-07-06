@@ -14,6 +14,7 @@ interface Detail {
   steps: DetailStep[];
   remaining: number;
   run_all_active: boolean;
+  run_all_state: "queued" | "running" | null;
   any_active: boolean;
 }
 
@@ -143,14 +144,16 @@ export default function ProjectDetail() {
         <button
           className="runall"
           onClick={runAll}
-          disabled={detail.any_active || detail.remaining === 0}
-          title="Runs every remaining step — concurrently where dependencies allow"
+          disabled={detail.run_all_active || detail.remaining === 0}
+          title="Queues every remaining step. Runs now if no other project's run-all is active, otherwise waits its turn."
         >
-          {detail.run_all_active
+          {detail.run_all_state === "running"
             ? "⏳ running all…"
-            : detail.remaining === 0
-              ? "✓ all steps complete"
-              : `▶ run all (${detail.remaining} remaining)`}
+            : detail.run_all_state === "queued"
+              ? "⏳ queued — waiting for another run"
+              : detail.remaining === 0
+                ? "✓ all steps complete"
+                : `▶ run all (${detail.remaining} remaining)`}
         </button>
         <label className="cookies">
           cookies.txt (for Udemy etc.): <input type="file" ref={fileRef} />
