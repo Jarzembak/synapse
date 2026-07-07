@@ -70,87 +70,115 @@ export default function Settings() {
   const [newCat, setNewCat] = useState<CatDraft | null>(null);
   const [catBanner, setCatBanner] = useState("");
   const [saved, setSaved] = useState("");
+  const [savedError, setSavedError] = useState(false);
 
   function load() {
-    api<{ functions: Record<string, ModelCfg>; providers: string[] }>("/settings/models")
-      .then((r) => { setFunctions(r.functions); setProviders(r.providers); });
-    api<{ terms: string[] }>("/settings/glossary").then((r) => setGlossary(r.terms.join("\n")));
-    api<TagInfo[]>("/tags").then(setTags);
-    api<{ max_height: number }>("/settings/download").then((r) => setMaxHeight(r.max_height));
-    api<Record<string, PromptInfo>>("/settings/prompts").then(setPrompts);
-    api<Record<string, Params>>("/settings/params").then(setParams);
-    api<{ groups: Record<string, Record<string, any>> }>("/settings/advanced")
-      .then((r) => setAdv(r.groups));
-    api<CloudState>("/settings/cloud").then((r) => { setCloud(r); setCloudEdit(r.config); });
-    api<QuickRefCategory[]>("/quickrefs/categories").then(setQrCats);
+    Promise.all([
+      api<{ functions: Record<string, ModelCfg>; providers: string[] }>("/settings/models")
+        .then((r) => { setFunctions(r.functions); setProviders(r.providers); }),
+      api<{ terms: string[] }>("/settings/glossary").then((r) => setGlossary(r.terms.join("\n"))),
+      api<TagInfo[]>("/tags").then(setTags),
+      api<{ max_height: number }>("/settings/download").then((r) => setMaxHeight(r.max_height)),
+      api<Record<string, PromptInfo>>("/settings/prompts").then(setPrompts),
+      api<Record<string, Params>>("/settings/params").then(setParams),
+      api<{ groups: Record<string, Record<string, any>> }>("/settings/advanced")
+        .then((r) => setAdv(r.groups)),
+      api<CloudState>("/settings/cloud").then((r) => { setCloud(r); setCloudEdit(r.config); }),
+      api<QuickRefCategory[]>("/quickrefs/categories").then(setQrCats),
+    ]).catch((e) => flash(`couldn't load settings: ${e.message}`, true));
   }
   useEffect(load, []);
 
-  function flash(msg: string) {
+  function flash(msg: string, isError = false) {
     setSaved(msg);
-    setTimeout(() => setSaved(""), 1500);
+    setSavedError(isError);
+    setTimeout(() => setSaved(""), isError ? 4000 : 1500);
   }
 
   async function saveModel(fn: string, cfg: ModelCfg) {
-    setFunctions((prev) => ({ ...prev, [fn]: cfg }));
-    await api(`/settings/models/${fn}`, { method: "PUT", body: JSON.stringify(cfg) });
-    flash(`saved ${fn}`);
+    const prev = functions[fn];
+    setFunctions((p) => ({ ...p, [fn]: cfg }));
+    try {
+      await api(`/settings/models/${fn}`, { method: "PUT", body: JSON.stringify(cfg) });
+      flash(`saved ${fn}`);
+    } catch (e: any) {
+      setFunctions((p) => ({ ...p, [fn]: prev }));  // revert the optimistic edit
+      flash(`save failed: ${e.message}`, true);
+    }
   }
 
   async function saveGlossary() {
-    await api("/settings/glossary", {
-      method: "PUT", body: JSON.stringify({ terms: glossary.split("\n") }),
-    });
-    flash("glossary saved");
+    try {
+      await api("/settings/glossary", {
+        method: "PUT", body: JSON.stringify({ terms: glossary.split("\n") }),
+      });
+      flash("glossary saved");
+    } catch (e: any) { flash(`save failed: ${e.message}`, true); }
   }
 
   async function saveMaxHeight(v: number) {
+    const prev = maxHeight;
     setMaxHeight(v);
-    await api("/settings/download", { method: "PUT", body: JSON.stringify({ max_height: v }) });
-    flash("download quality saved");
+    try {
+      await api("/settings/download", { method: "PUT", body: JSON.stringify({ max_height: v }) });
+      flash("download quality saved");
+    } catch (e: any) {
+      setMaxHeight(prev);
+      flash(`save failed: ${e.message}`, true);
+    }
   }
 
   async function savePrompt(name: string) {
-    await api(`/settings/prompts/${name}`, {
-      method: "PUT", body: JSON.stringify({ value: prompts[name].value }),
-    });
-    api<Record<string, PromptInfo>>("/settings/prompts").then(setPrompts);
-    flash(`prompt saved: ${name}`);
+    try {
+      await api(`/settings/prompts/${name}`, {
+        method: "PUT", body: JSON.stringify({ value: prompts[name].value }),
+      });
+      api<Record<string, PromptInfo>>("/settings/prompts").then(setPrompts);
+      flash(`prompt saved: ${name}`);
+    } catch (e: any) { flash(`save failed: ${e.message}`, true); }
   }
 
   async function resetPrompt(name: string) {
-    const r = await api<{ default: string }>(`/settings/prompts/${name}`, { method: "DELETE" });
-    setPrompts((p) => ({ ...p, [name]: { ...p[name], value: r.default, modified: false } }));
-    flash(`prompt reset: ${name}`);
+    try {
+      const r = await api<{ default: string }>(`/settings/prompts/${name}`, { method: "DELETE" });
+      setPrompts((p) => ({ ...p, [name]: { ...p[name], value: r.default, modified: false } }));
+      flash(`prompt reset: ${name}`);
+    } catch (e: any) { flash(`reset failed: ${e.message}`, true); }
   }
 
   async function saveParams(fn: string) {
-    await api(`/settings/params/${fn}`, {
-      method: "PUT", body: JSON.stringify(params[fn] ?? {}),
-    });
-    flash(`params saved: ${fn}`);
+    try {
+      await api(`/settings/params/${fn}`, {
+        method: "PUT", body: JSON.stringify(params[fn] ?? {}),
+      });
+      flash(`params saved: ${fn}`);
+    } catch (e: any) { flash(`save failed: ${e.message}`, true); }
   }
 
   async function saveAdvanced(group: string) {
-    await api(`/settings/advanced/${group}`, {
-      method: "PUT", body: JSON.stringify({ values: adv[group] }),
-    });
-    flash(`${group} settings saved`);
+    try {
+      await api(`/settings/advanced/${group}`, {
+        method: "PUT", body: JSON.stringify({ values: adv[group] }),
+      });
+      flash(`${group} settings saved`);
+    } catch (e: any) { flash(`save failed: ${e.message}`, true); }
   }
 
   async function saveCloud() {
     if (!cloud) return;
-    await api("/settings/cloud", {
-      method: "PUT",
-      body: JSON.stringify({
-        provider: cloud.provider,
-        config: cloudEdit,
-        remote_base: cloud.remote_base,
-        auto: cloud.auto,
-      }),
-    });
-    flash("cloud settings saved");
-    api<CloudState>("/settings/cloud").then((r) => { setCloud(r); setCloudEdit(r.config); });
+    try {
+      await api("/settings/cloud", {
+        method: "PUT",
+        body: JSON.stringify({
+          provider: cloud.provider,
+          config: cloudEdit,
+          remote_base: cloud.remote_base,
+          auto: cloud.auto,
+        }),
+      });
+      flash("cloud settings saved");
+      api<CloudState>("/settings/cloud").then((r) => { setCloud(r); setCloudEdit(r.config); });
+    } catch (e: any) { flash(`save failed: ${e.message}`, true); }
   }
 
   async function cloudSyncNow() {
@@ -240,7 +268,7 @@ export default function Settings() {
 
   return (
     <div className="settings">
-      {saved && <div className="flash">{saved}</div>}
+      {saved && <div className={`flash ${savedError ? "flash-error" : ""}`}>{saved}</div>}
 
       <h2>Model matrix</h2>
       <p className="meta">

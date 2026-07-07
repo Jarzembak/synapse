@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import { api, Job } from "../api";
+import { api, fmtTime, Job } from "../api";
 
 interface Snapshot {
   active: Job[];   // queued + running, oldest first
@@ -28,7 +28,7 @@ function JobRow({ job, onCancel }: { job: Job; onCancel?: (j: Job) => void }) {
         </td>
         <td>{job.task_label ?? job.task}</td>
         <td className="progress">{job.progress}</td>
-        <td className="mono">{job.updated ? new Date(job.updated).toLocaleTimeString() : ""}</td>
+        <td className="mono">{job.updated ? fmtTime(job.updated) : ""}</td>
         <td className="jobactions">
           {job.error && (
             <button className="linkish" onClick={() => setOpen((o) => !o)}>

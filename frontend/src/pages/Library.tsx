@@ -1,6 +1,6 @@
-import { Fragment, useEffect, useMemo, useState } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
-import { api, Artifact, typeLabel } from "../api";
+import { api, Artifact, fmtDate, parseTime, typeLabel } from "../api";
 
 interface TagInfo { id: number; name: string; kind: string; count: number }
 
@@ -26,7 +26,7 @@ function sortValue(a: Artifact, col: Col): string | number {
     case "type": return typeLabel(a.type).toLowerCase();
     case "project": return a.project_slug ?? "";
     case "tags": return (a.tags ?? []).slice().sort().join(",");
-    case "updated": return new Date(a.updated).getTime();
+    case "updated": return parseTime(a.updated);
   }
 }
 
@@ -52,11 +52,13 @@ export default function Library() {
   }, []);
 
   // server does full-text search only; sorting/filtering happen client-side
+  const reqSeq = useRef(0);
   useEffect(() => {
     const t = setTimeout(() => {
+      const seq = ++reqSeq.current;  // ignore a slow response a newer query lapped
       api<Artifact[]>(`/library/search?${new URLSearchParams({ q, limit: "500" })}`)
-        .then((r) => { setItems(r); setError(""); })
-        .catch((e) => setError(e.message));
+        .then((r) => { if (seq === reqSeq.current) { setItems(r); setError(""); } })
+        .catch((e) => { if (seq === reqSeq.current) setError(e.message); });
     }, 250);
     return () => clearTimeout(t);
   }, [q]);
@@ -200,7 +202,7 @@ export default function Library() {
           </button>
         ))}
       </td>
-      <td>{new Date(a.updated).toLocaleDateString()}</td>
+      <td>{fmtDate(a.updated)}</td>
     </tr>
   );
 

@@ -259,7 +259,18 @@ def delete_project(project_id: int):
         if not project:
             raise HTTPException(404)
         slug = project.slug
-        for art in session.exec(select(Artifact).where(Artifact.project_id == project_id)).all():
+        # Only delete artifacts that live under this project's own directory.
+        # Shared quick-ref docs (tools/*, concepts/*, …) keep project_id set to
+        # their FIRST contributor and must survive — deleting that project used
+        # to wipe the doc's Artifact row, FTS index and tags out from under it.
+        prefix = f"projects/{slug}/"
+        own = session.exec(
+            select(Artifact).where(
+                Artifact.project_id == project_id,
+                Artifact.path.startswith(prefix),
+            )
+        ).all()
+        for art in own:
             session.exec(text("DELETE FROM artifact_fts WHERE artifact_id = :id")
                          .bindparams(id=art.id))
             session.exec(text("DELETE FROM artifacttag WHERE artifact_id = :id")

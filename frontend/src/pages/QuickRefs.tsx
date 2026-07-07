@@ -32,10 +32,14 @@ export default function QuickRefs() {
   const [sort, setSort] = useState<"title" | "updated" | "sources">("title");
   const [open, setOpen] = useState<RefDetail | null>(null);
   const [versionBody, setVersionBody] = useState<{ name: string; body: string } | null>(null);
+  const [error, setError] = useState("");
 
   function load() {
-    api<Ref[]>("/quickrefs").then(setRefs).catch(() => {});
-    api<QuickRefCategory[]>("/quickrefs/categories").then(setCats).catch(() => {});
+    // surface load failures — silently swallowing them showed the "no
+    // quick-refs yet" onboarding state to users who actually have hundreds
+    setError("");
+    api<Ref[]>("/quickrefs").then(setRefs).catch((e) => setError(e.message));
+    api<QuickRefCategory[]>("/quickrefs/categories").then(setCats).catch((e) => setError(e.message));
   }
   useEffect(load, []);
 
@@ -58,7 +62,13 @@ export default function QuickRefs() {
 
   async function openRef(id: number) {
     setVersionBody(null);
-    setOpen(await api<RefDetail>(`/quickrefs/${id}`));
+    try {
+      setOpen(await api<RefDetail>(`/quickrefs/${id}`));
+      setError("");
+    } catch (e: any) {
+      // e.g. the doc file was deleted on disk (410) — don't leave the click dead
+      setError(`Couldn't open that quick-ref: ${e.message}`);
+    }
   }
 
   async function viewVersion(name: string) {
@@ -128,6 +138,7 @@ export default function QuickRefs() {
 
   return (
     <div className="quickrefs">
+      {error && <p className="error qr-error">{error}</p>}
       <aside>
         <input
           className="search"
@@ -238,7 +249,7 @@ export default function QuickRefs() {
               </ul>
             </div>
           ))}
-          {filtered.length === 0 && (
+          {filtered.length === 0 && !error && (
             <p className="empty">
               {refs.length === 0
                 ? "No quick-refs yet — run the Quick-references step on a project."

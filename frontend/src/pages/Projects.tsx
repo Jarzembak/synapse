@@ -1,6 +1,6 @@
 import { FormEvent, useEffect, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
-import { api, Project } from "../api";
+import { api, fmtDate, Project } from "../api";
 
 export default function Projects() {
   const [projects, setProjects] = useState<Project[]>([]);
@@ -84,7 +84,7 @@ export default function Projects() {
               <td><Link to={`/projects/${p.id}`}>{p.title}</Link></td>
               <td className="mono">{p.source.slice(0, 60)}</td>
               <td>{p.status}</td>
-              <td>{new Date(p.created).toLocaleDateString()}</td>
+              <td>{fmtDate(p.created)}</td>
               <td>
                 <button className="linkish danger" title="delete project"
                         onClick={() => remove(p)}>🗑</button>

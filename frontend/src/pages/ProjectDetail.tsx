@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
-import { api, Project, Step } from "../api";
+import { api, fmtDateTime, fmtTime, Project, Step } from "../api";
 
 interface DetailStep extends Step {
   missing: string[];
@@ -74,8 +74,19 @@ export default function ProjectDetail() {
     if (!file) return;
     const form = new FormData();
     form.append("file", file);
-    await fetch(`/api/projects/${id}/cookies`, { method: "POST", body: form });
-    alert("cookies.txt uploaded — used by ingest/download/transcript for auth sites");
+    // raw fetch (multipart body, not JSON) — but still surface a failed upload
+    // instead of alerting success unconditionally
+    try {
+      const res = await fetch(`/api/projects/${id}/cookies`, { method: "POST", body: form });
+      if (!res.ok) {
+        let detail = res.statusText;
+        try { detail = (await res.json()).detail ?? detail; } catch {}
+        throw new Error(detail);
+      }
+      alert("cookies.txt uploaded — used by ingest/download/transcript for auth sites");
+    } catch (e: any) {
+      setError(`cookies upload failed: ${e.message}`);
+    }
   }
 
   async function saveRename() {
@@ -221,7 +232,7 @@ export default function ProjectDetail() {
                         status: <b>{s.job.status}</b>
                         {s.job.progress && <> · progress: {s.job.progress}</>}
                         {s.job.updated && (
-                          <> · updated {new Date(s.job.updated).toLocaleTimeString()}</>
+                          <> · updated {fmtTime(s.job.updated)}</>
                         )}
                       </p>
                       {s.job.error && (
@@ -237,7 +248,7 @@ export default function ProjectDetail() {
                       {s.artifact.provider && (
                         <> · {s.artifact.provider}/{s.artifact.model}</>
                       )}
-                      {" · "}updated {new Date(s.artifact.updated).toLocaleString()}
+                      {" · "}updated {fmtDateTime(s.artifact.updated)}
                     </p>
                   )}
                   {s.blocked && !s.done && (

@@ -258,14 +258,28 @@ def run_all(job_id: int, project_id: int):
                                 for d in RUN_DEPS[s])]:
                 pending.discard(step)
                 try:
-                    celery.send_task(step, args=[jobs[step], project_id])
+                    res = celery.send_task(step, args=[jobs[step], project_id])
                     running.add(step)
+                    # record the celery id so a Jobs-tab cancel can revoke this
+                    # orchestrated step (manual runs already store theirs)
+                    with get_session() as session:
+                        set_job(session, jobs[step], celery_id=res.id)
                     log.info("run_all project=%s: launched %s", project_id, step)
                 except Exception as e:
                     failed.add(step)
+                    # a dispatch failure never entered `running`, so also skip
+                    # the steps that HARD-depend on it — otherwise they sit in
+                    # `pending` forever and the run spins until the deadline
+                    skipped = transitive_dependents(step, HARD_DEPS) & pending
                     with get_session() as session:
                         set_job(session, jobs[step], status="error",
                                 error=f"could not dispatch: {e}")
+                        for dep in skipped:
+                            pending.discard(dep)
+                            failed.add(dep)
+                            set_job(session, jobs[dep], status="error",
+                                    error=f"skipped: prerequisite step "
+                                          f"'{STEP_LABELS[step]}' failed")
 
             time.sleep(2)
 

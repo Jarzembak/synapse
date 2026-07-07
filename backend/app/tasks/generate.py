@@ -58,7 +58,10 @@ def correct(job_id: int, project_id: int):
         system += "\n\nGlossary of known-correct terms:\n" + ", ".join(glossary)
 
     provider, model = llm.resolve_model("correct")
-    chunks = llm.chunk_text(transcript, max_chars=int(advanced("pipeline")["chunk_chars"]))
+    # overlap=0: each chunk is corrected and concatenated verbatim, so any
+    # carried-over tail would be duplicated at every chunk boundary.
+    chunks = llm.chunk_text(transcript, max_chars=int(advanced("pipeline")["chunk_chars"]),
+                            overlap=0)
     fixed: list[str] = []
     for i, chunk in enumerate(chunks):
         progress(job_id, f"correcting chunk {i + 1}/{len(chunks)}")

@@ -67,6 +67,7 @@ def fetch_site_captions(url: str, project_slug: str) -> str | None:
         "subtitlesformat": "vtt",
         "outtmpl": str(wd / "captions.%(ext)s"),
         "quiet": True,
+        "noplaylist": True,  # captions for the submitted video only
     }
     ck = cookies_path(project_slug)
     if ck.exists():

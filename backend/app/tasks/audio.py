@@ -45,11 +45,19 @@ def _kokoro_model():
     for name, url in KOKORO_FILES.items():
         dest = model_dir / name
         if not dest.exists():
-            with httpx.stream("GET", url, follow_redirects=True, timeout=None) as r:
-                r.raise_for_status()
-                with open(dest, "wb") as f:
-                    for chunk in r.iter_bytes():
-                        f.write(chunk)
+            # download to a temp file and rename on success, so an interrupted
+            # download can't leave a truncated file that dest.exists() then
+            # treats as valid (which breaks every future TTS run).
+            tmp = dest.with_suffix(dest.suffix + ".part")
+            try:
+                with httpx.stream("GET", url, follow_redirects=True, timeout=None) as r:
+                    r.raise_for_status()
+                    with open(tmp, "wb") as f:
+                        for chunk in r.iter_bytes():
+                            f.write(chunk)
+                tmp.replace(dest)
+            finally:
+                tmp.unlink(missing_ok=True)
     return Kokoro(str(model_dir / "kokoro-v1.0.onnx"), str(model_dir / "voices-v1.0.bin"))
 
 
