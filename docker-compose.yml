@@ -2,6 +2,10 @@ services:
   api:
     build: ./backend
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    # published so the vite dev server's /api proxy (localhost:8000) works when
+    # the stack is run for local frontend development, per the README
+    ports:
+      - "8000:8000"
     env_file: .env
     environment:
       - REDIS_URL=redis://redis:6379/0
@@ -51,6 +55,11 @@ services:
 
   redis:
     image: redis:7-alpine
+    # persist the broker/result backend so a stack restart doesn't silently
+    # drop queued jobs (leaving their Job rows stuck 'queued'/'running' forever)
+    command: redis-server --appendonly yes
+    volumes:
+      - redis-data:/data
     restart: unless-stopped
 
   ollama:
@@ -70,3 +79,4 @@ services:
 volumes:
   ollama-models:
   whisper-models:
+  redis-data:

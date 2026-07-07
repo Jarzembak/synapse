@@ -72,6 +72,10 @@ def ingest(job_id: int, project_id: int):
                 {"key": "FFmpegExtractAudio", "preferredcodec": "m4a"}
             ],
             "quiet": True,
+            # a watch URL copied from within a playlist carries &list=…; without
+            # this yt-dlp grabs the whole playlist and the wrong video wins the
+            # fixed source.* filename.
+            "noplaylist": True,
         }
         ck = cookies_path(project.slug)
         if ck.exists():
@@ -150,6 +154,7 @@ def download(job_id: int, project_id: int):
         "outtmpl": str(wd / "source_video.%(ext)s"),
         "progress_hooks": [hook],
         "quiet": True,
+        "noplaylist": True,  # archive only the submitted video, not its playlist
     }
     ck = cookies_path(project.slug)
     if ck.exists():

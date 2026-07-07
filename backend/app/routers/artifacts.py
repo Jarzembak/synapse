@@ -80,9 +80,12 @@ def search_library(
         if project_id is not None:
             stmt = stmt.where(Artifact.project_id == project_id)
         if tag:
+            # distinct(): an artifact carrying several of the requested tags
+            # would otherwise be returned once per matching tag.
             stmt = (stmt.join(ArtifactTag, ArtifactTag.artifact_id == Artifact.id)
                         .join(Tag, Tag.id == ArtifactTag.tag_id)
-                        .where(Tag.name.in_(tag.split(","))))
+                        .where(Tag.name.in_(tag.split(",")))
+                        .distinct())
         col = {"updated": Artifact.updated, "created": Artifact.created,
                "title": Artifact.title, "type": Artifact.type}.get(sort, Artifact.updated)
         stmt = stmt.order_by(col.desc() if order == "desc" else col.asc()).limit(limit)

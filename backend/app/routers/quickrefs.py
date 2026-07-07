@@ -147,7 +147,13 @@ def get_quickref(ref_id: int):
         ref = session.get(QuickRef, ref_id)
         if not ref:
             raise HTTPException(404)
-        meta, body = library.read_doc(ref.path)
+        try:
+            meta, body = library.read_doc(ref.path)
+        except FileNotFoundError:
+            # disk is source of truth; the vault is user-editable (Obsidian),
+            # so a deleted/renamed file leaves an orphaned row — mirror the
+            # artifacts endpoint's 410 rather than a raw 500.
+            raise HTTPException(410, "quick-ref file missing from library")
         return {
             "ref": _serialize_ref(session, ref),
             "meta": meta,

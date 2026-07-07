@@ -52,7 +52,9 @@ export default function MindMap({ graph }: { graph: Graph }) {
   const nodes = useMemo(() => layout(graph), [graph]);
   const edges: Edge[] = useMemo(
     () =>
-      graph.edges
+      // edges is optional in the stored graph JSON (the backend writes
+      // graph.get("edges", [])), so guard against it being absent
+      (graph.edges ?? [])
         .filter((e) => graph.nodes.some((n) => n.id === e.source) &&
                        graph.nodes.some((n) => n.id === e.target))
         .map((e, i) => ({

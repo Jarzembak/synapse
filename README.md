@@ -406,9 +406,12 @@ npm run dev
 ```
 
 Rebuilding after backend/frontend code changes: `docker compose up --build`.
-Wiping all data (library, media, database, Ollama/Whisper model caches) to
-start fresh: `docker compose down -v` (destructive — confirm you want to lose
-the library before running this).
+
+Starting fresh (destructive — confirm you want to lose the library first):
+`docker compose down -v` removes the named volumes (Ollama/Whisper/Redis
+caches) but **not** the library, media, database, and logs — those are host
+bind mounts under `./data`. To wipe those too, also delete the directory:
+`docker compose down -v && rm -rf ./data`.
 
 ## Logging
 

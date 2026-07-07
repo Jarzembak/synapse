@@ -37,10 +37,21 @@ def pipeline_task(fn):
     def wrapper(job_id: int, project_id: int, *args, **kwargs):
         log.info("step %s starting (job=%s project=%s)", fn.__name__, job_id, project_id)
         with get_session() as session:
+            job = session.get(Job, job_id)
+            if job and job.status == "canceled":
+                # user canceled between enqueue and pickup — honor it instead
+                # of resurrecting the job to running/done
+                log.info("step %s skipped: job=%s already canceled", fn.__name__, job_id)
+                return None
             set_job(session, job_id, status="running")
         try:
             result = fn(job_id, project_id, *args, **kwargs)
             with get_session() as session:
+                job = session.get(Job, job_id)
+                if job and job.status == "canceled":
+                    log.info("step %s finished but job=%s was canceled — leaving canceled",
+                             fn.__name__, job_id)
+                    return result
                 set_job(session, job_id, status="done", progress="complete")
             log.info("step %s done (job=%s project=%s)", fn.__name__, job_id, project_id)
             return result

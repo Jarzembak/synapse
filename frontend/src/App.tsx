@@ -1,4 +1,5 @@
-import { NavLink, Route, Routes } from "react-router-dom";
+import { NavLink, Route, Routes, useLocation } from "react-router-dom";
+import ErrorBoundary from "./components/ErrorBoundary";
 import Library from "./pages/Library";
 import Projects from "./pages/Projects";
 import ProjectDetail from "./pages/ProjectDetail";
@@ -10,6 +11,7 @@ import JobTicker from "./components/JobTicker";
 import ThemeSelect from "./components/ThemeSelect";
 
 export default function App() {
+  const location = useLocation();
   return (
     <div className="app">
       <nav className="topnav">
@@ -23,15 +25,17 @@ export default function App() {
         <ThemeSelect />
       </nav>
       <main>
-        <Routes>
-          <Route path="/" element={<Library />} />
-          <Route path="/projects" element={<Projects />} />
-          <Route path="/projects/:id" element={<ProjectDetail />} />
-          <Route path="/artifacts/:id" element={<ArtifactView />} />
-          <Route path="/quickrefs" element={<QuickRefs />} />
-          <Route path="/jobs" element={<Jobs />} />
-          <Route path="/settings" element={<Settings />} />
-        </Routes>
+        <ErrorBoundary key={location.pathname}>
+          <Routes>
+            <Route path="/" element={<Library />} />
+            <Route path="/projects" element={<Projects />} />
+            <Route path="/projects/:id" element={<ProjectDetail />} />
+            <Route path="/artifacts/:id" element={<ArtifactView />} />
+            <Route path="/quickrefs" element={<QuickRefs />} />
+            <Route path="/jobs" element={<Jobs />} />
+            <Route path="/settings" element={<Settings />} />
+          </Routes>
+        </ErrorBoundary>
       </main>
     </div>
   );

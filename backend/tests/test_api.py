@@ -343,6 +343,92 @@ def test_custom_category_crud(client):
                for c in client.get("/api/quickrefs/categories").json())
 
 
+def test_delete_project_keeps_shared_quickref_artifacts(client):
+    """Regression: deleting a project must not wipe the Artifact row / FTS index
+    of a shared quick-ref doc that happens to keep this project's id."""
+    from sqlmodel import select
+    from app.models import Artifact
+
+    r = client.post("/api/projects", json={
+        "source": "https://e.com/shared", "source_type": "url", "title": "Shared creator"})
+    pid = r.json()["id"]
+    slug = r.json()["slug"]
+
+    with get_session() as session:
+        # a project-owned artifact (should be deleted) …
+        library.write_artifact(
+            session, project_id=pid, project_slug=slug, type="summary",
+            title="Summary — Shared", body="own artifact")
+        # … and a shared quick-ref doc whose project_id is this project (kept)
+        library.write_artifact(
+            session, project_id=pid, project_slug=slug, type="quickref_tool",
+            title="sharedtool", body="cross-project doc",
+            rel_path="tools/sharedtool.md")
+
+    assert client.delete(f"/api/projects/{pid}").status_code == 200
+    with get_session() as session:
+        rows = session.exec(
+            select(Artifact).where(Artifact.path == "tools/sharedtool.md")).all()
+        assert len(rows) == 1  # survived
+    # still full-text searchable
+    hits = client.get("/api/library/search", params={"q": "cross-project"}).json()
+    assert any(h["path"] == "tools/sharedtool.md" for h in hits)
+
+
+def test_library_search_multi_tag_no_duplicates(client):
+    """Regression: an artifact carrying several requested tags must appear once."""
+    aid = seed_artifact("Multi tag doc", "wireguard and firewalls",
+                        tags=["networking", "linux"])
+    hits = client.get("/api/library/search",
+                      params={"tag": "networking,linux"}).json()
+    matching = [h for h in hits if h["id"] == aid]
+    assert len(matching) == 1
+
+
+def test_quickref_detail_missing_file_returns_410(client):
+    """A QuickRef row whose doc file was removed on disk yields 410, not 500."""
+    from app.models import QuickRef
+
+    with get_session() as session:
+        ref = QuickRef(kind="tool", slug="ghosttool", title="ghosttool",
+                       path="tools/ghosttool-missing.md", aliases="[]")
+        session.add(ref)
+        session.commit()
+        session.refresh(ref)
+        rid = ref.id
+    assert client.get(f"/api/quickrefs/{rid}").status_code == 410
+
+
+def test_correct_chunking_uses_no_overlap(client, monkeypatch):
+    """Regression: the correction pass must not duplicate chunk-boundary text."""
+    from app.tasks import generate
+    from app import llm
+
+    calls = []
+    monkeypatch.setattr(llm, "resolve_model", lambda fn: ("test", "m"))
+    # echo each chunk back unchanged so we can detect duplicated lines
+    monkeypatch.setattr(llm, "complete", lambda fn, sys, chunk, **k: chunk)
+    monkeypatch.setattr(generate, "_write",
+                        lambda pid, t, tp, body, **k: calls.append(body) or 1)
+    monkeypatch.setattr(generate, "advanced", lambda g: {"chunk_chars": 200})
+
+    r = client.post("/api/projects", json={
+        "source": "https://e.com/corr", "source_type": "url", "title": "Corr demo"})
+    pid = r.json()["id"]
+    lines = "".join(f"[00:00:{i:02d}] line number {i}\n" for i in range(40))
+    with get_session() as session:
+        library.write_artifact(
+            session, project_id=pid, project_slug=r.json()["slug"], type="transcript",
+            title="Transcript — Corr", body=lines)
+
+    generate.correct.run(0, pid)  # .run bypasses celery dispatch
+    joined = calls[-1]
+    # every distinct source line appears exactly once — no boundary duplication
+    import re as _re
+    for i in range(40):
+        assert len(_re.findall(rf"line number {i}\b", joined)) == 1
+
+
 def test_upsert_quickref_keeps_existing_kind(client, monkeypatch):
     """When the LLM re-classifies an existing doc under a different kind, the
     merge must keep the doc's established kind — a mismatched quickref_<kind>

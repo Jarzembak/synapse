@@ -59,7 +59,9 @@ def cancel_job(job_id: int):
             raise HTTPException(409, f"job is already {job.status}")
         if job.celery_id:
             try:
-                celery.control.revoke(job.celery_id, terminate=False)
+                # terminate=True stops a task that's already executing, not just
+                # one still waiting in the queue.
+                celery.control.revoke(job.celery_id, terminate=True)
             except Exception:
                 pass
         job.status = "canceled"

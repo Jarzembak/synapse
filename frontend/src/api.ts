@@ -13,6 +13,22 @@ export async function api<T = any>(path: string, opts?: RequestInit): Promise<T>
   return res.json();
 }
 
+/** Parse a backend timestamp as UTC.
+ *
+ * Datetimes are stored UTC but SQLite drops the offset, so the API emits
+ * naive ISO strings ("2026-07-07T18:30:00"). JS parses an offset-less string
+ * as LOCAL time, shifting every displayed time by the viewer's UTC offset —
+ * so we re-attach 'Z' when the string carries no zone. */
+function parseUTC(s: string): Date {
+  const hasZone = /[zZ]|[+-]\d\d:?\d\d$/.test(s);
+  return new Date(hasZone ? s : s + "Z");
+}
+
+export const fmtDateTime = (s: string) => parseUTC(s).toLocaleString();
+export const fmtDate = (s: string) => parseUTC(s).toLocaleDateString();
+export const fmtTime = (s: string) => parseUTC(s).toLocaleTimeString();
+export const parseTime = (s: string) => parseUTC(s).getTime();
+
 export interface Project {
   id: number;
   slug: string;

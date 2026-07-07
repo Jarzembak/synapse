@@ -40,7 +40,9 @@ def resolve_local_source(rel: str) -> Path:
     """Validate a user-supplied path against the read-only host media mount."""
     base = settings.host_media_mount.resolve()
     candidate = (base / rel).resolve()
-    if not str(candidate).startswith(str(base)):
+    # is_relative_to enforces a path-component boundary; a bare str.startswith
+    # would also accept a sibling like /srv/media-private for base /srv/media.
+    if not candidate.is_relative_to(base):
         raise ValueError("path escapes the media mount")
     if not candidate.exists():
         raise FileNotFoundError(f"{rel} not found under the host media directory")

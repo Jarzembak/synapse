@@ -133,6 +133,10 @@ h2 { margin-top: 1.4rem; }
 .meta { color: var(--muted); font-size: 0.9rem; }
 .flash { position: fixed; top: 60px; right: 20px; background: var(--success);
   color: var(--accent-contrast); padding: 0.5rem 1rem; border-radius: 6px; z-index: 100; }
+.flash.flash-error { background: var(--danger); color: #fff; }
+
+.errorboundary { padding: 1.5rem; }
+.errorboundary button { margin-top: 0.6rem; }
 
 .list { width: 100%; border-collapse: collapse; background: var(--panel); }
 .list th, .list td { text-align: left; padding: 0.5rem 0.7rem; border-bottom: 1px solid var(--border); }
@@ -239,6 +243,7 @@ button.linkish.danger { color: var(--danger); }
 
 .quickrefs { display: grid; grid-template-columns: 260px 1fr; gap: 1.5rem;
   align-items: start; }
+.quickrefs .qr-error { grid-column: 1 / -1; margin: 0 0 0.4rem; }
 .quickrefs aside .search { margin-bottom: 0.5rem; }
 .quickrefs aside select { width: 100%; margin: 0.4rem 0; }
 
