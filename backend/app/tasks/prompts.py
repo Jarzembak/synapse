@@ -54,7 +54,7 @@ Rules:
 Output the merged markdown document only."""
 
 EXTRACT_ENTITIES = """From this deep-dive document, identify the TOOLS, TECHNIQUES,
-and CONCEPTS covered in substantive depth — not passing mentions.
+CONCEPTS, and TECHNOLOGIES covered in substantive depth — not passing mentions.
 
 Definitions (classify carefully):
 - TOOL: a concrete thing a user actually runs or touches — software, a CLI, a
@@ -65,7 +65,11 @@ Definitions (classify carefully):
   image builds, carving memory dumps). The subject of a recipe.
 - CONCEPT: an idea, principle, model, or architecture you understand rather than
   run (e.g. least privilege, declarative configuration, union file systems). The
-  subject of an explainer."""
+  subject of an explainer.
+- TECHNOLOGY: a named platform, protocol, standard, format, or language that
+  systems are built on — infrastructure you adopt rather than a program you
+  invoke (e.g. TCP/IP, OAuth 2.0, Active Directory, WebAssembly). The subject
+  of a primer."""
 
 QUICKREF_TOOL = """Create a quick-reference document for the given tool, based on this
 deep-dive material. Write it as a USER-FRIENDLY INSTRUCTION MANUAL — assume a
@@ -97,6 +101,18 @@ this deep-dive material. Write it as a CRISP EXPLAINER of the idea. Structure (m
 ## How it works
 ## Related tools & techniques
 ## Examples          (how the source material used/illustrated it, cited as 'From: <video title>')
+## Further study"""
+
+QUICKREF_TECHNOLOGY = """Create a quick-reference document for the given technology, based
+on this deep-dive material. Write it as a PRIMER on a platform/protocol/standard —
+what a technical reader needs to know before working with things built on it.
+Structure (markdown):
+# <name>
+## What it is            (2-3 sentences: what problem it solves, where it sits in the stack)
+## Key pieces            (### per component/term a newcomer must know)
+## How it works          (the essential mechanics, protocol flow, or lifecycle)
+## Working with it       (the tools and techniques people use it through)
+## Examples              (how the source material used it, cited as 'From: <video title>')
 ## Further study"""
 
 QUICKREF_MERGE = """Update an existing quick-reference document with new material
@@ -145,6 +161,7 @@ DEFAULTS: dict[str, str] = {
     "quickref_tool": QUICKREF_TOOL,
     "quickref_technique": QUICKREF_TECHNIQUE,
     "quickref_concept": QUICKREF_CONCEPT,
+    "quickref_technology": QUICKREF_TECHNOLOGY,
     "quickref_merge": QUICKREF_MERGE,
     "podcast_outline": PODCAST_OUTLINE,
     "podcast_segment": PODCAST_SEGMENT,
@@ -162,6 +179,7 @@ PROMPT_LABELS: dict[str, str] = {
     "quickref_tool": "Quick-ref: tool manual",
     "quickref_technique": "Quick-ref: technique recipe",
     "quickref_concept": "Quick-ref: concept explainer",
+    "quickref_technology": "Quick-ref: technology primer",
     "quickref_merge": "Quick-ref: merge into existing",
     "podcast_outline": "Podcast: episode outline",
     "podcast_segment": "Podcast: segment dialogue",

@@ -12,14 +12,17 @@ const KIND_COLORS: Record<string, string> = {
   technique: "#ef6c00",
   technology: "#8e24aa",
 };
+const FALLBACK_COLOR = "#78909c"; // custom quick-ref categories
 
 /** Column-per-kind layout: stable, readable without a physics engine. */
 function layout(graph: Graph): Node[] {
-  const kinds = ["concept", "technology", "tool", "technique"];
+  const known = ["concept", "technology", "tool", "technique"];
+  const extra = [...new Set(graph.nodes.map((n) => n.kind))]
+    .filter((k) => !known.includes(k)).sort();
+  const kinds = [...known, ...extra];
   const columns: Record<string, GraphNode[]> = {};
   for (const n of graph.nodes) {
-    const k = kinds.includes(n.kind) ? n.kind : "concept";
-    (columns[k] ??= []).push(n);
+    (columns[n.kind] ??= []).push(n);
   }
   const out: Node[] = [];
   kinds.forEach((kind, col) => {
@@ -31,7 +34,7 @@ function layout(graph: Graph): Node[] {
         style: {
           background: "var(--panel)",
           color: "var(--text)",
-          border: `2px solid ${KIND_COLORS[kind]}`,
+          border: `2px solid ${KIND_COLORS[kind] ?? FALLBACK_COLOR}`,
           borderRadius: 8,
           padding: 6,
           fontSize: 13,
@@ -79,7 +82,7 @@ export default function MindMap({ graph }: { graph: Graph }) {
       {selected && (
         <aside className="nodepanel">
           <h3>{selected.label}</h3>
-          <p className="kind" style={{ color: KIND_COLORS[selected.kind] }}>{selected.kind}</p>
+          <p className="kind" style={{ color: KIND_COLORS[selected.kind] ?? FALLBACK_COLOR }}>{selected.kind}</p>
           <p>{selected.summary}</p>
           {selected.quickref && (
             <p><a href={`/quickrefs?path=${encodeURIComponent(selected.quickref)}`}>quick-reference →</a></p>

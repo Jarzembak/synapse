@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { api, Artifact, Project, TYPE_LABELS } from "../api";
+import { api, Artifact, Project, typeLabel } from "../api";
 import MindMap, { Graph } from "../components/MindMap";
 
 interface Detail {
@@ -54,7 +54,7 @@ export default function ArtifactView() {
       <header>
         <h2>{d.artifact.title}</h2>
         <p className="meta">
-          {TYPE_LABELS[d.artifact.type] ?? d.artifact.type}
+          {typeLabel(d.artifact.type)}
           {d.project && <> · <Link to={`/projects/${d.project.id}`}>{d.project.title}</Link></>}
           {d.artifact.model && <> · {d.artifact.provider}/{d.artifact.model}</>}
           {" · "}{new Date(d.artifact.updated).toLocaleString()}

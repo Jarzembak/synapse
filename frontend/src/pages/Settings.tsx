@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { api } from "../api";
+import { api, QuickRefCategory } from "../api";
 
 interface ModelCfg { provider: string; model: string }
 interface TagInfo { id: number; name: string; kind: string; count: number }
@@ -42,6 +42,19 @@ const CLOUD_LABELS: Record<string, string> = {
 const OAUTH_HINT = "Run `rclone authorize \"<provider>\"` on any machine with a " +
   "browser (rclone.org downloads), approve access, and paste the token JSON here.";
 
+interface CatDraft {
+  label: string; plural: string; icon: string; description: string; prompt: string;
+}
+
+const NEW_CAT_PROMPT = `Create a quick-reference document for the given subject, based on this
+deep-dive material. Structure (markdown):
+# <name>
+## What it is
+## Why it matters
+## Details
+## Examples          (from the source material, cited as 'From: <video title>')
+## Further study`;
+
 export default function Settings() {
   const [functions, setFunctions] = useState<Record<string, ModelCfg>>({});
   const [providers, setProviders] = useState<string[]>([]);
@@ -53,6 +66,9 @@ export default function Settings() {
   const [adv, setAdv] = useState<Record<string, Record<string, any>>>({});
   const [cloud, setCloud] = useState<CloudState | null>(null);
   const [cloudEdit, setCloudEdit] = useState<Record<string, string>>({});
+  const [qrCats, setQrCats] = useState<QuickRefCategory[]>([]);
+  const [newCat, setNewCat] = useState<CatDraft | null>(null);
+  const [catBanner, setCatBanner] = useState("");
   const [saved, setSaved] = useState("");
 
   function load() {
@@ -66,6 +82,7 @@ export default function Settings() {
     api<{ groups: Record<string, Record<string, any>> }>("/settings/advanced")
       .then((r) => setAdv(r.groups));
     api<CloudState>("/settings/cloud").then((r) => { setCloud(r); setCloudEdit(r.config); });
+    api<QuickRefCategory[]>("/quickrefs/categories").then(setQrCats);
   }
   useEffect(load, []);
 
@@ -145,28 +162,81 @@ export default function Settings() {
     }
   }
 
+  // tag ops refresh only the tag list — a full load() would clobber unsaved
+  // edits elsewhere on the page (prompts, category drafts)
+  const reloadTags = () => api<TagInfo[]>("/tags").then(setTags);
+
   async function renameTag(t: TagInfo) {
     const name = prompt(`Rename tag "${t.name}" to:`, t.name);
     if (!name || name === t.name) return;
     await api(`/tags/${t.id}`, { method: "PUT", body: JSON.stringify({ name }) });
-    load();
+    reloadTags();
   }
 
   async function deleteTag(t: TagInfo) {
     if (!confirm(`Delete tag "${t.name}" (used ${t.count}×)?`)) return;
     await api(`/tags/${t.id}`, { method: "DELETE" });
-    load();
+    reloadTags();
   }
 
   async function addTag() {
     const name = prompt("New tag name:");
     if (!name) return;
     await api("/tags", { method: "POST", body: JSON.stringify({ name }) });
-    load();
+    reloadTags();
   }
 
   const setAdvValue = (group: string, key: string, value: any) =>
     setAdv((a) => ({ ...a, [group]: { ...a[group], [key]: value } }));
+
+  const reloadCats = () =>
+    api<QuickRefCategory[]>("/quickrefs/categories").then(setQrCats);
+
+  const setCatField = (key: string, field: string, value: string) =>
+    setQrCats((cs) => cs.map((c) => (c.key === key ? { ...c, [field]: value } : c)));
+
+  async function addCategory() {
+    if (!newCat) return;
+    try {
+      await api("/quickrefs/categories", { method: "POST", body: JSON.stringify(newCat) });
+    } catch (e: any) {
+      alert(e.message);
+      return;
+    }
+    setCatBanner(newCat.label);
+    setNewCat(null);
+    reloadCats();
+    flash("category added");
+  }
+
+  async function saveCategory(c: QuickRefCategory) {
+    let stored: QuickRefCategory;
+    try {
+      stored = await api<QuickRefCategory>(`/quickrefs/categories/${c.key}`, {
+        method: "PUT",
+        body: JSON.stringify({ label: c.label, plural: c.plural, icon: c.icon,
+                               description: c.description, prompt: c.prompt }),
+      });
+    } catch (e: any) {
+      alert(e.message);
+      return;
+    }
+    // show what the server actually stored (it trims whitespace)
+    setQrCats((cs) => cs.map((x) => (x.key === c.key ? { ...x, ...stored } : x)));
+    flash(`category saved: ${stored.label}`);
+  }
+
+  async function deleteCategory(c: QuickRefCategory) {
+    if (!confirm(`Delete quick-ref category "${c.label}"?`)) return;
+    try {
+      await api(`/quickrefs/categories/${c.key}`, { method: "DELETE" });
+    } catch (e: any) {
+      alert(e.message);
+      return;
+    }
+    reloadCats();
+    flash("category deleted");
+  }
 
   return (
     <div className="settings">
@@ -235,6 +305,106 @@ export default function Settings() {
           </span>
         ))}
       </div>
+
+      <h2>Quick-ref categories</h2>
+      <p className="meta">
+        What the Quick-references step files docs under. Built-in categories are fixed
+        (their doc prompts live under Advanced → Prompt editor); custom categories carry
+        their own doc prompt, and their description is announced to the entity-extraction
+        call automatically.
+      </p>
+      {catBanner && (
+        <div className="banner">
+          <p>
+            <b>“{catBanner}” added.</b> Entity extraction is told about it automatically,
+            but these prompts were written around the built-in categories — review them in
+            Advanced → Prompt editor so future runs actually surface this material:
+          </p>
+          <ul>
+            <li><b>Deep dive (both models)</b> — decides what the source document covers in depth</li>
+            <li><b>Quick-ref: entity extraction</b> — its category definitions steer classification</li>
+            <li><b>Mind map: topic graph</b> — its node-kind list is spelled out in the prompt</li>
+          </ul>
+          <button onClick={() => setCatBanner("")}>dismiss</button>
+        </div>
+      )}
+      <div className="tagcloud">
+        {qrCats.filter((c) => c.builtin).map((c) => (
+          <span key={c.key} className="tag">
+            {c.icon} {c.plural} <small>built-in · {c.count}</small>
+          </span>
+        ))}
+      </div>
+      {qrCats.filter((c) => !c.builtin).map((c) => (
+        <details key={c.key} className="prompt-item">
+          <summary>
+            {c.icon} {c.plural} <small>— {c.count} doc(s) in {c.dir}/</small>
+          </summary>
+          <div className="catfields">
+            <label>Label
+              <input value={c.label}
+                onChange={(e) => setCatField(c.key, "label", e.target.value)} />
+            </label>
+            <label>Plural
+              <input value={c.plural}
+                onChange={(e) => setCatField(c.key, "plural", e.target.value)} />
+            </label>
+            <label>Icon
+              <input value={c.icon} style={{ width: "3.5rem" }}
+                onChange={(e) => setCatField(c.key, "icon", e.target.value)} />
+            </label>
+          </div>
+          <label className="stacked">What belongs here (guides entity extraction)
+            <textarea rows={3} value={c.description ?? ""}
+              onChange={(e) => setCatField(c.key, "description", e.target.value)} />
+          </label>
+          <label className="stacked">Doc-writing prompt
+            <textarea rows={8} value={c.prompt ?? ""}
+              onChange={(e) => setCatField(c.key, "prompt", e.target.value)} />
+          </label>
+          <div className="row">
+            <button onClick={() => saveCategory(c)}>save</button>
+            <button className="linkish danger" onClick={() => deleteCategory(c)}>delete</button>
+          </div>
+        </details>
+      ))}
+      {newCat ? (
+        <div className="catnew">
+          <div className="catfields">
+            <label>Label
+              <input value={newCat.label} placeholder="Framework"
+                onChange={(e) => setNewCat({ ...newCat, label: e.target.value })} />
+            </label>
+            <label>Plural
+              <input value={newCat.plural} placeholder="Frameworks"
+                onChange={(e) => setNewCat({ ...newCat, plural: e.target.value })} />
+            </label>
+            <label>Icon
+              <input value={newCat.icon} style={{ width: "3.5rem" }}
+                onChange={(e) => setNewCat({ ...newCat, icon: e.target.value })} />
+            </label>
+          </div>
+          <label className="stacked">What belongs here (guides entity extraction)
+            <textarea rows={3} value={newCat.description}
+              placeholder="e.g. a named methodology or compliance framework practitioners align work to (MITRE ATT&CK, NIST CSF, CIS benchmarks)"
+              onChange={(e) => setNewCat({ ...newCat, description: e.target.value })} />
+          </label>
+          <label className="stacked">Doc-writing prompt
+            <textarea rows={8} value={newCat.prompt}
+              onChange={(e) => setNewCat({ ...newCat, prompt: e.target.value })} />
+          </label>
+          <div className="row">
+            <button onClick={addCategory}>create category</button>
+            <button onClick={() => setNewCat(null)}>cancel</button>
+          </div>
+        </div>
+      ) : (
+        <button onClick={() => setNewCat({
+          label: "", plural: "", icon: "📄", description: "", prompt: NEW_CAT_PROMPT,
+        })}>
+          + add category
+        </button>
+      )}
 
       <h2>Advanced</h2>
 

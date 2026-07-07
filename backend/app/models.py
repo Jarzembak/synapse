@@ -24,7 +24,7 @@ class Artifact(SQLModel, table=True):
     project_id: int | None = Field(default=None, foreign_key="project.id", index=True)
     # transcript | corrected | summary | deepdive_claude | deepdive_gemini |
     # deepdive_merged | podcast_script | podcast_audio | trimmed_audio |
-    # mindmap | quickref_tool | quickref_technique | source_video | source_audio
+    # mindmap | quickref_<category kind> | source_video | source_audio
     type: str = Field(index=True)
     title: str
     path: str  # library-relative path of the .md (or sidecar .md for binaries)
@@ -50,7 +50,7 @@ class ArtifactTag(SQLModel, table=True):
 
 class QuickRef(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
-    kind: str = Field(index=True)  # tool | technique
+    kind: str = Field(index=True)  # tool | technique | concept | technology | custom category key
     slug: str = Field(index=True)
     title: str
     path: str

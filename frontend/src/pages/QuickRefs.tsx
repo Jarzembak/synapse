@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { api } from "../api";
+import { api, QuickRefCategory } from "../api";
 
 interface Ref {
   id: number;
@@ -21,15 +21,11 @@ interface RefDetail {
   versions: string[];
 }
 
-const KIND_META: Record<string, { label: string; plural: string; icon: string }> = {
-  tool: { label: "Tool", plural: "Tools", icon: "🔧" },
-  technique: { label: "Technique", plural: "Techniques", icon: "🎯" },
-  concept: { label: "Concept", plural: "Concepts", icon: "💡" },
-};
-const KIND_ORDER = ["tool", "technique", "concept"];
+const FALLBACK_META = { label: "", plural: "", icon: "📄" };
 
 export default function QuickRefs() {
   const [refs, setRefs] = useState<Ref[]>([]);
+  const [cats, setCats] = useState<QuickRefCategory[]>([]);
   const [search, setSearch] = useState("");
   const [kinds, setKinds] = useState<Set<string>>(new Set());
   const [tagFilter, setTagFilter] = useState<Set<string>>(new Set());
@@ -39,17 +35,26 @@ export default function QuickRefs() {
 
   function load() {
     api<Ref[]>("/quickrefs").then(setRefs).catch(() => {});
+    api<QuickRefCategory[]>("/quickrefs/categories").then(setCats).catch(() => {});
   }
   useEffect(load, []);
 
-  // deep link from mind map: ?path=tools/nmap.md
+  // deep link from mind map: ?path=tools/nmap.md — consumed once, so the
+  // param can't re-open the doc after the user navigates back to the columns
   useEffect(() => {
     const path = new URLSearchParams(location.search).get("path");
     if (path && refs.length) {
       const hit = refs.find((r) => r.path === path);
       if (hit) openRef(hit.id);
+      history.replaceState(null, "", location.pathname);
     }
   }, [refs]);
+
+  const meta = useMemo(() => {
+    const m = new Map(cats.map((c) => [c.key, c]));
+    return (kind: string) =>
+      m.get(kind) ?? { ...FALLBACK_META, label: kind, plural: kind };
+  }, [cats]);
 
   async function openRef(id: number) {
     setVersionBody(null);
@@ -65,6 +70,18 @@ export default function QuickRefs() {
     if (!open || !confirm(`Revert ${open.ref.title} to ${name}?`)) return;
     await api(`/quickrefs/${open.ref.id}/revert/${name}`, { method: "POST" });
     openRef(open.ref.id);
+  }
+
+  function closeDetail() {
+    setOpen(null);
+    setVersionBody(null);
+  }
+
+  async function deleteDoc() {
+    if (!open || !confirm(`Delete "${open.ref.title}" and its doc file? This cannot be undone.`)) return;
+    await api(`/quickrefs/${open.ref.id}`, { method: "DELETE" });
+    closeDetail();
+    load();
   }
 
   function toggle<T>(set: Set<T>, v: T, apply: (s: Set<T>) => void) {
@@ -99,12 +116,15 @@ export default function QuickRefs() {
     return out;
   }, [refs, search, kinds, tagFilter, sort]);
 
-  const sections = useMemo(
-    () => KIND_ORDER
+  // one column per category (registry order), plus any stray kinds at the end
+  const columns = useMemo(() => {
+    const known = cats.map((c) => c.key);
+    const stray = [...new Set(filtered.map((r) => r.kind))]
+      .filter((k) => !known.includes(k)).sort();
+    return [...known, ...stray]
       .map((k) => [k, filtered.filter((r) => r.kind === k)] as const)
-      .filter(([, list]) => list.length > 0),
-    [filtered]
-  );
+      .filter(([, list]) => list.length > 0);
+  }, [filtered, cats]);
 
   return (
     <div className="quickrefs">
@@ -116,13 +136,13 @@ export default function QuickRefs() {
           onChange={(e) => setSearch(e.target.value)}
         />
         <div className="segmented">
-          {KIND_ORDER.map((k) => (
+          {cats.map((c) => (
             <button
-              key={k}
-              className={kinds.has(k) ? "on" : ""}
-              onClick={() => toggle(kinds, k, setKinds)}
+              key={c.key}
+              className={kinds.has(c.key) ? "on" : ""}
+              onClick={() => toggle(kinds, c.key, setKinds)}
             >
-              {KIND_META[k].icon} {KIND_META[k].plural}
+              {c.icon} {c.plural}
             </button>
           ))}
         </div>
@@ -142,36 +162,17 @@ export default function QuickRefs() {
             </button>
           ))}
         </div>
-
-        {sections.map(([kind, list]) => (
-          <div key={kind} className="ref-section">
-            <h3>{KIND_META[kind].plural} <small>({list.length})</small></h3>
-            <ul>
-              {list.map((r) => (
-                <li key={r.id}>
-                  <button className={open?.ref.id === r.id ? "on" : ""} onClick={() => openRef(r.id)}>
-                    <span className="kindmark">{KIND_META[r.kind]?.icon}</span>
-                    {r.title}
-                  </button>
-                </li>
-              ))}
-            </ul>
-          </div>
-        ))}
-        {filtered.length === 0 && (
-          <p className="empty">
-            {refs.length === 0
-              ? "No quick-refs yet — run the Quick-references step on a project."
-              : "No quick-refs match the filters."}
-          </p>
-        )}
       </aside>
 
-      {open && (
+      {open ? (
         <section>
+          <p className="detail-bar">
+            <button className="linkish" onClick={closeDetail}>← all quick-refs</button>
+            <button className="linkish danger" onClick={deleteDoc}>delete doc</button>
+          </p>
           <h2>
-            {KIND_META[open.ref.kind]?.icon} {open.ref.title}
-            <span className="kindbadge">{KIND_META[open.ref.kind]?.label ?? open.ref.kind}</span>
+            {meta(open.ref.kind).icon} {open.ref.title}
+            <span className="kindbadge">{meta(open.ref.kind).label || open.ref.kind}</span>
           </h2>
           {(open.ref.aliases ?? []).length > 0 && (
             <p className="meta">aka: {open.ref.aliases.join(", ")}</p>
@@ -217,6 +218,33 @@ export default function QuickRefs() {
               {versionBody ? versionBody.body : open.body}
             </ReactMarkdown>
           </article>
+        </section>
+      ) : (
+        <section
+          className="ref-columns"
+          style={{ gridTemplateColumns: `repeat(${Math.max(columns.length, 1)}, minmax(220px, 1fr))` }}
+        >
+          {columns.map(([kind, list]) => (
+            <div key={kind} className="ref-column">
+              <h3>
+                {meta(kind).icon} {meta(kind).plural || kind} <small>({list.length})</small>
+              </h3>
+              <ul>
+                {list.map((r) => (
+                  <li key={r.id}>
+                    <button onClick={() => openRef(r.id)}>{r.title}</button>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ))}
+          {filtered.length === 0 && (
+            <p className="empty">
+              {refs.length === 0
+                ? "No quick-refs yet — run the Quick-references step on a project."
+                : "No quick-refs match the filters."}
+            </p>
+          )}
         </section>
       )}
     </div>

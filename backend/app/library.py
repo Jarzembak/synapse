@@ -4,7 +4,8 @@ Disk layout (LIBRARY_DIR is Obsidian-openable):
     projects/<project-slug>/<artifact>.md      one file per artifact
     projects/<project-slug>/<artifact>.mp3     binary payloads, sidecar .md holds metadata
     tools/<slug>.md                            cross-project quick-references
-    techniques/<slug>.md
+    techniques/<slug>.md                       (one folder per category: concepts/,
+                                               technologies/, custom category dirs)
     .history/<library-relative-path>.<ts>.md   snapshots taken before quick-ref merges
 
 Every write goes through write_artifact(), which persists frontmatter+body and
@@ -29,6 +30,7 @@ ARTIFACT_TYPES = [
     "transcript", "corrected", "summary", "deepdive_claude", "deepdive_gemini",
     "deepdive_merged", "podcast_script", "podcast_audio", "trimmed_audio",
     "mindmap", "quickref_tool", "quickref_technique", "quickref_concept",
+    "quickref_technology",  # plus quickref_<key> per custom category
     "source_video", "source_audio",
 ]
 

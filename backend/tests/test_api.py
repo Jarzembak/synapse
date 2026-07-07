@@ -255,6 +255,132 @@ def test_quickref_concept_kind(client):
     assert hit["updated"] is not None
 
 
+def test_quickref_categories_builtins(client):
+    cats = client.get("/api/quickrefs/categories").json()
+    assert [c["key"] for c in cats[:4]] == ["tool", "technique", "concept", "technology"]
+    tech = cats[3]
+    assert tech["builtin"] and tech["dir"] == "technologies" and tech["plural"] == "Technologies"
+    # the technology kind has a doc prompt in the registry / prompt editor
+    assert "quickref_technology" in client.get("/api/settings/prompts").json()
+
+
+def test_custom_category_crud(client):
+    from app import categories
+
+    new = {"label": "Framework", "plural": "Frameworks", "icon": "🧭",
+           "description": "a named methodology practitioners align work to",
+           "prompt": "Write a framework quick-ref for the given subject."}
+    r = client.post("/api/quickrefs/categories", json=new)
+    assert r.status_code == 200, r.text
+    assert r.json()["key"] == "framework" and r.json()["dir"] == "frameworks"
+
+    cats = client.get("/api/quickrefs/categories").json()
+    mine = next(c for c in cats if c["key"] == "framework")
+    assert not mine["builtin"] and mine["count"] == 0
+
+    # duplicates and built-in collisions are refused
+    assert client.post("/api/quickrefs/categories", json=new).status_code == 409
+    assert client.post("/api/quickrefs/categories", json={
+        **new, "label": "Tool", "plural": "Tools2"}).status_code == 409
+    # required fields
+    assert client.post("/api/quickrefs/categories", json={
+        **new, "label": "Empty desc", "plural": "EDs", "description": " "}).status_code == 400
+
+    # update: fields change, key and dir stay fixed; blanks are rejected, not
+    # silently dropped
+    r = client.put("/api/quickrefs/categories/framework",
+                   json={"label": "Frameworkz", "description": "updated"})
+    assert r.status_code == 200
+    assert r.json()["label"] == "Frameworkz" and r.json()["dir"] == "frameworks"
+    assert client.put("/api/quickrefs/categories/framework",
+                      json={"description": "  "}).status_code == 400
+    assert client.put("/api/quickrefs/categories/tool",
+                      json={"label": "x"}).status_code == 400
+    assert client.put("/api/quickrefs/categories/nope",
+                      json={"label": "x"}).status_code == 404
+
+    # the pipeline helpers pick the category up
+    from app.tasks.quickref import doc_prompt, extraction_system
+
+    cat_map = categories.category_map()
+    assert doc_prompt("framework", cat_map) == "Write a framework quick-ref for the given subject."
+    assert doc_prompt("tool", cat_map)  # builtin routes through the prompt registry
+    system = extraction_system([], categories.all_categories())
+    assert "FRAMEWORKZ" in system and "updated" in system
+    assert '"tool|technique|concept|technology|framework"' in system
+    assert categories.kind_dir("framework") == "frameworks"
+    assert categories.kind_dir("technology") == "technologies"
+
+    # deletion is blocked while docs still use the category; deleting the doc
+    # through the API (files + DB rows + FTS) unblocks it
+    from app.models import Artifact, QuickRef
+
+    library._write_doc("frameworks/mitre-attack.md", {"title": "MITRE ATT&CK"}, "kb body")
+    with get_session() as session:
+        ref = QuickRef(kind="framework", slug="mitre-attack", title="MITRE ATT&CK",
+                       path="frameworks/mitre-attack.md", aliases="[]")
+        session.add(ref)
+        session.commit()
+        rid = ref.id
+        art = library.write_artifact(
+            session, project_id=None, project_slug=None, type="quickref_framework",
+            title="MITRE ATT&CK", body="kb body",
+            rel_path="frameworks/mitre-attack.md",
+        )
+        aid = art.id
+    assert client.delete("/api/quickrefs/categories/framework").status_code == 409
+
+    assert client.delete(f"/api/quickrefs/{rid}").status_code == 200
+    assert not library.lib_path("frameworks/mitre-attack.md").exists()
+    with get_session() as session:
+        assert session.get(Artifact, aid) is None
+    assert client.delete(f"/api/quickrefs/{rid}").status_code == 404
+
+    assert client.delete("/api/quickrefs/categories/framework").status_code == 200
+    assert client.delete("/api/quickrefs/categories/framework").status_code == 404
+    assert client.delete("/api/quickrefs/categories/tool").status_code == 400
+    assert all(c["key"] != "framework"
+               for c in client.get("/api/quickrefs/categories").json())
+
+
+def test_upsert_quickref_keeps_existing_kind(client, monkeypatch):
+    """When the LLM re-classifies an existing doc under a different kind, the
+    merge must keep the doc's established kind — a mismatched quickref_<kind>
+    artifact type at the same path would fork a second Artifact row."""
+    from app import categories, llm
+    from app.models import Artifact, QuickRef
+    from app.tasks import quickref as qr
+    from sqlmodel import select
+
+    with get_session() as session:
+        project = Project(slug="qkind", title="Kind demo", source="x", source_type="url")
+        session.add(project)
+        session.commit()
+        session.refresh(project)
+        pid, pslug, ptitle = project.id, project.slug, project.title
+        library.write_artifact(
+            session, project_id=pid, project_slug=pslug, type="quickref_tool",
+            title="Docker", body="tool manual", rel_path="tools/docker.md")
+        session.add(QuickRef(kind="tool", slug="docker", title="Docker",
+                             path="tools/docker.md", aliases="[]"))
+        session.commit()
+
+    monkeypatch.setattr(llm, "resolve_model", lambda fn: ("test", "test-model"))
+    monkeypatch.setattr(llm, "complete", lambda *a, **k: "merged body")
+    monkeypatch.setattr(qr, "auto_tag", lambda *a, **k: None)  # no celery broker
+    qr._upsert_quickref(pid, pslug, ptitle, "Docker", "technology", "docker",
+                        "deep dive text", categories.category_map())
+
+    with get_session() as session:
+        arts = session.exec(
+            select(Artifact).where(Artifact.path == "tools/docker.md")).all()
+        assert len(arts) == 1 and arts[0].type == "quickref_tool"
+        ref = session.exec(select(QuickRef).where(QuickRef.slug == "docker")).one()
+        assert ref.kind == "tool"
+    _, body = library.read_doc("tools/docker.md")
+    assert body.startswith("merged body")
+
+
 def test_tag_project_propagates_and_caches(client, monkeypatch):
     """Project-level tagging: one LLM call from the richest doc, propagated to
     all project artifacts (metadata artifacts inherit rather than re-tag)."""

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException
-from sqlmodel import select
+from pydantic import BaseModel
+from sqlmodel import select, text
 
 from ..db import get_session
 from ..models import Artifact, Project, QuickRef, QuickRefSource
-from .. import library
+from .. import categories, library
 
 router = APIRouter(prefix="/api/quickrefs", tags=["quickrefs"])
 
@@ -35,6 +36,100 @@ def list_quickrefs(kind: str = ""):
         return [_serialize_ref(session, r) for r in session.exec(stmt).all()]
 
 
+# --- categories (declared before /{ref_id} so the literal path wins) ---
+
+RESERVED_DIRS = {"projects", ".history"}
+
+
+@router.get("/categories")
+def list_categories():
+    with get_session() as session:
+        counts = dict(session.exec(
+            text("SELECT kind, COUNT(*) FROM quickref GROUP BY kind")
+        ).all())
+    return [{**c, "count": counts.get(c["key"], 0)}
+            for c in categories.all_categories()]
+
+
+class CategoryCreate(BaseModel):
+    label: str
+    plural: str = ""
+    icon: str = ""
+    description: str
+    prompt: str
+
+
+class CategoryUpdate(BaseModel):
+    label: str | None = None
+    plural: str | None = None
+    icon: str | None = None
+    description: str | None = None
+    prompt: str | None = None
+
+
+@router.post("/categories")
+def create_category(req: CategoryCreate):
+    label = req.label.strip()
+    if not label:
+        raise HTTPException(400, "label is required")
+    if not req.description.strip():
+        raise HTTPException(400, "description is required — entity extraction uses it "
+                                 "to decide what belongs in this category")
+    if not req.prompt.strip():
+        raise HTTPException(400, "prompt is required — it writes this category's docs")
+    key = library.make_slug(label)
+    plural = req.plural.strip() or f"{label}s"
+    cat_dir = library.make_slug(plural)
+    existing = categories.all_categories()
+    if any(c["key"] == key for c in existing):
+        raise HTTPException(409, f"category {key!r} already exists")
+    if cat_dir in RESERVED_DIRS or any(c["dir"] == cat_dir for c in existing):
+        raise HTTPException(409, f"library folder {cat_dir!r} is already in use")
+    cat = {"key": key, "label": label, "plural": plural,
+           "icon": req.icon.strip() or "📄", "dir": cat_dir,
+           "description": req.description.strip(), "prompt": req.prompt.strip()}
+    categories.save_custom_categories(categories.custom_categories() + [cat])
+    return {**cat, "builtin": False, "count": 0}
+
+
+@router.put("/categories/{key}")
+def update_category(key: str, req: CategoryUpdate):
+    """Edit a custom category. Its key and library folder stay fixed so
+    existing docs and QuickRef rows never orphan."""
+    if key in categories.BUILTIN_KEYS:
+        raise HTTPException(400, "built-in categories are fixed — edit their "
+                                 "prompts in Settings → Advanced → Prompt editor")
+    custom = categories.custom_categories()
+    cat = next((c for c in custom if c["key"] == key), None)
+    if not cat:
+        raise HTTPException(404)
+    for field in ("label", "plural", "icon", "description", "prompt"):
+        value = getattr(req, field)
+        if value is None:
+            continue
+        if not value.strip():
+            raise HTTPException(400, f"{field} cannot be blank")
+        cat[field] = value.strip()
+    categories.save_custom_categories(custom)
+    return cat
+
+
+@router.delete("/categories/{key}")
+def delete_category(key: str):
+    if key in categories.BUILTIN_KEYS:
+        raise HTTPException(400, "built-in categories cannot be deleted")
+    custom = categories.custom_categories()
+    if not any(c["key"] == key for c in custom):
+        raise HTTPException(404)
+    with get_session() as session:
+        used = len(session.exec(select(QuickRef).where(QuickRef.kind == key)).all())
+    if used:
+        raise HTTPException(409, f"{used} quick-ref(s) still use this category — "
+                                 "delete those docs first")
+    categories.save_custom_categories([c for c in custom if c["key"] != key])
+    return {"ok": True}
+
+
 def _versions(ref: QuickRef) -> list[str]:
     hist_dir = library.lib_path(f".history/{ref.path}").parent
     prefix = library.lib_path(ref.path).name + "."
@@ -59,6 +154,35 @@ def get_quickref(ref_id: int):
             "body": body,
             "versions": _versions(ref),
         }
+
+
+@router.delete("/{ref_id}")
+def delete_quickref(ref_id: int):
+    """Permanently delete a quick-ref doc: DB rows, FTS entry, the file and its
+    history snapshots. This is also how a used custom category becomes
+    deletable."""
+    with get_session() as session:
+        ref = session.get(QuickRef, ref_id)
+        if not ref:
+            raise HTTPException(404)
+        rel_path = ref.path
+        versions = _versions(ref)
+        for art in session.exec(select(Artifact).where(Artifact.path == rel_path)).all():
+            session.exec(text("DELETE FROM artifact_fts WHERE artifact_id = :id")
+                         .bindparams(id=art.id))
+            session.exec(text("DELETE FROM artifacttag WHERE artifact_id = :id")
+                         .bindparams(id=art.id))
+            session.delete(art)
+        session.exec(text("DELETE FROM quickrefsource WHERE quickref_id = :id")
+                     .bindparams(id=ref_id))
+        session.delete(ref)
+        session.commit()
+
+    library.lib_path(rel_path).unlink(missing_ok=True)
+    hist_dir = library.lib_path(f".history/{rel_path}").parent
+    for name in versions:
+        (hist_dir / name).unlink(missing_ok=True)
+    return {"ok": True}
 
 
 @router.get("/{ref_id}/versions/{name}")

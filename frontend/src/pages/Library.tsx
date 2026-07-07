@@ -1,6 +1,6 @@
 import { Fragment, useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
-import { api, Artifact, TYPE_LABELS } from "../api";
+import { api, Artifact, typeLabel } from "../api";
 
 interface TagInfo { id: number; name: string; kind: string; count: number }
 
@@ -23,7 +23,7 @@ const FunnelIcon = () => (
 function sortValue(a: Artifact, col: Col): string | number {
   switch (col) {
     case "title": return a.title.toLowerCase();
-    case "type": return (TYPE_LABELS[a.type] ?? a.type).toLowerCase();
+    case "type": return typeLabel(a.type).toLowerCase();
     case "project": return a.project_slug ?? "";
     case "tags": return (a.tags ?? []).slice().sort().join(",");
     case "updated": return new Date(a.updated).getTime();
@@ -171,7 +171,7 @@ export default function Library() {
               checked={selected.has(v)}
               onChange={() => setter(toggleSet(selected, v))}
             />
-            {col === "type" ? TYPE_LABELS[v] ?? v : v} <small>({n})</small>
+            {col === "type" ? typeLabel(v) : v} <small>({n})</small>
           </label>
         ))}
         {values.length === 0 && <p className="empty">no values</p>}
@@ -186,7 +186,7 @@ export default function Library() {
   const renderRow = (a: Artifact) => (
     <tr key={a.id}>
       <td><Link to={`/artifacts/${a.id}`}>{a.title}</Link></td>
-      <td>{TYPE_LABELS[a.type] ?? a.type}</td>
+      <td>{typeLabel(a.type)}</td>
       <td>{a.project_slug}</td>
       <td>
         {a.tags?.map((t) => (

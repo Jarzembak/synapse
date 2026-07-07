@@ -72,6 +72,26 @@ export const TYPE_LABELS: Record<string, string> = {
   quickref_tool: "Quick-ref: tool",
   quickref_technique: "Quick-ref: technique",
   quickref_concept: "Quick-ref: concept",
+  quickref_technology: "Quick-ref: technology",
   source_video: "Source video",
   source_audio: "Source audio",
 };
+
+/** Human label for an artifact type; custom quick-ref categories fall back
+ * to "Quick-ref: <kind>" instead of the raw quickref_<kind> type. */
+export function typeLabel(type: string): string {
+  return TYPE_LABELS[type] ??
+    (type.startsWith("quickref_") ? `Quick-ref: ${type.slice(9).replace(/-/g, " ")}` : type);
+}
+
+export interface QuickRefCategory {
+  key: string;
+  label: string;
+  plural: string;
+  icon: string;
+  dir: string;
+  builtin: boolean;
+  description?: string;
+  prompt?: string;
+  count: number;
+}

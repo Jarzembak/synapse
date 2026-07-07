@@ -1,9 +1,11 @@
-"""Quick-reference docs: one per tool / technique / concept, auto-merged across
-videos.
+"""Quick-reference docs: one per tool / technique / concept / technology (plus
+any user-defined categories), auto-merged across videos.
 
 Kinds: a TOOL doc is a user-friendly instruction manual, a TECHNIQUE doc is a
-step-by-step recipe for a specific task, a CONCEPT doc is a crisp explainer —
-see the per-kind templates in prompts.py.
+step-by-step recipe for a specific task, a CONCEPT doc is a crisp explainer, a
+TECHNOLOGY doc is a platform/protocol primer — see the per-kind templates in
+prompts.py. Custom categories (Settings → Quick-ref categories) carry their own
+doc prompt and their description is appended to the extraction call below.
 
 Matching policy (user-confirmed): the LLM sees the existing quick-ref index
 (slugs + aliases) and must map each mention to an existing doc or justify a new
@@ -17,13 +19,11 @@ import json
 from sqlmodel import select
 
 from ..db import get_session
-from .. import library, llm
+from .. import categories, library, llm
 from ..models import QuickRef, QuickRefSource
 from .celery_app import celery
 from .common import artifact_body, auto_tag, get_project, pipeline_task, progress
 from .prompts import get_prompt
-
-KINDS = ("tool", "technique", "concept")
 
 
 def _index(session) -> list[dict]:
@@ -34,6 +34,38 @@ def _index(session) -> list[dict]:
     ]
 
 
+def extraction_system(index: list[dict], cats: list[dict]) -> str:
+    """Entity-extraction system prompt: the (editable) base prompt, definitions
+    of user-defined categories, the existing index, and the reply schema with
+    the full kind enum — the last three are code-side so custom categories work
+    without hand-editing the base prompt."""
+    system = get_prompt("extract_entities")
+    custom = [c for c in cats if not c["builtin"]]
+    if custom:
+        system += "\n\nUser-defined categories (classify into these too):\n" + "\n".join(
+            f"- {c['label'].upper()} (kind \"{c['key']}\"): {c.get('description', '')}"
+            for c in custom
+        )
+    kind_enum = "|".join(c["key"] for c in cats)
+    return (
+        system
+        + "\n\nExisting quick-reference index — map mentions to an existing entry "
+          "whenever it is the same thing under a variant name:\n"
+        + json.dumps(index)
+        + '\n\nReply as {"entities": [{"name": "...", "kind": "' + kind_enum
+        + '", "existing_slug": "slug or null", "why_new": "only if new"}]}'
+    )
+
+
+def doc_prompt(kind: str, cats: dict[str, dict]) -> str:
+    """Doc-writing prompt for a kind: built-ins from the prompt registry
+    (override-aware), custom categories from their stored prompt."""
+    cat = cats[kind]
+    if cat["builtin"]:
+        return get_prompt(f"quickref_{kind}")
+    return cat.get("prompt") or get_prompt("quickref_concept")
+
+
 @celery.task(name="quickref")
 @pipeline_task
 def quickref(job_id: int, project_id: int):
@@ -42,38 +74,38 @@ def quickref(job_id: int, project_id: int):
         project = get_project(session, project_id)
         index = _index(session)
 
-    progress(job_id, "identifying tools, techniques and concepts")
+    cats = categories.all_categories()
+    progress(job_id, "identifying tools, techniques, concepts and technologies")
     extraction = llm.complete_json(
         "quickref",
-        get_prompt("extract_entities")
-        + "\n\nExisting quick-reference index — map mentions to an existing entry "
-          "whenever it is the same thing under a variant name:\n"
-        + json.dumps(index)
-        + '\n\nReply as {"entities": [{"name": "...", "kind": "tool|technique|concept", '
-          '"existing_slug": "slug or null", "why_new": "only if new"}]}',
+        extraction_system(index, cats),
         deepdive[:100000],
     )
 
+    cat_map = {c["key"]: c for c in cats}
     entities = extraction.get("entities", [])
     for i, ent in enumerate(entities):
         name = (ent.get("name") or "").strip()
         kind = ent.get("kind")
-        if not name or kind not in KINDS:
+        if not name or kind not in cat_map:
             continue
         progress(job_id, f"quick-ref {i + 1}/{len(entities)}: {name}")
         _upsert_quickref(project_id, project.slug, project.title,
-                         name, kind, ent.get("existing_slug"), deepdive)
+                         name, kind, ent.get("existing_slug"), deepdive, cat_map)
 
 
 def _upsert_quickref(project_id: int, project_slug: str, project_title: str,
                      name: str, kind: str, existing_slug: str | None,
-                     deepdive: str) -> None:
+                     deepdive: str, cat_map: dict[str, dict]) -> None:
     with get_session() as session:
         ref = None
         if existing_slug:
-            ref = session.exec(
+            matches = session.exec(
                 select(QuickRef).where(QuickRef.slug == existing_slug)
-            ).first()
+            ).all()
+            # slugs are only unique per kind — prefer the same-kind match
+            ref = next((m for m in matches if m.kind == kind),
+                       matches[0] if matches else None)
         if ref is None:  # exact slug/alias fallback
             slug = library.make_slug(name)
             for candidate in session.exec(select(QuickRef).where(QuickRef.kind == kind)).all():
@@ -82,6 +114,12 @@ def _upsert_quickref(project_id: int, project_slug: str, project_title: str,
                 ]:
                     ref = candidate
                     break
+
+    if ref:
+        # the doc's established kind wins over this run's (re)classification —
+        # writing a different quickref_<kind> type at the same path would fork
+        # a second Artifact row and leave a stale FTS entry
+        kind = ref.kind
 
     provider, model = llm.resolve_model("quickref")
     source_note = (
@@ -102,10 +140,10 @@ def _upsert_quickref(project_id: int, project_slug: str, project_title: str,
     else:
         body = llm.complete(
             "quickref",
-            get_prompt(f"quickref_{kind}") + source_note,
+            doc_prompt(kind, cat_map) + source_note,
             f"Subject: {name}\n\n{deepdive[:80000]}",
         ).strip()
-        rel_path = f"{kind}s/{library.make_slug(name)}.md"
+        rel_path = f"{categories.kind_dir(kind)}/{library.make_slug(name)}.md"
         snapshot = None
 
     with get_session() as session:
