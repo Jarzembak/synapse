@@ -701,6 +701,176 @@ def test_project_progress_run_all_label(client):
             session.commit()
 
 
+def test_clean_tag_collapses_degenerate_output():
+    from app.tagging import clean_tag, sanitize_tags
+
+    # single-token looping → one word, however it arrives
+    assert clean_tag("apis apis apis apis") == "apis"
+    assert clean_tag("apis-apis-apis-apis-apis-apis") == "apis"
+    # consecutive-doubled prefix collapses to the real tag (merges into it)
+    assert clean_tag("apis-apis-control-plane") == "apis-control-plane"
+    # multi-token cycle: apis-networking-apis-networking → apis-networking
+    assert clean_tag("apis networking apis networking") == "apis-networking"
+    # genuine tags that merely reuse a word are NOT a clean cycle → kept intact
+    assert clean_tag("day-to-day") == "day-to-day"
+    assert clean_tag("end-to-end") == "end-to-end"
+    # legitimate short tags survive untouched
+    assert clean_tag("API integration") == "api-integration"
+    assert clean_tag("Docker") == "docker"
+    # run-on phrases the model sometimes emits as one tag are dropped
+    assert clean_tag("attack-surface-mapping-attack-vector-prioritization") is None
+    assert clean_tag("auto-provisioned-default-value-oracle-pattern") is None
+    assert clean_tag("") is None
+    # list helper de-dups and drops junk, order-preserving
+    assert sanitize_tags(["Docker", "apis-apis-apis", "docker", "", 5, "linux"]) \
+        == ["docker", "apis", "linux"]
+
+
+def test_tag_text_trusts_existing_long_vocab(client, monkeypatch):
+    """A long/multi-word tag a user created on purpose stays selectable — the
+    sanitizer's caps apply only to NEW model-invented tags."""
+    from sqlmodel import select
+    from app import tagging, llm
+    from app.models import Tag
+
+    long_name = "command-and-control-infrastructure"  # 34 chars, would exceed caps
+    with get_session() as session:
+        if not session.exec(select(Tag).where(Tag.name == long_name)).first():
+            session.add(Tag(name=long_name, kind="topic"))
+            session.commit()
+
+    # new tags disallowed: the model proposing the existing long tag must keep it
+    monkeypatch.setattr(tagging, "advanced",
+                        lambda g: {"max_tags": 8, "allow_new_tags": False})
+    monkeypatch.setattr(llm, "complete_json",
+                        lambda *a, **k: {"tags": [long_name, "invented-new-tag"]})
+    with get_session() as session:
+        names = tagging.tag_text(session, "t", "summary", "body")
+    assert long_name in names and "invented-new-tag" not in names
+
+
+def test_reset_orphaned_jobs_unblocks_queue(client):
+    """A worker restart marks stale 'running' jobs failed so they can't block
+    the serial queue or hide the Continue button."""
+    from app.tasks.celery_app import _reset_orphaned_jobs
+    from app.models import Job
+
+    with get_session() as session:
+        j = Job(project_id=None, task="run_all", status="running", progress="mid-run")
+        session.add(j)
+        session.commit()
+        session.refresh(j)
+        jid = j.id
+
+    _reset_orphaned_jobs()
+
+    with get_session() as session:
+        job = session.get(Job, jid)
+        assert job.status == "error" and "interrupted" in job.error
+
+
+def test_tag_text_sanitizes(client, monkeypatch):
+    """The tagger's output is sanitized before it can enter the vocabulary."""
+    from app import tagging, llm
+
+    monkeypatch.setattr(llm, "complete_json",
+                        lambda *a, **k: {"tags": ["apis-apis-apis-apis", "networking",
+                                                  "a-really-long-run-on-phrase-tag-here"]})
+    with get_session() as session:
+        names = tagging.tag_text(session, "t", "summary", "body about apis")
+    assert "networking" in names and "apis" in names
+    assert all(len(n) <= 32 for n in names)
+    assert not any(n.count("apis") > 1 for n in names)
+
+
+def test_continue_queue_endpoint(client, monkeypatch):
+    from sqlmodel import select
+    from app.tasks.celery_app import celery
+    from app.models import Job
+
+    sent = []
+    monkeypatch.setattr(celery, "send_task",
+                        lambda name, args=None, **k: (sent.append((name, args))
+                                                      or type("R", (), {"id": "x"})()))
+    r = client.post("/api/projects", json={
+        "source": "https://example.com/cq", "source_type": "url", "title": "Continue demo"})
+    pid = r.json()["id"]
+    with get_session() as session:
+        session.add(Job(project_id=pid, task="run_all", status="queued"))
+        session.commit()
+
+    try:
+        resp = client.post("/api/jobs/continue")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["already_running"] is False and body["queued"] >= 1
+        # it dispatched the stalled run-all
+        assert any(name == "run_all" for name, _ in sent)
+    finally:
+        # continue flips the run-all to 'running' in the DB (send_task is mocked)
+        # — don't leave it blocking the global run-all queue other tests exercise
+        with get_session() as session:
+            for j in session.exec(select(Job).where(Job.project_id == pid)).all():
+                session.delete(j)
+            session.commit()
+
+
+def test_cloud_sync_is_idempotent(client, monkeypatch):
+    """Two rapid 'sync everything' clicks must not launch concurrent full syncs
+    (which create duplicate files on Drive-style backends)."""
+    from app.tasks.celery_app import celery
+
+    monkeypatch.setattr(celery, "send_task", lambda *a, **k: type("R", (), {"id": "x"})())
+    client.put("/api/settings/cloud", json={
+        "provider": "drive", "config": {"token": '{"access_token":"t"}'},
+        "remote_base": "synapse", "auto": False,
+    })
+    try:
+        first = client.post("/api/settings/cloud/sync").json()
+        second = client.post("/api/settings/cloud/sync").json()
+        assert first["id"] == second["id"]      # same in-flight job, not a new one
+    finally:
+        from sqlmodel import select
+        from app.models import Job
+        with get_session() as session:
+            for j in session.exec(select(Job).where(Job.task == "cloud_sync_all")).all():
+                session.delete(j)
+            session.commit()
+        client.put("/api/settings/cloud", json={
+            "provider": "", "config": {}, "remote_base": "synapse", "auto": False})
+
+
+def test_cloud_sync_dispatch_failure_leaves_no_ghost(client, monkeypatch):
+    """If the broker is down, the sync must not persist a 'queued' job that the
+    idempotency guard would then return forever, blocking all future syncs."""
+    from sqlmodel import select
+    from app.tasks.celery_app import celery
+    from app.models import Job
+
+    def boom(*a, **k):
+        raise RuntimeError("broker down")
+
+    monkeypatch.setattr(celery, "send_task", boom)
+    client.put("/api/settings/cloud", json={
+        "provider": "drive", "config": {"token": '{"access_token":"t"}'},
+        "remote_base": "synapse", "auto": False})
+    try:
+        r = client.post("/api/settings/cloud/sync")
+        assert r.status_code == 503
+        with get_session() as session:
+            ghosts = session.exec(
+                select(Job).where(Job.task == "cloud_sync_all",
+                                  Job.status == "queued")).all()
+            assert not ghosts  # the failed dispatch was marked error, not left queued
+    finally:
+        with get_session() as session:
+            for j in session.exec(select(Job).where(Job.task == "cloud_sync_all")).all():
+                session.delete(j)
+            session.commit()
+        client.put("/api/settings/cloud", json={
+            "provider": "", "config": {}, "remote_base": "synapse", "auto": False})
+
+
 def test_system_stats_shape(client):
     """The monitor endpoint returns host CPU/RAM plus (possibly empty) GPU and
     Ollama lists — never 500s when nvidia-smi or Ollama are absent."""
