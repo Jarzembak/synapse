@@ -1,21 +1,21 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { Link } from "react-router-dom";
 import { Job } from "../api";
+import { useEventSource } from "../useEventSource";
 
 /** Live badge in the nav (links to the Jobs tab), fed by the SSE stream. */
 export default function JobTicker() {
   const [active, setActive] = useState<Job[]>([]);
+  const [connected, setConnected] = useState(true);
 
-  useEffect(() => {
-    const es = new EventSource("/api/jobs/stream");
-    es.addEventListener("jobs", (e) => {
-      const data = JSON.parse((e as MessageEvent).data);
-      setActive(data.active);
-    });
-    return () => es.close();
-  }, []);
+  useEventSource<{ active: Job[] }>(
+    "/api/jobs/stream", "jobs", (d) => setActive(d.active), setConnected);
 
-  if (active.length === 0) return <Link to="/jobs" className="ticker idle">idle</Link>;
+  // While the stream is down we have no live data, so don't assert "busy" — a
+  // dropped connection reconnects within a couple seconds and refreshes this.
+  if (!connected || active.length === 0)
+    return <Link to="/jobs" className="ticker idle">idle</Link>;
+
   const running = active.filter((a) => a.status === "running");
   const queued = active.filter((a) => a.status === "queued");
   const lead = running[0] ?? active[0];

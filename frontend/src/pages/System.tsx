@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { api } from "../api";
+import { useEventSource } from "../useEventSource";
 
 interface Gpu {
   index: number;
@@ -51,15 +52,12 @@ export default function System() {
   useEffect(() => {
     // one immediate snapshot so the page isn't blank for the first ~2s
     api<Stats>("/system/stats").then((s) => { if (!seen.current) setStats(s); }).catch(() => {});
-    const es = new EventSource("/api/system/stream");
-    es.addEventListener("system", (e) => {
-      seen.current = true;
-      setStats(JSON.parse((e as MessageEvent).data));
-      setLive(true);
-    });
-    es.onerror = () => setLive(false);
-    return () => es.close();
   }, []);
+
+  // the /system/stream sends a fresh sample every ~2s, so it doubles as its own
+  // heartbeat; the reconnecting hook keeps it alive across an api restart
+  useEventSource<Stats>("/api/system/stream", "system",
+    (s) => { seen.current = true; setStats(s); }, setLive);
 
   if (!stats) return <p>loading system stats…</p>;
 
