@@ -304,6 +304,29 @@ button.linkish.danger { color: var(--danger); }
 .legend { display: flex; gap: 1rem; margin-top: 0.5rem; font-size: 0.8rem; color: var(--muted); }
 .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 4px; }
 
+/* ---------- logs ---------- */
+
+.logs-toolbar { display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap;
+  margin-bottom: 0.6rem; }
+.logs-toolbar .segmented { flex: 0 0 auto; }
+.logs-toolbar .segmented button { padding: 0.3rem 0.7rem; text-transform: uppercase;
+  font-size: 0.75rem; }
+.logs-toolbar .search { flex: 1; min-width: 8rem; max-width: 22rem; padding: 0.35rem 0.6rem;
+  font-size: 0.85rem; }
+.logs-toolbar select { margin: 0; }
+.live-toggle { display: inline-flex; align-items: center; gap: 0.3rem; font-size: 0.85rem;
+  color: var(--muted); }
+.logview { height: 62vh; overflow: auto; background: var(--code-bg); color: var(--code-text);
+  border: 1px solid var(--border2); border-radius: 8px; padding: 0.6rem 0.8rem;
+  font-family: Consolas, "Cascadia Code", monospace; font-size: 0.78rem; line-height: 1.5; }
+.logline { white-space: pre-wrap; word-break: break-word; padding: 0 0.2rem;
+  border-left: 2px solid transparent; }
+.logline.debug { color: var(--muted); }
+.logline.warning { color: var(--warning); border-left-color: var(--warning); }
+.logline.error, .logline.critical { color: var(--danger); border-left-color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 10%, transparent); }
+.logview .empty { color: var(--muted); }
+
 /* ---------- system monitor ---------- */
 
 .sys-head { display: flex; align-items: center; gap: 0.8rem; }

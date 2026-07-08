@@ -7,6 +7,7 @@ import ArtifactView from "./pages/ArtifactView";
 import QuickRefs from "./pages/QuickRefs";
 import Jobs from "./pages/Jobs";
 import System from "./pages/System";
+import Logs from "./pages/Logs";
 import Settings from "./pages/Settings";
 import JobTicker from "./components/JobTicker";
 import ThemeSelect from "./components/ThemeSelect";
@@ -22,6 +23,7 @@ export default function App() {
         <NavLink to="/quickrefs">Quick-refs</NavLink>
         <NavLink to="/jobs">Jobs</NavLink>
         <NavLink to="/system">System</NavLink>
+        <NavLink to="/logs">Logs</NavLink>
         <NavLink to="/settings">Settings</NavLink>
         <JobTicker />
         <ThemeSelect />
@@ -36,6 +38,7 @@ export default function App() {
             <Route path="/quickrefs" element={<QuickRefs />} />
             <Route path="/jobs" element={<Jobs />} />
             <Route path="/system" element={<System />} />
+            <Route path="/logs" element={<Logs />} />
             <Route path="/settings" element={<Settings />} />
           </Routes>
         </ErrorBoundary>

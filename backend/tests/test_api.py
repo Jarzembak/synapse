@@ -539,6 +539,9 @@ def test_logging_and_tail_endpoint(client):
     assert client.get("/api/logs/nosuchservice").status_code == 404
     assert client.get("/api/logs/..%2Fetc").status_code in (400, 404)
 
+    # chatty per-request loggers are quieted so pipeline logs stay readable
+    assert logging.getLogger("httpx").getEffectiveLevel() >= logging.WARNING
+
 
 def test_combined_title():
     from app.tasks.ingest import combined_title
