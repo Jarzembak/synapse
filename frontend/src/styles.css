@@ -122,6 +122,8 @@ button:hover { border-color: var(--accent); }
 .jobstatus.done { background: var(--success); color: var(--accent-contrast); }
 .jobstatus.error { background: var(--danger); color: #fff; }
 .jobstatus.canceled { background: var(--panel2); color: var(--muted); }
+.jobstatus.partial { background: var(--panel2); color: var(--text); border: 1px solid var(--border2); }
+.jobstatus.new { background: var(--panel2); color: var(--muted); border: 1px solid var(--border2); }
 .job-error-row pre { max-height: 220px; overflow: auto; font-size: 0.72rem; margin: 0; }
 .muted { color: var(--muted); }
 .themeselect { background: var(--nav-bg); color: var(--nav-text); border-color: var(--border2); }
@@ -194,6 +196,20 @@ h2 { margin-top: 1.4rem; }
 
 .newproject { display: flex; gap: 0.5rem; }
 .newproject input { flex: 1; padding: 0.45rem; }
+
+/* derived pipeline status in the projects list */
+.projstatus { display: flex; flex-direction: column; gap: 0.28rem; min-width: 160px; }
+.projstatus-line { display: flex; align-items: center; gap: 0.4rem; flex-wrap: wrap; }
+.projstatus .substep { font-size: 0.78rem; color: var(--muted); }
+.projstatus .frac { margin-left: auto; font-size: 0.72rem; color: var(--muted);
+  font-variant-numeric: tabular-nums; }
+.pbar { height: 3px; border-radius: 2px; background: var(--panel2); overflow: hidden; }
+.pbar i { display: block; height: 100%; background: var(--accent); transition: width 0.3s; }
+.pbar i.done { background: var(--success); }
+.pbar i.running { background: var(--warning); }
+.pbar i.error { background: var(--danger); }
+.pbar i.canceled { background: var(--muted); }
+.pbar i.new { background: var(--border2); }
 
 .project-head { display: flex; align-items: center; gap: 0.8rem; flex-wrap: wrap; }
 .project-head h2 { margin: 1rem 0 0.4rem; }

@@ -12,10 +12,83 @@ from ..tasks.celery_app import celery
 from ..tasks.ingest import cookies_path
 
 from ..tasks.orchestrate import (  # noqa: E402
-    STEPS, STEP_NAMES, applicable_steps, missing_deps, step_done,
+    STEPS, STEP_LABELS, STEP_NAMES, STEP_OUTPUT, applicable_steps,
+    missing_deps, step_done,
 )
 
 router = APIRouter(prefix="/api/projects", tags=["projects"])
+
+
+def _step_label(task: str) -> str:
+    return "Run all steps" if task == "run_all" else STEP_LABELS.get(task, task)
+
+
+def _list_step_done(step: str, artifact_types: set[str], done_tasks: set[str]) -> bool:
+    """DB-only step-completion for the projects list — no filesystem access.
+
+    The canonical step_done() stats the media dir for `ingest` (and even
+    mkdir's it) and issues a fresh query for `quickref`; doing that per project
+    on a ~1/sec-polled list is both a side effect and an N+1. Here `ingest` is
+    proven by a succeeded ingest job or the existence of a transcript (which
+    can't exist without ingested audio), and `quickref` by a succeeded job."""
+    if step == "ingest":
+        return "ingest" in done_tasks or "transcript" in artifact_types
+    if step == "quickref":
+        return "quickref" in done_tasks
+    return STEP_OUTPUT[step] in artifact_types
+
+
+def _project_progress(project: Project, artifact_types: set[str],
+                      jobs: list[Job]) -> dict:
+    """Derived pipeline status for the projects list, computed from the step
+    graph (the raw Project.status field only ever tracks ingest/transcribe).
+
+    `jobs` must be this project's jobs ordered oldest-first (by updated).
+    Precedence: running (a job is queued/running) > canceled (the last run was
+    canceled) > failed (it errored) > complete (all applicable steps done) >
+    partial > new.
+    """
+    applicable = applicable_steps(project)
+    done_tasks = {j.task for j in jobs if j.status == "done"}
+    done = sum(1 for s in applicable
+               if _list_step_done(s, artifact_types, done_tasks))
+    total = len(applicable)
+
+    active = [j for j in jobs if j.status in ("queued", "running")]
+    latest = jobs[-1] if jobs else None
+    status, detail = "new", None
+    if active:
+        run = next((j for j in active if j.status == "running"), active[0])
+        # name a concrete step rather than the run-all wrapper when possible
+        step = next((j for j in active
+                     if j.status == "running" and j.task in STEP_NAMES), None) or run
+        status = "running"
+        detail = _step_label(step.task)
+    elif latest is not None and (
+            latest.status == "canceled"
+            or (latest.status == "error" and "cancel" in (latest.error or "").lower())):
+        # a user cancellation aborts leftover step jobs into 'error' rows tagged
+        # 'run-all canceled' — surface that as canceled, not a pipeline failure
+        status = "canceled"
+    elif latest is not None and latest.status == "error":
+        status = "failed"
+        # name the most recent errored step that isn't since completed
+        errored = next((j for j in reversed(jobs)
+                        if j.status == "error" and j.task in STEP_NAMES
+                        and not _list_step_done(j.task, artifact_types, done_tasks)), None)
+        detail = _step_label(errored.task) if errored else None
+    elif total and done >= total:
+        status = "complete"
+    elif done > 0:
+        status = "partial"
+
+    return {
+        "done": done,
+        "total": total,
+        "status": status,
+        "detail": detail,
+        "last_activity": latest.updated.isoformat() if latest else None,
+    }
 
 
 class ProjectCreate(BaseModel):
@@ -84,9 +157,23 @@ def rename_project(project_id: int, req: ProjectRename):
 
 @router.get("")
 def list_projects():
+    from collections import defaultdict
+
     with get_session() as session:
         projects = session.exec(select(Project).order_by(Project.created.desc())).all()
-        return projects
+        # batch the per-project inputs so the list is a fixed handful of queries
+        arts_by_pid: dict[int, set[str]] = defaultdict(set)
+        for pid, typ in session.exec(select(Artifact.project_id, Artifact.type)).all():
+            arts_by_pid[pid].add(typ)
+        jobs_by_pid: dict[int, list[Job]] = defaultdict(list)
+        for job in session.exec(select(Job).order_by(Job.updated)).all():
+            jobs_by_pid[job.project_id].append(job)
+        return [
+            {**p.model_dump(),
+             "progress": _project_progress(
+                 p, arts_by_pid.get(p.id, set()), jobs_by_pid.get(p.id, []))}
+            for p in projects
+        ]
 
 
 @router.get("/steps")

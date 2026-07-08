@@ -617,6 +617,90 @@ def test_delete_project_removes_files(client):
     assert client.delete(f"/api/projects/{pid}").status_code == 404
 
 
+def test_project_list_progress(client):
+    """The projects list carries a derived pipeline status (done/total + a
+    macro-state), not the vestigial ingest/transcribe string."""
+    from datetime import timedelta
+    from sqlmodel import select
+    from app.models import Job, utcnow
+
+    r = client.post("/api/projects", json={
+        "source": "https://example.com/prog", "source_type": "url", "title": "Progress demo"})
+    pid, slug = r.json()["id"], r.json()["slug"]
+
+    def prog():
+        return next(p["progress"] for p in client.get("/api/projects").json()
+                    if p["id"] == pid)
+
+    p0 = prog()
+    assert p0["total"] == 13 and p0["done"] == 0          # url project: every step applies
+    assert p0["status"] == "new" and p0["last_activity"] is None
+
+    # a transcript implies ingest happened, so it counts toward two steps
+    # (ingest + transcribe); nothing running → partial
+    with get_session() as session:
+        library.write_artifact(session, project_id=pid, project_slug=slug,
+                               type="transcript", title="T — Progress demo",
+                               body="[00:00:01] hello")
+        session.add(Job(project_id=pid, task="transcribe", status="done", updated=utcnow()))
+        session.commit()
+    p1 = prog()
+    assert p1["done"] == 2 and p1["status"] == "partial" and p1["last_activity"] is not None
+
+    # a running job wins and names the concrete step
+    with get_session() as session:
+        session.add(Job(project_id=pid, task="summarize", status="running",
+                        updated=utcnow() + timedelta(minutes=1)))
+        session.commit()
+    p2 = prog()
+    assert p2["status"] == "running" and p2["detail"] == "Summary"
+
+    # most-recent job errored, nothing running → failed, names the failed step
+    with get_session() as session:
+        run = session.exec(select(Job).where(Job.project_id == pid,
+                                             Job.task == "summarize")).first()
+        run.status, run.updated = "done", utcnow() + timedelta(minutes=2)
+        session.add(run)
+        session.add(Job(project_id=pid, task="merge", status="error",
+                        updated=utcnow() + timedelta(minutes=3)))
+        session.commit()
+    p3 = prog()
+    assert p3["status"] == "failed" and p3["detail"] == "Merge deep dives"
+
+    # a cancellation (leftover step jobs errored as 'run-all canceled') reads as
+    # canceled, not failed
+    with get_session() as session:
+        session.add(Job(project_id=pid, task="mindmap", status="error",
+                        error="run-all canceled", updated=utcnow() + timedelta(minutes=4)))
+        session.commit()
+    p4 = prog()
+    assert p4["status"] == "canceled"
+
+
+def test_project_progress_run_all_label(client):
+    """A queued run-all (waiting its turn) reads as running with a friendly
+    label, never the raw 'run_all' task name."""
+    from sqlmodel import select
+    from app.models import Job
+
+    r = client.post("/api/projects", json={
+        "source": "https://example.com/ralabel", "source_type": "url", "title": "RA label"})
+    pid = r.json()["id"]
+    with get_session() as session:
+        session.add(Job(project_id=pid, task="run_all", status="queued"))
+        session.commit()
+    try:
+        p = next(x["progress"] for x in client.get("/api/projects").json() if x["id"] == pid)
+        assert p["status"] == "running" and p["detail"] == "Run all steps"
+    finally:
+        # don't leave a queued run_all in the shared DB — it would hijack the
+        # global run-all queue other tests exercise
+        with get_session() as session:
+            for j in session.exec(select(Job).where(Job.project_id == pid)).all():
+                session.delete(j)
+            session.commit()
+
+
 def test_step_graph_is_sound():
     """Every dependency is a real step and the graph has no cycles."""
     from app.tasks.orchestrate import HARD_DEPS, RUN_DEPS, STEP_NAMES, STEP_OUTPUT

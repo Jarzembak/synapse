@@ -1,17 +1,69 @@
-import { FormEvent, useEffect, useState } from "react";
+import { FormEvent, useEffect, useRef, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
-import { api, fmtDate, Project } from "../api";
+import { api, fmtDate, fmtDateTime, PipelineStatus, Project } from "../api";
+
+// derived pipeline status → chip label + the CSS class it borrows from .jobstatus
+const STATUS_META: Record<PipelineStatus, { label: string; cls: string }> = {
+  running: { label: "Running", cls: "running" },
+  failed: { label: "Failed", cls: "error" },
+  complete: { label: "Complete", cls: "done" },
+  partial: { label: "Partial", cls: "partial" },
+  canceled: { label: "Canceled", cls: "canceled" },
+  new: { label: "New", cls: "new" },
+};
+
+function StatusCell({ p }: { p: Project }) {
+  const pr = p.progress;
+  if (!pr) return <>{p.status}</>; // pre-progress API fallback
+  const meta = STATUS_META[pr.status];
+  const pct = pr.total ? Math.round((pr.done / pr.total) * 100) : 0;
+  return (
+    <div className="projstatus">
+      <div className="projstatus-line">
+        <span className={`jobstatus ${meta.cls}`}>{meta.label}</span>
+        {pr.detail && <span className="substep">{pr.detail}</span>}
+        <span className="frac">{pr.done}/{pr.total}</span>
+      </div>
+      <div className="pbar" title={`${pr.done} of ${pr.total} steps done`}>
+        <i className={meta.cls} style={{ width: `${pct}%` }} />
+      </div>
+    </div>
+  );
+}
 
 export default function Projects() {
   const [projects, setProjects] = useState<Project[]>([]);
+  const [loaded, setLoaded] = useState(false);
   const [source, setSource] = useState("");
   const [sourceType, setSourceType] = useState<"url" | "local">("url");
   const [title, setTitle] = useState("");
   const [error, setError] = useState("");
   const nav = useNavigate();
+  const reloadSeq = useRef(0);
 
+  function reload() {
+    // sequence guard: SSE can fire reloads faster than they resolve — only the
+    // newest response is allowed to win, so a slow one can't clobber fresh data
+    const seq = ++reloadSeq.current;
+    api<Project[]>("/projects")
+      .then((r) => {
+        if (seq !== reloadSeq.current) return;
+        setProjects(r);
+        setLoaded(true);
+        setError("");           // recovered — drop any stale error banner
+      })
+      .catch((e) => {
+        if (seq === reloadSeq.current) setError(e.message);
+      });
+  }
+  useEffect(reload, []);
+
+  // live-refresh the derived status while pipelines run: the job SSE stream
+  // fires only when the active/recent job set changes, so re-pull the list then
   useEffect(() => {
-    api<Project[]>("/projects").then(setProjects).catch((e) => setError(e.message));
+    const es = new EventSource("/api/jobs/stream");
+    es.addEventListener("jobs", () => reload());
+    return () => es.close();
   }, []);
 
   const [creating, setCreating] = useState(false);
@@ -77,13 +129,20 @@ export default function Projects() {
 
       <h2>Projects</h2>
       <table className="list">
-        <thead><tr><th>Title</th><th>Source</th><th>Status</th><th>Created</th><th></th></tr></thead>
+        <thead><tr>
+          <th>Title</th><th>Source</th><th>Status</th>
+          <th>Last activity</th><th>Created</th><th></th>
+        </tr></thead>
         <tbody>
           {projects.map((p) => (
             <tr key={p.id}>
               <td><Link to={`/projects/${p.id}`}>{p.title}</Link></td>
               <td className="mono">{p.source.slice(0, 60)}</td>
-              <td>{p.status}</td>
+              <td><StatusCell p={p} /></td>
+              <td className="muted" title={p.progress?.last_activity
+                ? fmtDateTime(p.progress.last_activity) : ""}>
+                {p.progress?.last_activity ? fmtDate(p.progress.last_activity) : "—"}
+              </td>
               <td>{fmtDate(p.created)}</td>
               <td>
                 <button className="linkish danger" title="delete project"
@@ -91,6 +150,9 @@ export default function Projects() {
               </td>
             </tr>
           ))}
+          {loaded && projects.length === 0 && (
+            <tr><td colSpan={6} className="empty">No projects yet — add one above.</td></tr>
+          )}
         </tbody>
       </table>
     </div>
