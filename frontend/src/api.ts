@@ -29,14 +29,26 @@ export const fmtDate = (s: string) => parseUTC(s).toLocaleDateString();
 export const fmtTime = (s: string) => parseUTC(s).toLocaleTimeString();
 export const parseTime = (s: string) => parseUTC(s).getTime();
 
+export type PipelineStatus =
+  "new" | "running" | "partial" | "complete" | "failed" | "canceled";
+
+export interface ProjectProgress {
+  done: number;
+  total: number;
+  status: PipelineStatus;
+  detail: string | null;      // active or failed step label
+  last_activity: string | null;
+}
+
 export interface Project {
   id: number;
   slug: string;
   title: string;
   source: string;
   source_type: string;
-  status: string;
+  status: string;             // raw ingest/transcribe substatus (legacy)
   created: string;
+  progress?: ProjectProgress; // derived pipeline status (list endpoint)
 }
 
 export interface Artifact {
