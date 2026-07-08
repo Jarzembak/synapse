@@ -6,10 +6,10 @@
 #
 #   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up --build
 #
-# Ollama uses the GPU automatically once it can see one. faster-whisper and
-# Kokoro TTS are controlled by Settings → Advanced → Compute (whisper_device /
-# kokoro_device: auto/cpu/cuda); the worker image is built with GPU=1 here so
-# the CUDA libraries and onnxruntime-gpu it needs are present.
+# Ollama uses the GPU automatically once it can see one. faster-whisper is
+# controlled by Settings → Advanced → Compute (whisper_device: auto/cpu/cuda);
+# the worker image is built with GPU=1 here so the CUDA libraries it needs are
+# present. TTS (Kokoro/Piper) runs on CPU — see the note in backend/Dockerfile.
 services:
   worker:
     build:
