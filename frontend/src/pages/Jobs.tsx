@@ -1,6 +1,7 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { Link } from "react-router-dom";
 import { api, fmtTime, Job } from "../api";
+import { useEventSource } from "../useEventSource";
 
 interface Snapshot {
   active: Job[];   // queued + running, oldest first
@@ -50,11 +51,7 @@ function JobRow({ job, onCancel }: { job: Job; onCancel?: (j: Job) => void }) {
 export default function Jobs() {
   const [snap, setSnap] = useState<Snapshot>({ active: [], recent: [] });
 
-  useEffect(() => {
-    const es = new EventSource("/api/jobs/stream");
-    es.addEventListener("jobs", (e) => setSnap(JSON.parse((e as MessageEvent).data)));
-    return () => es.close();
-  }, []);
+  useEventSource<Snapshot>("/api/jobs/stream", "jobs", setSnap);
 
   async function cancel(job: Job) {
     if (!confirm(`Cancel "${job.task_label ?? job.task}"${job.project_title ? ` for ${job.project_title}` : ""}?`)) return;

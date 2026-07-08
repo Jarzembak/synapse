@@ -98,6 +98,7 @@ async def stream_jobs(project_id: int | None = None):
 
     async def gen():
         last = ""
+        idle_ticks = 0
         while True:
             with get_session() as session:
                 titles = _project_titles(session)
@@ -112,8 +113,12 @@ async def stream_jobs(project_id: int | None = None):
                     rq = rq.where(Job.project_id == project_id)
                 recent = [_serialize(j, titles) for j in session.exec(rq).all()]
                 payload = json.dumps({"active": active, "recent": recent}, sort_keys=True)
-            if payload != last:
+            idle_ticks += 1
+            # emit on change, and at least every ~15s as a heartbeat so the
+            # client can tell a live-but-idle stream from a dead one
+            if payload != last or idle_ticks >= 15:
                 last = payload
+                idle_ticks = 0
                 yield {"event": "jobs", "data": payload}
             await asyncio.sleep(1)
 

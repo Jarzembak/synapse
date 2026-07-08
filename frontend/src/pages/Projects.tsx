@@ -1,6 +1,7 @@
 import { FormEvent, useEffect, useRef, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { api, fmtDate, fmtDateTime, PipelineStatus, Project } from "../api";
+import { useEventSource } from "../useEventSource";
 
 // derived pipeline status → chip label + the CSS class it borrows from .jobstatus
 const STATUS_META: Record<PipelineStatus, { label: string; cls: string }> = {
@@ -59,12 +60,10 @@ export default function Projects() {
   useEffect(reload, []);
 
   // live-refresh the derived status while pipelines run: the job SSE stream
-  // fires only when the active/recent job set changes, so re-pull the list then
-  useEffect(() => {
-    const es = new EventSource("/api/jobs/stream");
-    es.addEventListener("jobs", () => reload());
-    return () => es.close();
-  }, []);
+  // fires whenever the active/recent job set changes (and heartbeats), so
+  // re-pull the list then. The reconnecting hook keeps this alive across a
+  // worker/api restart instead of freezing after one.
+  useEventSource("/api/jobs/stream", "jobs", () => reload());
 
   const [creating, setCreating] = useState(false);
 
