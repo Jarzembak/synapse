@@ -232,15 +232,38 @@ def cloud_sync_now():
     from ..tasks.celery_app import celery
 
     with get_session() as session:
+        # idempotent: two concurrent full syncs both upload files the other
+        # hasn't finished yet, and cloud backends like Google Drive allow
+        # same-name duplicates — so return the in-flight sync instead of racing
+        # a second one.
+        existing = session.exec(
+            select(Job).where(Job.task == "cloud_sync_all",
+                              Job.status.in_(("queued", "running")))
+            .order_by(Job.created)
+        ).first()
+        if existing:
+            return existing.model_dump()
         job = Job(project_id=None, task="cloud_sync_all")
         session.add(job)
         session.commit()
         session.refresh(job)
-        async_result = celery.send_task("cloud_sync_all", args=[job.id])
-        job.celery_id = async_result.id
+        try:
+            async_result = celery.send_task("cloud_sync_all", args=[job.id])
+            job.celery_id = async_result.id
+        except Exception as e:
+            # never leave a 'queued' row with no task behind it — the idempotency
+            # guard would then return this ghost forever and block real syncs
+            job.status = "error"
+            job.error = f"could not dispatch: {e}"[:2000]
+            session.add(job)
+            session.commit()
+            raise HTTPException(503, f"could not queue sync: {e}")
         session.add(job)
         session.commit()
-        return job
+        session.refresh(job)
+        # return a dict, not the ORM row — its attributes expire after commit and
+        # the session closes before FastAPI serializes, which yielded an empty {}
+        return job.model_dump()
 
 
 # --- tag vocabulary management ---

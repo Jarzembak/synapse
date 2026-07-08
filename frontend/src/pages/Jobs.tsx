@@ -65,12 +65,32 @@ export default function Jobs() {
     }
   }
 
+  async function continueQueue() {
+    try {
+      await api("/jobs/continue", { method: "POST" });
+    } catch (e: any) {
+      alert(e.message);
+    }
+  }
+
   const running = snap.active.filter((j) => j.status === "running");
   const queued = snap.active.filter((j) => j.status === "queued");
+  // the run-all chain has stalled if whole-project runs are waiting but none is
+  // running (e.g. the worker restarted mid-run and broke the auto hand-off)
+  const runAllStalled =
+    queued.some((j) => j.task === "run_all") && !running.some((j) => j.task === "run_all");
 
   return (
     <div className="jobs">
-      <h2>Job queue</h2>
+      <div className="jobs-head">
+        <h2>Job queue</h2>
+        {runAllStalled && (
+          <button className="continue-btn" onClick={continueQueue}
+                  title="Resume the run-all queue — the auto hand-off stalled (a worker restart breaks it)">
+            ▶ Continue queue
+          </button>
+        )}
+      </div>
       <p className="meta">
         Live view of everything running, waiting, and recently finished across all
         projects. Whole-project "run all" jobs execute one at a time and auto-chain;

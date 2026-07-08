@@ -46,6 +46,27 @@ def list_jobs(project_id: int | None = None, limit: int = 100):
         return [_serialize(j, titles) for j in session.exec(q).all()]
 
 
+@router.post("/continue")
+def continue_queue():
+    """Resume the whole-project run-all queue if it stalled.
+
+    Run-alls execute one at a time and auto-chain, but that hand-off is
+    event-driven — if the worker restarts mid-run (crash, redeploy, reboot) the
+    chain breaks and queued jobs wait forever. This kicks the next one; it's a
+    no-op if one is already running or nothing is queued."""
+    from ..tasks.orchestrate import maybe_start_next_run_all
+
+    with get_session() as session:
+        running = session.exec(
+            select(Job).where(Job.task == "run_all", Job.status == "running")
+        ).first()
+        queued = len(session.exec(
+            select(Job).where(Job.task == "run_all", Job.status == "queued")
+        ).all())
+    maybe_start_next_run_all()
+    return {"already_running": running is not None, "queued": queued}
+
+
 @router.post("/{job_id}/cancel")
 def cancel_job(job_id: int):
     """Cancel a queued or running job. Queued jobs simply drop out of the

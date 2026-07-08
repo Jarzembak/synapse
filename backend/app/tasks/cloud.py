@@ -156,6 +156,14 @@ def sync_all(job_id: int):
         # media dir holds working files too — only the archived downloads sync
         _rclone(["copy", str(settings.media_dir), _dest("media"),
                  "--include", "/*/source_video.*", "--include", "/*/source_audio.*"])
+        # Google Drive allows same-name files in a folder, so an interrupted or
+        # raced upload can leave duplicates. Fold them back to one (keep newest)
+        # so a full sync always converges to a clean remote — self-healing.
+        if get_setting("cloud.provider") == "drive":
+            with get_session() as session:
+                set_job(session, job_id, status="running", progress="de-duplicating remote")
+            for sub in ("library", "media"):
+                _rclone(["dedupe", "--dedupe-mode", "newest", _dest(sub)])
         _record("ok", "full sync complete")
         with get_session() as session:
             set_job(session, job_id, status="done", progress="complete")
