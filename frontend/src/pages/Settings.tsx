@@ -288,7 +288,7 @@ export default function Settings() {
                   value={cfg.provider}
                   onChange={(e) => saveModel(fn, { ...cfg, provider: e.target.value })}
                 >
-                  {[...new Set([...providers, "faster-whisper", "kokoro", cfg.provider])].map((p) => (
+                  {[...new Set([...providers, "faster-whisper", "kokoro", "piper", cfg.provider])].map((p) => (
                     <option key={p} value={p}>{p}</option>
                   ))}
                 </select>
@@ -511,6 +511,12 @@ export default function Settings() {
                 value={adv.audio.tts_gap}
                 onChange={(e) => setAdvValue("audio", "tts_gap", Number(e.target.value))} />
             </label>
+            <label title="Mainly speeds up Piper (each line is its own process). Kokoro is already multi-core per line and gains most from the GPU."
+              >TTS parallel workers (0 = auto)
+              <input type="number" step="1" min="0" max="16"
+                value={adv.audio.tts_workers}
+                onChange={(e) => setAdvValue("audio", "tts_workers", Number(e.target.value))} />
+            </label>
             <label>Silence threshold (dB)
               <input type="number" step="1" min="-70" max="-10"
                 value={adv.audio.trim_db}
@@ -601,6 +607,14 @@ export default function Settings() {
                 <option value="int8">int8 (CPU / lowest memory)</option>
                 <option value="int8_float16">int8_float16 (GPU)</option>
                 <option value="float16">float16 (GPU / best quality)</option>
+              </select>
+            </label>
+            <label>Kokoro TTS device
+              <select value={adv.compute.kokoro_device}
+                onChange={(e) => setAdvValue("compute", "kokoro_device", e.target.value)}>
+                <option value="auto">auto (GPU if available)</option>
+                <option value="cpu">cpu</option>
+                <option value="cuda">cuda</option>
               </select>
             </label>
             <p className="meta">

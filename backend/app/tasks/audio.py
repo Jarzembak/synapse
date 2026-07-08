@@ -1,9 +1,13 @@
-"""Audio steps: podcast TTS (local Kokoro default, Gemini/ElevenLabs cloud) and
-the silence/off-topic trim of the source audio."""
+"""Audio steps: podcast TTS (local Kokoro/Piper, Gemini cloud) and the
+silence/off-topic trim of the source audio."""
 from __future__ import annotations
 
 import json
+import os
 import re
+import subprocess
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import httpx
@@ -25,6 +29,78 @@ KOKORO_FILES = {
         "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin",
 }
 DEFAULT_VOICES = {"HOST_A": "am_michael", "HOST_B": "af_heart"}
+# Piper: single-speaker ONNX voices pulled per-name from the rhasspy voice repo.
+DEFAULT_PIPER_VOICES = {"HOST_A": "en_US-ryan-medium", "HOST_B": "en_US-amy-medium"}
+PIPER_REPO = "https://huggingface.co/rhasspy/piper-voices/resolve/main"
+
+
+def _tts_workers(default_auto: int) -> int:
+    """Synthesis parallelism. 0 in settings = auto (per-engine default)."""
+    n = int(advanced("audio").get("tts_workers", 0) or 0)
+    if n > 0:
+        return n
+    return max(1, min(default_auto, os.cpu_count() or 1))
+
+
+def _download(url: str, dest: Path) -> None:
+    """Fetch to a private temp file and atomically rename on success.
+
+    The temp name is unique per process+thread, so several cold fetchers of the
+    same model (parallel TTS workers, or celery's 4 processes each starting a
+    job) never share one .part file — each writes a COMPLETE file and renames it
+    into place, so the promoted file is never interleaved or truncated. An
+    interrupted download only leaves its own .part, which the finally cleans up."""
+    if dest.exists():
+        return
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_suffix(dest.suffix + f".{os.getpid()}.{threading.get_ident()}.part")
+    try:
+        with httpx.stream("GET", url, follow_redirects=True, timeout=None) as r:
+            r.raise_for_status()
+            with open(tmp, "wb") as f:
+                for chunk in r.iter_bytes():
+                    f.write(chunk)
+        try:
+            tmp.replace(dest)
+        except OSError:
+            # lost a race to another worker (Windows raises on concurrent atomic
+            # replace of the same target); the winner's file is already complete
+            if not dest.exists():
+                raise
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _synthesize_lines(lines, tts_dir: Path, workers: int, on_progress,
+                      render) -> list[str]:
+    """Render each dialogue line to tts_dir/line_<i>.wav via `render(i, speaker,
+    text, out_path)`, optionally in parallel, then return ordered ffmpeg concat
+    entries interleaved with the shared gap. Progress is reported as lines
+    complete; wav order is preserved by index regardless of completion order."""
+    done = [0]
+    lock = threading.Lock()
+
+    def one(item):
+        i, (speaker, text) = item
+        out = tts_dir / f"line_{i:05d}.wav"
+        render(i, speaker, text, out)
+        with lock:
+            done[0] += 1
+            on_progress(f"synthesizing line {done[0]}/{len(lines)}")
+
+    items = list(enumerate(lines))
+    if workers > 1:
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            list(ex.map(one, items))
+    else:
+        for item in items:
+            one(item)
+
+    entries: list[str] = []
+    for i in range(len(lines)):
+        entries.append(f"file 'line_{i:05d}.wav'")
+        entries.append("file 'gap.wav'")
+    return entries
 
 
 def parse_script(body: str) -> list[tuple[str, str]]:
@@ -37,60 +113,137 @@ def parse_script(body: str) -> list[tuple[str, str]]:
     return out
 
 
+def _kokoro_providers() -> None:
+    """Pick the ONNX Runtime execution provider from the compute settings.
+    kokoro-onnx honors the ONNX_PROVIDER env var; 'auto' uses CUDA only when the
+    onnxruntime-gpu build actually exposes it (i.e. the GPU overlay)."""
+    device = str(advanced("compute").get("kokoro_device", "auto"))
+    if device == "cuda":
+        os.environ["ONNX_PROVIDER"] = "CUDAExecutionProvider"
+    elif device == "cpu":
+        os.environ["ONNX_PROVIDER"] = "CPUExecutionProvider"
+    else:  # auto
+        try:
+            import onnxruntime as ort
+
+            avail = ort.get_available_providers()
+        except Exception:
+            avail = []
+        os.environ["ONNX_PROVIDER"] = (
+            "CUDAExecutionProvider" if "CUDAExecutionProvider" in avail
+            else "CPUExecutionProvider")
+
+
+def _kokoro_files() -> Path:
+    """Ensure the Kokoro model files are present; returns their directory. Call
+    on the main thread before spawning synthesis workers so threads only build
+    sessions from files already on disk (never cold-download in parallel)."""
+    model_dir = settings.media_dir / "models"
+    for name, url in KOKORO_FILES.items():
+        _download(url, model_dir / name)
+    return model_dir
+
+
 def _kokoro_model():
     from kokoro_onnx import Kokoro
 
-    model_dir = settings.media_dir / "models"
-    model_dir.mkdir(parents=True, exist_ok=True)
-    for name, url in KOKORO_FILES.items():
-        dest = model_dir / name
-        if not dest.exists():
-            # download to a temp file and rename on success, so an interrupted
-            # download can't leave a truncated file that dest.exists() then
-            # treats as valid (which breaks every future TTS run).
-            tmp = dest.with_suffix(dest.suffix + ".part")
-            try:
-                with httpx.stream("GET", url, follow_redirects=True, timeout=None) as r:
-                    r.raise_for_status()
-                    with open(tmp, "wb") as f:
-                        for chunk in r.iter_bytes():
-                            f.write(chunk)
-                tmp.replace(dest)
-            finally:
-                tmp.unlink(missing_ok=True)
+    _kokoro_providers()
+    model_dir = _kokoro_files()
     return Kokoro(str(model_dir / "kokoro-v1.0.onnx"), str(model_dir / "voices-v1.0.bin"))
 
 
-def _tts_kokoro(lines, wd: Path, on_progress) -> Path:
+def _write_gap(tts_dir: Path, rate: int) -> None:
     import numpy as np
     import soundfile as sf
 
+    gap_seconds = max(0.05, float(advanced("audio")["tts_gap"]))
+    sf.write(tts_dir / "gap.wav", np.zeros(int(rate * gap_seconds), dtype="float32"), rate)
+
+
+def _concat_mp3(tts_dir: Path, entries: list[str], out: Path) -> Path:
+    (tts_dir / "list.txt").write_text("\n".join(entries), encoding="utf-8")
+    media.run(["ffmpeg", "-y", "-f", "concat", "-safe", "0",
+               "-i", str(tts_dir / "list.txt"), "-c:a", "libmp3lame", "-q:a", "4", str(out)])
+    return out
+
+
+def _tts_kokoro(lines, wd: Path, on_progress) -> Path:
+    import soundfile as sf
+
     voices = {**DEFAULT_VOICES, **(get_setting("tts.voices") or {})}
-    tuning = advanced("audio")
-    kokoro = _kokoro_model()
+    speed = float(advanced("audio")["tts_speed"])
     tts_dir = wd / "tts"
     tts_dir.mkdir(exist_ok=True)
+    _write_gap(tts_dir, 24000)
+    _kokoro_files()  # fetch on the main thread before any worker builds a model
 
-    concat_list = tts_dir / "list.txt"
-    gap = tts_dir / "gap.wav"
-    gap_seconds = max(0.05, float(tuning["tts_gap"]))
-    sf.write(gap, np.zeros(int(24000 * gap_seconds), dtype="float32"), 24000)
+    # one Kokoro per worker thread — the model is shareable but its English G2P
+    # keeps per-call state, so a thread-local instance avoids any race. CPU
+    # inference is already multi-core per call, so kokoro's auto default is 1;
+    # the real CPU-parallel win is Piper, and the real kokoro win is the GPU.
+    local = threading.local()
 
-    entries = []
-    for i, (speaker, text) in enumerate(lines):
-        on_progress(f"synthesizing line {i + 1}/{len(lines)}")
-        samples, rate = kokoro.create(text, voice=voices[speaker],
-                                      speed=float(tuning["tts_speed"]))
-        line_wav = tts_dir / f"line_{i:05d}.wav"
-        sf.write(line_wav, samples, rate)
-        entries.append(f"file '{line_wav.name}'")
-        entries.append(f"file '{gap.name}'")
-    concat_list.write_text("\n".join(entries), encoding="utf-8")
+    def render(i, speaker, text, out):
+        model = getattr(local, "kokoro", None)
+        if model is None:
+            model = local.kokoro = _kokoro_model()
+        samples, rate = model.create(text, voice=voices[speaker], speed=speed)
+        sf.write(out, samples, rate)
 
-    out = wd / "podcast.mp3"
-    media.run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_list),
-               "-c:a", "libmp3lame", "-q:a", "4", str(out)])
-    return out
+    entries = _synthesize_lines(lines, tts_dir, _tts_workers(1), on_progress, render)
+    return _concat_mp3(tts_dir, entries, wd / "podcast.mp3")
+
+
+def _piper_urls(voice: str) -> tuple[str, str]:
+    """Repo URLs for a Piper voice by its rhasspy key, e.g. en_US-amy-medium →
+    .../en/en_US/amy/medium/en_US-amy-medium.onnx[.json]."""
+    lang_region, name, quality = voice.split("-")
+    lang = lang_region.split("_")[0]
+    base = f"{PIPER_REPO}/{lang}/{lang_region}/{name}/{quality}/{voice}"
+    return base + ".onnx", base + ".onnx.json"
+
+
+def _piper_files(voice: str) -> tuple[Path, Path]:
+    onnx_url, cfg_url = _piper_urls(voice)
+    model_dir = settings.media_dir / "models" / "piper"
+    onnx, cfg = model_dir / f"{voice}.onnx", model_dir / f"{voice}.onnx.json"
+    _download(onnx_url, onnx)
+    _download(cfg_url, cfg)
+    return onnx, cfg
+
+
+def _piper_rate(cfg: Path) -> int:
+    """A Piper voice's native sample rate from its .onnx.json (medium/high =
+    22.05 kHz, low/x_low = 16 kHz). Falls back to the medium default."""
+    try:
+        return int(json.loads(cfg.read_text(encoding="utf-8"))["audio"]["sample_rate"])
+    except Exception:
+        return 22050
+
+
+def _tts_piper(lines, wd: Path, on_progress) -> Path:
+    voices = {**DEFAULT_PIPER_VOICES, **(get_setting("tts.piper_voices") or {})}
+    files = {sp: _piper_files(voices[sp]) for sp in {s for s, _ in lines}}
+    tts_dir = wd / "tts"
+    tts_dir.mkdir(exist_ok=True)
+    # match the gap to the voices' native rate so the concat demuxer sees
+    # uniform stream params regardless of the chosen quality tier
+    rate = max(_piper_rate(cfg) for _, cfg in files.values())
+    _write_gap(tts_dir, rate)
+
+    def render(i, speaker, text, out):
+        onnx, cfg = files[speaker]
+        proc = subprocess.run(
+            ["piper", "--model", str(onnx), "--config", str(cfg),
+             "--output_file", str(out)],
+            input=text, capture_output=True, text=True,
+        )
+        if proc.returncode != 0 or not out.exists():
+            raise RuntimeError(f"piper failed: {proc.stderr[-2000:]}")
+
+    # each piper line is its own process, so parallelism is race-free
+    entries = _synthesize_lines(lines, tts_dir, _tts_workers(4), on_progress, render)
+    return _concat_mp3(tts_dir, entries, wd / "podcast.mp3")
 
 
 def _tts_gemini(lines, wd: Path, model: str, on_progress) -> Path:
@@ -167,10 +320,13 @@ def tts(job_id: int, project_id: int):
 
     wd = media.workdir(project.slug)
     provider, model = llm.resolve_model("tts")
+    on_progress = lambda m: progress(job_id, m)  # noqa: E731
     if provider == "gemini":
-        out = _tts_gemini(lines, wd, model, lambda m: progress(job_id, m))
+        out = _tts_gemini(lines, wd, model, on_progress)
+    elif provider == "piper":
+        out = _tts_piper(lines, wd, on_progress)
     else:
-        out = _tts_kokoro(lines, wd, lambda m: progress(job_id, m))
+        out = _tts_kokoro(lines, wd, on_progress)
 
     _store_audio(project_id, project.slug, project.title, out,
                  type="podcast_audio", title_prefix="Podcast audio",

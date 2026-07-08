@@ -54,6 +54,7 @@ ADVANCED_DEFAULTS: dict[str, dict] = {
     "audio": {
         "tts_speed": 1.0,        # Kokoro speaking rate multiplier
         "tts_gap": 0.4,          # seconds of silence between dialogue lines
+        "tts_workers": 0,        # parallel TTS synthesis workers; 0 = auto
         "trim_db": -40,          # silenceremove threshold (dBFS)
         "trim_silence": 1.5,     # minimum silence duration to remove (s)
     },
@@ -74,6 +75,9 @@ ADVANCED_DEFAULTS: dict[str, dict] = {
         # (NVIDIA runtime + CUDA libraries in the worker image).
         "whisper_device": "auto",        # auto | cpu | cuda
         "whisper_compute_type": "auto",  # auto | int8 | int8_float16 | float16
+        # Kokoro TTS ONNX Runtime execution provider. "auto" uses CUDA when the
+        # onnxruntime-gpu build sees a GPU (GPU overlay), else CPU.
+        "kokoro_device": "auto",         # auto | cpu | cuda
     },
 }
 

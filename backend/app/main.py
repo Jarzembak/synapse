@@ -12,7 +12,7 @@ setup_logging()
 from .config import SEED_TAGS, settings  # noqa: E402
 from .db import get_session, init_db  # noqa: E402
 from .models import Tag  # noqa: E402
-from .routers import artifacts, jobs, logs, projects, quickrefs  # noqa: E402
+from .routers import artifacts, jobs, logs, projects, quickrefs, system  # noqa: E402
 from .routers.settings import router as settings_router, tags_router  # noqa: E402
 
 
@@ -37,6 +37,7 @@ app.include_router(quickrefs.router)
 app.include_router(settings_router)
 app.include_router(tags_router)
 app.include_router(logs.router)
+app.include_router(system.router)
 
 
 @app.get("/api/health")
