@@ -75,8 +75,9 @@ ADVANCED_DEFAULTS: dict[str, dict] = {
         # (NVIDIA runtime + CUDA libraries in the worker image).
         "whisper_device": "auto",        # auto | cpu | cuda
         "whisper_compute_type": "auto",  # auto | int8 | int8_float16 | float16
-        # Kokoro TTS ONNX Runtime execution provider. "auto" uses CUDA when the
-        # onnxruntime-gpu build sees a GPU (GPU overlay), else CPU.
+        # Kokoro TTS ONNX Runtime execution provider. "auto" uses CUDA only when
+        # onnxruntime exposes it; the shipped images use CPU onnxruntime (see the
+        # Dockerfile note), so this is CPU in practice — Piper is the fast path.
         "kokoro_device": "auto",         # auto | cpu | cuda
     },
 }
