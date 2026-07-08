@@ -301,6 +301,40 @@ button.linkish.danger { color: var(--danger); }
 .legend { display: flex; gap: 1rem; margin-top: 0.5rem; font-size: 0.8rem; color: var(--muted); }
 .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 4px; }
 
+/* ---------- system monitor ---------- */
+
+.sys-head { display: flex; align-items: center; gap: 0.8rem; }
+.live-dot { font-size: 0.75rem; text-transform: uppercase; color: var(--muted);
+  border: 1px solid var(--border2); border-radius: 10px; padding: 0.1rem 0.55rem; }
+.live-dot.on { color: var(--success); border-color: var(--success); }
+.live-dot.on::before { content: "● "; }
+.sys-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 1rem; margin-top: 1rem; }
+.card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+  padding: 0.8rem 1rem; }
+.card h3 { margin: 0 0 0.6rem; font-size: 0.9rem; }
+.card h3 small { color: var(--muted); font-weight: 400; }
+.meter { margin: 0.5rem 0; }
+.meter-head { display: flex; justify-content: space-between; font-size: 0.8rem; margin-bottom: 0.2rem; }
+.meter-bar { height: 8px; background: var(--panel2); border-radius: 4px; overflow: hidden; }
+.meter-bar i { display: block; height: 100%; background: var(--success); transition: width 0.5s; }
+.meter-bar i.warm { background: var(--warning); }
+.meter-bar i.hot { background: var(--danger); }
+.cores { display: flex; align-items: flex-end; gap: 2px; height: 34px; margin-top: 0.5rem; }
+.core { flex: 1; height: 100%; background: var(--panel2); border-radius: 2px;
+  display: flex; align-items: flex-end; overflow: hidden; }
+.core i { width: 100%; background: var(--success); transition: height 0.5s; }
+.core i.warm { background: var(--warning); }
+.core i.hot { background: var(--danger); }
+.gpu + .gpu { margin-top: 0.8rem; border-top: 1px solid var(--border); padding-top: 0.6rem; }
+.gpu-name { font-size: 0.85rem; font-weight: 600; margin-bottom: 0.3rem; }
+.list.compact th, .list.compact td { padding: 0.3rem 0.5rem; font-size: 0.82rem; }
+.proc { font-size: 0.7rem; text-transform: uppercase; font-weight: 700; border-radius: 8px;
+  padding: 0.05rem 0.45rem; }
+.proc.gpu { background: var(--success); color: var(--accent-contrast); }
+.proc.cpu { background: var(--panel2); color: var(--muted); border: 1px solid var(--border2); }
+.proc.hybrid { background: var(--warning); color: var(--accent-contrast); }
+
 /* ---------- settings / misc ---------- */
 
 .settings textarea { width: 100%; font-family: Consolas, monospace; }

@@ -10,14 +10,17 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # GPU=1 (set by docker-compose.gpu.yml) adds the CUDA runtime libraries
-# faster-whisper/CTranslate2 need for whisper_device=cuda. Default build stays
-# CPU-only and lean. The python one-liner prints each pip-installed CUDA lib
-# dir (semicolon-separated simple statements — no literal newlines, which the
-# shell would pass to python as invalid line-continuations) so ldconfig can
-# find libcublas/libcudnn at runtime.
+# faster-whisper/CTranslate2 need for whisper_device=cuda, and swaps the CPU
+# onnxruntime (pulled in by kokoro-onnx/piper) for onnxruntime-gpu so Kokoro TTS
+# can run on the GPU too. Default build stays CPU-only and lean. The python
+# one-liner prints each pip-installed CUDA lib dir (semicolon-separated simple
+# statements — no literal newlines, which the shell would pass to python as
+# invalid line-continuations) so ldconfig can find libcublas/libcudnn at runtime.
 ARG GPU=0
 RUN if [ "$GPU" = "1" ]; then \
         pip install --no-cache-dir nvidia-cublas-cu12 nvidia-cudnn-cu12 && \
+        pip uninstall -y onnxruntime 2>/dev/null; \
+        pip install --no-cache-dir onnxruntime-gpu && \
         python -c "import nvidia.cublas.lib, nvidia.cudnn.lib; print(list(nvidia.cublas.lib.__path__)[0]); print(list(nvidia.cudnn.lib.__path__)[0])" > /etc/ld.so.conf.d/nvidia-pip.conf && \
         ldconfig; \
     fi

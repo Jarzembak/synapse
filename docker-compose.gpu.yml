@@ -6,12 +6,27 @@
 #
 #   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up --build
 #
-# Ollama uses the GPU automatically once it can see one. faster-whisper is
-# controlled by Settings → Advanced → Compute (whisper_device: auto/cpu/cuda);
-# the worker image is built with GPU=1 here so the CUDA libraries it needs are
-# present.
+# Ollama uses the GPU automatically once it can see one. faster-whisper and
+# Kokoro TTS are controlled by Settings → Advanced → Compute (whisper_device /
+# kokoro_device: auto/cpu/cuda); the worker image is built with GPU=1 here so
+# the CUDA libraries and onnxruntime-gpu it needs are present.
 services:
   worker:
+    build:
+      context: ./backend
+      args:
+        GPU: "1"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # api also gets the GPU reservation — not for compute, but so the resource
+  # monitor's nvidia-smi call can report GPU utilization/VRAM from this container.
+  api:
     build:
       context: ./backend
       args:

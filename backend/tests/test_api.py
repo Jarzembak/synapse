@@ -701,6 +701,139 @@ def test_project_progress_run_all_label(client):
             session.commit()
 
 
+def test_system_stats_shape(client):
+    """The monitor endpoint returns host CPU/RAM plus (possibly empty) GPU and
+    Ollama lists — never 500s when nvidia-smi or Ollama are absent."""
+    r = client.get("/api/system/stats")
+    assert r.status_code == 200
+    s = r.json()
+    assert 0 <= s["cpu_percent"] <= 100 * (s["cpu_count"] or 1)
+    assert s["mem_total_mb"] > 0 and 0 <= s["mem_percent"] <= 100
+    assert isinstance(s["gpus"], list) and isinstance(s["ollama_models"], list)
+    assert len(s["cpu_per_core"]) == s["cpu_count"]
+
+
+def test_piper_voice_urls():
+    from app.tasks.audio import _piper_urls
+
+    onnx, cfg = _piper_urls("en_US-amy-medium")
+    assert onnx.endswith("/en/en_US/amy/medium/en_US-amy-medium.onnx")
+    assert cfg == onnx + ".json"
+    # a different lang/region derives the right nested path
+    onnx2, _ = _piper_urls("de_DE-thorsten-high")
+    assert onnx2.endswith("/de/de_DE/thorsten/high/de_DE-thorsten-high.onnx")
+
+
+def test_synthesize_lines_parallel_preserves_order(tmp_path):
+    """Parallel synthesis must still emit line/gap concat entries in script
+    order regardless of which line finishes first."""
+    from app.tasks.audio import _synthesize_lines
+
+    lines = [("HOST_A", "one"), ("HOST_B", "two"), ("HOST_A", "three")]
+    rendered = []
+
+    def render(i, speaker, text, out):
+        out.write_text(f"{i}:{text}")           # stand in for a wav
+        rendered.append((i, speaker, text))
+
+    entries = _synthesize_lines(lines, tmp_path, workers=3,
+                                on_progress=lambda m: None, render=render)
+    assert entries == [
+        "file 'line_00000.wav'", "file 'gap.wav'",
+        "file 'line_00001.wav'", "file 'gap.wav'",
+        "file 'line_00002.wav'", "file 'gap.wav'",
+    ]
+    assert (tmp_path / "line_00000.wav").read_text() == "0:one"
+    assert (tmp_path / "line_00002.wav").read_text() == "2:three"
+    assert len(rendered) == 3
+
+
+def test_tts_worker_count(client, monkeypatch):
+    from app.tasks import audio
+
+    monkeypatch.setattr(audio, "advanced", lambda g: {"tts_workers": 0})
+    # 0 = auto, clamped to the engine default and the core count
+    assert audio._tts_workers(1) == 1
+    assert audio._tts_workers(4) == min(4, __import__("os").cpu_count() or 1)
+    monkeypatch.setattr(audio, "advanced", lambda g: {"tts_workers": 6})
+    assert audio._tts_workers(1) == 6          # explicit override wins
+
+
+def test_download_concurrent_is_corruption_safe(tmp_path, monkeypatch):
+    """Several threads cold-fetching the same model file must each write a
+    complete file via a private temp — never a shared, interleaved .part that
+    persists as a corrupt model (regression: parallel Kokoro workers)."""
+    import threading
+    from app.tasks import audio
+
+    payload = b"MODEL" * 20000
+
+    class FakeStream:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def raise_for_status(self):
+            pass
+
+        def iter_bytes(self):
+            for i in range(0, len(payload), 997):  # small chunks → interleave
+                yield payload[i:i + 997]
+
+    monkeypatch.setattr(audio.httpx, "stream", lambda *a, **k: FakeStream())
+    dest = tmp_path / "kokoro.onnx"
+    errors: list = []
+
+    def go():
+        try:
+            audio._download("http://model", dest)
+        except Exception as e:  # noqa: BLE001
+            errors.append(e)
+
+    threads = [threading.Thread(target=go) for _ in range(5)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors
+    assert dest.read_bytes() == payload           # complete, not interleaved
+    assert not list(tmp_path.glob("*.part"))       # every private temp cleaned up
+
+
+def test_tts_dispatch_routes_to_provider(client, monkeypatch):
+    """The tts task picks the synth backend from the configured provider."""
+    from app.tasks import audio
+    from app import llm
+
+    seed_artifact("Podcast script — demo", "HOST_A: hi\nHOST_B: hey there",
+                  type="podcast_script")
+    with get_session() as session:
+        from sqlmodel import select
+        pid = session.exec(select(Project).where(Project.slug == "demo")).first().id
+
+    calls = []
+    for name in ("_tts_piper", "_tts_kokoro"):
+        monkeypatch.setattr(audio, name,
+                            lambda *a, _n=name, **k: (calls.append(_n) or __import__("pathlib").Path("x.mp3")))
+    monkeypatch.setattr(audio, "_store_audio", lambda *a, **k: None)
+    monkeypatch.setattr(llm, "resolve_model", lambda fn: ("piper", "piper"))
+    audio.tts(job_id=_a_job(pid), project_id=pid)
+    assert calls == ["_tts_piper"]
+
+
+def _a_job(pid: int) -> int:
+    from app.models import Job
+    with get_session() as session:
+        j = Job(project_id=pid, task="tts", status="queued")
+        session.add(j)
+        session.commit()
+        session.refresh(j)
+        return j.id
+
+
 def test_step_graph_is_sound():
     """Every dependency is a real step and the graph has no cycles."""
     from app.tasks.orchestrate import HARD_DEPS, RUN_DEPS, STEP_NAMES, STEP_OUTPUT
