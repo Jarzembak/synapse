@@ -41,6 +41,12 @@ def setup_logging() -> None:
         stream.setFormatter(fmt)
         root.addHandler(stream)
 
+    # Quiet chatty third-party per-request logging so our own pipeline logs stay
+    # readable — httpx logs a line for EVERY request (the system monitor polls
+    # Ollama every 2s, which would otherwise flood the api log).
+    for noisy in ("httpx", "httpcore"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
     log_dir = os.environ.get("LOG_DIR", "")
     if log_dir:
         try:
