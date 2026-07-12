@@ -19,6 +19,10 @@ from fastapi import APIRouter
 from sse_starlette.sse import EventSourceResponse
 
 from ..config import settings
+from ..db import get_session
+from ..models import Job, LLMCall
+from ..tasks.celery_app import celery
+from sqlmodel import select, text
 
 router = APIRouter(prefix="/api/system", tags=["system"])
 
@@ -92,6 +96,19 @@ def _ollama_models() -> list[dict]:
 def _snapshot(cpu_interval: float | None = None) -> dict:
     vm = psutil.virtual_memory()
     per_core = psutil.cpu_percent(interval=cpu_interval, percpu=True)
+    try:
+        disk = shutil.disk_usage(settings.library_dir)
+        disk_stats = {
+            "used_mb": round(disk.used / 1_048_576),
+            "total_mb": round(disk.total / 1_048_576),
+            "percent": round(disk.used / disk.total * 100, 1) if disk.total else 0,
+        }
+    except OSError:
+        disk_stats = None
+    with get_session() as session:
+        active_jobs = len(session.exec(
+            select(Job.id).where(Job.status.in_(("queued", "running")))
+        ).all())
     return {
         "cpu_percent": round(sum(per_core) / len(per_core), 1) if per_core else 0.0,
         "cpu_per_core": [round(c, 1) for c in per_core],
@@ -101,6 +118,64 @@ def _snapshot(cpu_interval: float | None = None) -> dict:
         "mem_percent": vm.percent,
         "gpus": _gpus(),
         "ollama_models": _ollama_models(),
+        "disk": disk_stats,
+        "active_jobs": active_jobs,
+    }
+
+
+def _preflight() -> dict:
+    checks: list[dict] = []
+
+    def add(name: str, ok: bool, detail: str, required: bool = True):
+        checks.append({"name": name, "ok": ok, "detail": detail, "required": required})
+
+    try:
+        with get_session() as session:
+            session.exec(text("SELECT 1")).one()
+        add("database", True, "SQLite is writable and reachable")
+    except Exception as exc:
+        add("database", False, str(exc))
+    try:
+        import redis
+
+        redis.Redis.from_url(settings.redis_url, socket_timeout=2).ping()
+        add("redis", True, "queue broker is reachable")
+    except Exception as exc:
+        add("redis", False, str(exc))
+    try:
+        replies = celery.control.ping(timeout=1)
+        add("worker", bool(replies), f"{len(replies)} worker(s) responding")
+    except Exception as exc:
+        add("worker", False, str(exc))
+    for command in ("ffmpeg", "ffprobe", "rclone"):
+        path = shutil.which(command)
+        add(command, bool(path), path or "not installed", required=command != "rclone")
+    try:
+        response = httpx.get(f"{settings.ollama_base_url}/api/tags", timeout=2)
+        response.raise_for_status()
+        models = [item.get("name", "") for item in response.json().get("models", [])]
+        add("ollama", True, f"{len(models)} model(s) installed", required=False)
+        from ..search import embedding_model
+
+        embed = embedding_model()
+        add("embedding model", any(name == embed or name.startswith(embed + ":") for name in models),
+            f"{embed} {'is installed' if any(name == embed or name.startswith(embed + ':') for name in models) else 'must be pulled'}",
+            required=False)
+    except Exception as exc:
+        add("ollama", False, str(exc), required=False)
+    add("Anthropic key", bool(settings.anthropic_api_key),
+        "configured" if settings.anthropic_api_key else "not configured", required=False)
+    add("Gemini key", bool(settings.gemini_api_key),
+        "configured" if settings.gemini_api_key else "not configured", required=False)
+    try:
+        disk = shutil.disk_usage(settings.library_dir)
+        free_gb = disk.free / (1024 ** 3)
+        add("disk space", free_gb >= 2, f"{free_gb:.1f} GB free")
+    except OSError as exc:
+        add("disk space", False, str(exc))
+    return {
+        "ready": all(check["ok"] for check in checks if check["required"]),
+        "checks": checks,
     }
 
 
@@ -108,6 +183,34 @@ def _snapshot(cpu_interval: float | None = None) -> dict:
 async def stats():
     # small blocking sample so a one-shot poll returns a real CPU number
     return await asyncio.to_thread(_snapshot, 0.2)
+
+
+@router.get("/preflight")
+async def preflight():
+    return await asyncio.to_thread(_preflight)
+
+
+@router.get("/usage")
+def usage(limit: int = 500):
+    with get_session() as session:
+        rows = session.exec(
+            select(LLMCall).order_by(LLMCall.created.desc()).limit(max(1, min(limit, 5000)))
+        ).all()
+    grouped: dict[str, dict] = {}
+    for row in rows:
+        key = f"{row.function}:{row.provider}/{row.model}"
+        item = grouped.setdefault(key, {
+            "function": row.function, "provider": row.provider, "model": row.model,
+            "calls": 0, "errors": 0, "input_tokens": 0, "output_tokens": 0,
+            "duration_seconds": 0.0,
+        })
+        item["calls"] += 1
+        item["errors"] += row.status == "error"
+        item["input_tokens"] += row.input_tokens
+        item["output_tokens"] += row.output_tokens
+        item["duration_seconds"] = round(item["duration_seconds"] + row.duration_seconds, 3)
+    return {"summary": list(grouped.values()),
+            "recent": [row.model_dump() for row in rows[:50]]}
 
 
 @router.get("/stream")

@@ -2,10 +2,6 @@ services:
   api:
     build: ./backend
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000
-    # published so the vite dev server's /api proxy (localhost:8000) works when
-    # the stack is run for local frontend development, per the README
-    ports:
-      - "8000:8000"
     env_file: .env
     environment:
       - REDIS_URL=redis://redis:6379/0
@@ -13,6 +9,7 @@ services:
       - LIBRARY_DIR=/data/library
       - MEDIA_DIR=/data/media
       - DB_PATH=/data/db/vst.sqlite3
+      - BACKUP_DIR=/data/backups
       - LOG_DIR=/data/logs
       - LOG_NAME=api
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
@@ -20,10 +17,22 @@ services:
       - ./data/library:/data/library
       - ./data/media:/data/media
       - ./data/db:/data/db
+      - ./data/backups:/data/backups
       - ./data/logs:/data/logs
       - ${HOST_MEDIA_DIR:-./data/media}:/host-media:ro
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3).read()
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
     restart: unless-stopped
 
   worker:
@@ -38,6 +47,7 @@ services:
       - LIBRARY_DIR=/data/library
       - MEDIA_DIR=/data/media
       - DB_PATH=/data/db/vst.sqlite3
+      - BACKUP_DIR=/data/backups
       - LOG_DIR=/data/logs
       - LOG_NAME=worker
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
@@ -45,35 +55,86 @@ services:
       - ./data/library:/data/library
       - ./data/media:/data/media
       - ./data/db:/data/db
+      - ./data/backups:/data/backups
       - ./data/logs:/data/logs
       - whisper-models:/root/.cache/huggingface
       - ${HOST_MEDIA_DIR:-./data/media}:/host-media:ro
     depends_on:
-      - redis
-      - ollama
+      redis:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+    restart: unless-stopped
+
+  beat:
+    build: ./backend
+    command: >-
+      celery -A app.tasks.celery_app.celery beat --loglevel=info
+      --schedule=/tmp/celerybeat-schedule
+    env_file: .env
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://ollama:11434}
+      - LIBRARY_DIR=/data/library
+      - MEDIA_DIR=/data/media
+      - DB_PATH=/data/db/vst.sqlite3
+      - BACKUP_DIR=/data/backups
+      - LOG_DIR=/data/logs
+      - LOG_NAME=beat
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    volumes:
+      - ./data/library:/data/library
+      - ./data/media:/data/media
+      - ./data/db:/data/db
+      - ./data/backups:/data/backups
+      - ./data/logs:/data/logs
+    depends_on:
+      redis:
+        condition: service_healthy
     restart: unless-stopped
 
   redis:
-    image: redis:7-alpine
+    image: redis:7-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
     # persist the broker/result backend so a stack restart doesn't silently
     # drop queued jobs (leaving their Job rows stuck 'queued'/'running' forever)
     command: redis-server --appendonly yes
     volumes:
       - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
     restart: unless-stopped
 
   ollama:
-    image: ollama/ollama:latest
+    image: ollama/ollama:latest@sha256:509fdf54e23bd50d87af646cb51c0a7a203d6a83cc4d6695b3b08c5be1c62c0a
     volumes:
       - ollama-models:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
     restart: unless-stopped
 
   frontend:
     build: ./frontend
     ports:
-      - "8080:80"
+      # Synapse has no authentication. Keep the default stack local-only;
+      # setting SYNAPSE_BIND_ADDRESS=0.0.0.0 is an explicit LAN opt-in.
+      - "${SYNAPSE_BIND_ADDRESS:-127.0.0.1}:8080:80"
     depends_on:
-      - api
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     restart: unless-stopped
 
 volumes:

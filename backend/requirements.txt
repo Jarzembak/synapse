@@ -20,4 +20,3 @@ google-genai>=1.0
 openai>=1.50
 python-slugify>=8.0
 cryptography>=43.0
-pytest>=8.0

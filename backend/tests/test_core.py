@@ -97,6 +97,23 @@ def test_frontmatter_roundtrip(tmp_path, monkeypatch):
     assert body == "Body **here**."
 
 
+def test_atomic_doc_write_preserves_old_file_on_replace_failure(tmp_path, monkeypatch):
+    monkeypatch.setattr(library.settings, "library_dir", tmp_path)
+    rel = "projects/demo/summary.md"
+    library._write_doc(rel, {"type": "summary"}, "old body")
+
+    def fail_replace(*_args):
+        raise OSError("simulated replace failure")
+
+    monkeypatch.setattr(library.os, "replace", fail_replace)
+    with pytest.raises(OSError, match="simulated replace failure"):
+        library._write_doc(rel, {"type": "summary"}, "new body")
+
+    _, body = library.read_doc(rel)
+    assert body == "old body"
+    assert not list((tmp_path / "projects" / "demo").glob(".summary.md.*.tmp"))
+
+
 def test_snapshot_history(tmp_path, monkeypatch):
     monkeypatch.setattr(library.settings, "library_dir", tmp_path)
     rel = "tools/nmap.md"
@@ -123,6 +140,125 @@ def test_whisper_config_chain():
     # cpu never emits gpu-only float16 kernels
     assert _whisper_configs("cpu", "float16") == [("cpu", "int8")]
     assert _whisper_configs("cpu", "int8") == [("cpu", "int8")]
+
+
+def test_gemini_asr_uses_asr_model_and_deletes_upload(monkeypatch, tmp_path):
+    import types
+
+    from app import llm
+    from app.tasks.transcribe import gemini_transcribe
+
+    calls = {"deleted": []}
+    uploaded = types.SimpleNamespace(name="files/asr-upload")
+
+    class Files:
+        def upload(self, *, file):
+            calls["uploaded"] = file
+            return uploaded
+
+        def delete(self, *, name):
+            calls["deleted"].append(name)
+
+    class Models:
+        def generate_content(self, *, model, contents):
+            calls["model"] = model
+            calls["contents"] = contents
+            return types.SimpleNamespace(text="[00:00:00] hello")
+
+    client = types.SimpleNamespace(files=Files(), models=Models())
+    genai = types.SimpleNamespace(Client=lambda **_kwargs: client)
+    google = types.ModuleType("google")
+    google.genai = genai
+    monkeypatch.setitem(sys.modules, "google", google)
+    monkeypatch.setattr(llm, "resolve_model",
+                        lambda fn: ("gemini", "gemini-asr-model") if fn == "asr"
+                        else (_ for _ in ()).throw(AssertionError(fn)))
+
+    audio = tmp_path / "speech.mp3"
+    audio.write_bytes(b"audio")
+    assert gemini_transcribe(audio) == "[00:00:00] hello"
+    assert calls["model"] == "gemini-asr-model"
+    assert calls["uploaded"] == str(audio)
+    assert calls["deleted"] == ["files/asr-upload"]
+
+
+def test_gemini_asr_deletes_upload_when_generation_fails(monkeypatch, tmp_path):
+    import types
+
+    from app import llm
+    from app.tasks.transcribe import gemini_transcribe
+
+    deleted = []
+    uploaded = types.SimpleNamespace(name="files/failed-asr-upload")
+    files = types.SimpleNamespace(
+        upload=lambda **_kwargs: uploaded,
+        delete=lambda *, name: deleted.append(name),
+    )
+
+    def fail_generation(**_kwargs):
+        raise RuntimeError("generation failed")
+
+    client = types.SimpleNamespace(
+        files=files,
+        models=types.SimpleNamespace(generate_content=fail_generation),
+    )
+    google = types.ModuleType("google")
+    google.genai = types.SimpleNamespace(Client=lambda **_kwargs: client)
+    monkeypatch.setitem(sys.modules, "google", google)
+    monkeypatch.setattr(llm, "resolve_model", lambda _fn: ("gemini", "asr-model"))
+
+    with pytest.raises(RuntimeError, match="generation failed"):
+        gemini_transcribe(tmp_path / "speech.mp3")
+    assert deleted == ["files/failed-asr-upload"]
+
+
+def test_cloud_config_replace_is_atomic(tmp_path, monkeypatch):
+    from app.tasks import cloud
+
+    db_path = tmp_path / "db" / "test.sqlite3"
+    conf = db_path.parent / "rclone.conf"
+    conf.parent.mkdir(parents=True)
+    conf.write_text("old config", encoding="utf-8")
+    values = {
+        "cloud.provider": "drive",
+        "cloud.config": {"token": '{"access_token":"new"}'},
+    }
+    monkeypatch.setattr(cloud.settings, "db_path", db_path)
+    monkeypatch.setattr(cloud, "get_setting", lambda key: values.get(key))
+    monkeypatch.setattr(cloud.os, "replace",
+                        lambda *_args: (_ for _ in ()).throw(OSError("replace failed")))
+
+    with pytest.raises(OSError, match="replace failed"):
+        cloud._conf_path()
+    assert conf.read_text(encoding="utf-8") == "old config"
+    assert not list(conf.parent.glob(".rclone.conf.*.tmp"))
+
+
+def test_cloud_sync_paths_reports_uploaded_and_skipped(tmp_path, monkeypatch):
+    from app.tasks import cloud
+
+    library_dir = tmp_path / "library"
+    media_dir = tmp_path / "media"
+    library_dir.mkdir()
+    (library_dir / "one.md").write_text("one", encoding="utf-8")
+    media_file = media_dir / "demo" / "source.mp3"
+    media_file.parent.mkdir(parents=True)
+    media_file.write_bytes(b"audio")
+
+    calls = []
+    records = []
+    monkeypatch.setattr(cloud.settings, "library_dir", library_dir)
+    monkeypatch.setattr(cloud.settings, "media_dir", media_dir)
+    monkeypatch.setattr(cloud, "_dest", lambda sub: f"remote:{sub}")
+    monkeypatch.setattr(cloud, "_rclone", lambda args: calls.append(args))
+    monkeypatch.setattr(cloud, "_record", lambda status, detail: records.append((status, detail)))
+
+    result = cloud.sync_paths.run([
+        "one.md", "one.md", "missing.md", "media:demo/source.mp3",
+    ])
+    assert result == {"uploaded": 2, "skipped": 2}
+    assert len(calls) == 2
+    assert records == [("ok", "uploaded 2 file(s); skipped 2 file(s)")]
 
 
 def test_video_format_string():

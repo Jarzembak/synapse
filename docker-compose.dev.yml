@@ -1,0 +1,6 @@
+# Development-only overlay. The normal stack keeps the API on Docker's
+# internal network; Vite's local /api proxy needs an explicit host port.
+services:
+  api:
+    ports:
+      - "${SYNAPSE_API_BIND_ADDRESS:-127.0.0.1}:8000:8000"

@@ -141,6 +141,18 @@ def _versions(ref: QuickRef) -> list[str]:
     )
 
 
+def _version_path(ref: QuickRef, name: str):
+    """Resolve only a snapshot that belongs to this exact quick-reference.
+
+    Rejecting path separators is not sufficient: histories for every doc in a
+    category share a directory, so another doc's valid basename could
+    otherwise be read or reverted through this ref's endpoint.
+    """
+    if name not in _versions(ref):
+        raise HTTPException(404)
+    return library.lib_path(f".history/{ref.path}").parent / name
+
+
 @router.get("/{ref_id}")
 def get_quickref(ref_id: int):
     with get_session() as session:
@@ -174,6 +186,7 @@ def delete_quickref(ref_id: int):
         rel_path = ref.path
         versions = _versions(ref)
         for art in session.exec(select(Artifact).where(Artifact.path == rel_path)).all():
+            library.delete_search_chunks(session, art.id)
             session.exec(text("DELETE FROM artifact_fts WHERE artifact_id = :id")
                          .bindparams(id=art.id))
             session.exec(text("DELETE FROM artifacttag WHERE artifact_id = :id")
@@ -195,9 +208,9 @@ def delete_quickref(ref_id: int):
 def get_version(ref_id: int, name: str):
     with get_session() as session:
         ref = session.get(QuickRef, ref_id)
-    if not ref or "/" in name or "\\" in name or ".." in name:
+    if not ref:
         raise HTTPException(404)
-    path = library.lib_path(f".history/{ref.path}").parent / name
+    path = _version_path(ref, name)
     if not path.exists():
         raise HTTPException(404)
     return {"name": name, "body": path.read_text(encoding="utf-8")}
@@ -207,20 +220,33 @@ def get_version(ref_id: int, name: str):
 def revert(ref_id: int, name: str):
     with get_session() as session:
         ref = session.get(QuickRef, ref_id)
-        if not ref or "/" in name or "\\" in name or ".." in name:
+        if not ref:
             raise HTTPException(404)
-        src = library.lib_path(f".history/{ref.path}").parent / name
+        src = _version_path(ref, name)
         if not src.exists():
             raise HTTPException(404)
+        reverted = src.read_bytes()
+        target = library.lib_path(ref.path)
+        current = target.read_bytes() if target.exists() else None
         library.snapshot_history(ref.path)  # current becomes a version too
-        library.lib_path(ref.path).write_bytes(src.read_bytes())
+        try:
+            library._atomic_write_bytes(target, reverted)
 
-        # re-sync FTS from the reverted content
-        from ..models import Artifact
+            # re-sync FTS from the reverted content
+            from ..models import Artifact
 
-        art = session.exec(select(Artifact).where(Artifact.path == ref.path)).first()
-        if art:
-            _, body = library.read_doc(ref.path)
-            library.sync_fts(session, art, body)
-            session.commit()
+            art = session.exec(select(Artifact).where(Artifact.path == ref.path)).first()
+            if art:
+                _, body = library.read_doc(ref.path)
+                library.sync_fts(session, art, body)
+                library.sync_search_chunks(session, art, body)
+                session.commit()
+                library._queue_semantic_index(art)
+        except Exception:
+            session.rollback()
+            if current is None:
+                target.unlink(missing_ok=True)
+            else:
+                library._atomic_write_bytes(target, current)
+            raise
     return {"ok": True}

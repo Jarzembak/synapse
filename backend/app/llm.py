@@ -12,6 +12,8 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
+from contextvars import ContextVar
 
 from .config import FUNCTION_DEFAULTS, settings
 from .settings_store import get_setting
@@ -19,6 +21,39 @@ from .settings_store import get_setting
 log = logging.getLogger("synapse.llm")
 
 MAX_TOKENS = 16384
+_usage: ContextVar[tuple[int, int]] = ContextVar("llm_usage", default=(0, 0))
+
+
+def _record_call(function: str, provider: str, model: str, started: float,
+                 input_chars: int, output: str, error: Exception | None) -> None:
+    try:
+        from .context import current_job_id
+        from .db import get_session
+        from .models import LLMCall
+
+        input_tokens, output_tokens = _usage.get()
+        with get_session() as session:
+            session.add(LLMCall(
+                job_id=current_job_id.get(), function=function, provider=provider,
+                model=model, input_chars=input_chars, output_chars=len(output),
+                input_tokens=input_tokens, output_tokens=output_tokens,
+                duration_seconds=round(time.monotonic() - started, 3),
+                status="error" if error else "ok",
+                error=str(error)[:1000] if error else "",
+            ))
+            session.commit()
+    except Exception:
+        log.warning("could not record LLM usage", exc_info=True)
+
+
+def _is_transient(exc: Exception) -> bool:
+    status = getattr(exc, "status_code", None)
+    if status in {408, 409, 429} or isinstance(status, int) and status >= 500:
+        return True
+    return exc.__class__.__name__ in {
+        "APITimeoutError", "APIConnectionError", "InternalServerError",
+        "RateLimitError", "ServiceUnavailableError", "ConnectError", "ReadTimeout",
+    }
 
 
 def resolve_model(function: str) -> tuple[str, str]:
@@ -54,13 +89,37 @@ def complete(
 
     log.debug("completing %s via %s/%s (max_tokens=%s, temperature=%s)",
               function, provider, model, max_tokens, temperature)
-    if provider == "ollama":
-        return _ollama(system, user, model, max_tokens, temperature)
-    if provider == "anthropic":
-        return _anthropic(system, user, model, max_tokens, temperature)
-    if provider == "gemini":
-        return _gemini(system, user, model, max_tokens, temperature)
-    raise ValueError(f"unknown provider {provider!r} for function {function!r}")
+    started = time.monotonic()
+    output = ""
+    error: Exception | None = None
+    _usage.set((0, 0))
+    attempts = max(1, min(int(get_setting("llm.transient_attempts", 3) or 3), 5))
+    try:
+        for attempt in range(attempts):
+            try:
+                if provider == "ollama":
+                    output = _ollama(system, user, model, max_tokens, temperature)
+                elif provider == "anthropic":
+                    output = _anthropic(system, user, model, max_tokens, temperature)
+                elif provider == "gemini":
+                    output = _gemini(system, user, model, max_tokens, temperature)
+                else:
+                    raise ValueError(
+                        f"unknown provider {provider!r} for function {function!r}")
+                if not output.strip():
+                    raise RuntimeError(f"{provider}/{model} returned an empty response")
+                return output
+            except Exception as exc:
+                error = exc
+                if attempt + 1 >= attempts or not _is_transient(exc):
+                    raise
+                delay = min(8, 2 ** attempt)
+                log.warning("transient %s failure (%s); retrying in %ss",
+                            function, exc, delay)
+                time.sleep(delay)
+    finally:
+        _record_call(function, provider, model, started,
+                     len(system) + len(user), output, error if not output else None)
 
 
 def complete_json(function: str, system: str, user: str, *, retries: int = 2, **kw):
@@ -94,7 +153,8 @@ def _ollama(system: str, user: str, model: str, max_tokens: int,
             temperature: float | None) -> str:
     from openai import OpenAI
 
-    client = OpenAI(base_url=f"{settings.ollama_base_url}/v1", api_key="ollama")
+    client = OpenAI(base_url=f"{settings.ollama_base_url}/v1", api_key="ollama",
+                    timeout=180, max_retries=2)
     kw = {} if temperature is None else {"temperature": temperature}
     resp = client.chat.completions.create(
         model=model,
@@ -105,6 +165,8 @@ def _ollama(system: str, user: str, model: str, max_tokens: int,
         ],
         **kw,
     )
+    if resp.usage:
+        _usage.set((resp.usage.prompt_tokens or 0, resp.usage.completion_tokens or 0))
     return resp.choices[0].message.content or ""
 
 
@@ -112,7 +174,8 @@ def _anthropic(system: str, user: str, model: str, max_tokens: int,
                temperature: float | None) -> str:
     import anthropic
 
-    client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+    client = anthropic.Anthropic(api_key=settings.anthropic_api_key,
+                                 timeout=180, max_retries=2)
     kw = {} if temperature is None else {"temperature": temperature}
     resp = client.messages.create(
         model=model,
@@ -121,6 +184,8 @@ def _anthropic(system: str, user: str, model: str, max_tokens: int,
         messages=[{"role": "user", "content": user}],
         **kw,
     )
+    if getattr(resp, "usage", None):
+        _usage.set((resp.usage.input_tokens or 0, resp.usage.output_tokens or 0))
     return "".join(b.text for b in resp.content if b.type == "text")
 
 
@@ -138,6 +203,10 @@ def _gemini(system: str, user: str, model: str, max_tokens: int,
             temperature=temperature,
         ),
     )
+    usage = getattr(resp, "usage_metadata", None)
+    if usage:
+        _usage.set((getattr(usage, "prompt_token_count", 0) or 0,
+                    getattr(usage, "candidates_token_count", 0) or 0))
     return resp.text or ""
 
 

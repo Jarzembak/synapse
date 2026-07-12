@@ -7,9 +7,9 @@ a corrected transcript, a summary, two independent deep dives that get merged
 into one, a growing set of quick-reference docs (tools, techniques, concepts,
 technologies, or categories you define yourself), a two-host podcast script
 with generated audio, a trimmed audio-only copy, and an interactive mind map.
-Everything accumulates in one browsable, taggable, full-text-searchable
-library instead of living as scattered files — with an optional push to your
-own cloud storage.
+Everything accumulates in one browsable, taggable library with exact and
+semantic search, source-grounded Q&A, timestamp playback links, and an optional
+push to your own cloud storage instead of living as scattered files.
 
 Fully vibe coded by Fable and inspired by Jeff McJunkin's methodology.
 
@@ -26,9 +26,11 @@ without touching code.
 - [Themes](#themes)
 - [Advanced settings](#advanced-settings)
 - [Cloud storage](#cloud-storage)
+- [Backups and encryption](#backups-and-encryption)
 - [The library on disk](#the-library-on-disk)
 - [Configuring models](#configuring-models)
 - [Local files, cookies, and remote GPUs](#local-files-cookies-and-remote-gpus)
+- [Network exposure](#network-exposure)
 - [Development](#development)
 - [Logging](#logging)
 - [Troubleshooting](#troubleshooting)
@@ -38,19 +40,20 @@ without touching code.
 
 ### Architecture
 
-Five containers, orchestrated by `docker-compose.yml`:
+Six containers, orchestrated by `docker-compose.yml`:
 
 | Service | Role |
 |---|---|
 | `frontend` | nginx serving the built React SPA; proxies `/api` to `api` |
 | `api` | FastAPI — REST endpoints, SSE job stream, reads/writes the library |
 | `worker` | Celery worker — runs every pipeline step (this is where yt-dlp, ffmpeg, faster-whisper, Kokoro/Piper, and all LLM calls actually execute) |
+| `beat` | Celery scheduler — checks hourly whether a configured backup is due |
 | `redis` | Celery broker + result backend |
 | `ollama` | Local model server (OpenAI-compatible API) for any step configured to use a local model |
 
-`api` and `worker` share the same backend image and codebase; `api` only serves
-HTTP/SSE, `worker` only consumes the job queue, so a slow transcription or LLM
-call never blocks the UI.
+`api`, `worker`, and `beat` share the same backend image and codebase; `api`
+serves HTTP/SSE, `worker` consumes jobs, and `beat` only schedules periodic
+checks, so a slow transcription or LLM call never blocks the UI.
 
 ### The pipeline
 
@@ -87,6 +90,16 @@ loops a token (`apis-apis-apis…`) or emits a run-on phrase; degenerate
 repeats are collapsed and over-long/multi-word junk is dropped, while
 existing tags you created on purpose are always trusted as-is.
 
+Every generated artifact also records the exact upstream content signature,
+model, prompt, and relevant settings that produced it. If a source, glossary,
+prompt, model, voice, or tuning value changes, the project board marks affected
+outputs **update available** all the way down the dependency graph. A profile
+run automatically rebuilds only missing or stale work. Built-in profiles cover
+Full production, Research library, Quick notes, and Audio edition; custom
+profiles can be assembled in Settings. “Re-run downstream” deliberately
+rebuilds one step and every output that consumes it. Summary/deep-dive prompts
+preserve `[HH:MM:SS]` source citations and label model-added background context.
+
 ## Quick start
 
 Requires Docker (Docker Desktop on Windows/Mac, or Docker Engine on Linux) —
@@ -116,9 +129,15 @@ First-time setup, in another terminal, once the containers are up:
 ```bash
 # pull the default local model (used for correction, tagging, and trim-span detection)
 docker compose exec ollama ollama pull qwen3:8b
+# optional: enable meaning-based Hybrid search in Settings, then pull its model
+docker compose exec ollama ollama pull nomic-embed-text
 ```
 
 Open **http://localhost:8080**.
+
+The default Compose stack binds the web app to loopback only. Synapse has no
+authentication, so it is not reachable from other devices unless you
+explicitly opt in; see [Network exposure](#network-exposure).
 
 That's it — everything else (the TTS provider's voice files, whether Piper or
 Kokoro; faster-whisper's ASR model) downloads automatically on first use of
@@ -127,8 +146,9 @@ that step and is cached, so subsequent runs are fast.
 ## Using the app
 
 **Projects** is where you start: paste a URL (YouTube, Vimeo, Udemy, or
-anything [yt-dlp supports](https://github.com/yt-dlp/yt-dlp)) or give a local
-file path, and a project is created. The projects list shows each one's
+anything [yt-dlp supports](https://github.com/yt-dlp/yt-dlp)), upload an audio
+or video file directly in the browser, or give a mounted local-file path. The
+projects list shows each one's
 **derived pipeline status** — a colored chip (New / Partial / Running /
 Complete / Failed / Canceled), a `done/total` step count with a thin progress
 bar, the active or failed step's name, and last-activity time — computed live
@@ -136,26 +156,25 @@ from the step graph rather than a static field, and refreshed automatically
 over the job stream. Opening a project shows its **pipeline board** —
 thirteen step cards you run in order (each is disabled while running/queued;
 a card turns green once its artifact exists, red on error with the full error
-message expandable inline). Progress updates live via server-sent events, so
+message expandable inline). Choose a built-in or custom pipeline profile at
+the top; completed cards show when an update is available after their inputs
+or settings change, and can rebuild only themselves or their entire downstream
+branch. Progress updates live via server-sent events, so
 you can watch "transcribing 43%" or "writing segment 4/11" without
 refreshing. Each completed step links straight to its artifact.
 
 **Library** is the home page and the point of the whole app: every artifact
-from every project, in one searchable, sortable, filterable list. Full-text
-search hits the SQLite FTS5 index, so searching for a command or a specific
-phrase from a transcript works, not just titles. It opens **grouped by
-project by default** — each project is a collapsible section, like a folder
-in a file explorer (▶/▼ to expand/collapse one, or "expand all"/"collapse
-all" for the whole table); toggle "group by project" off for a flat sorted
-list instead. Every column header (Title, Type, Project, Tags, Updated) is
-clickable to sort — click again to reverse direction (▲/▼ shows current
-order) — and Title/Type/Project/Tags each have a small filter funnel: a text
-box for Title, a checklist of the actual values present (with counts) for
-Type/Project/Tags. Tag chips are clickable everywhere they appear — in the
-table rows and in the left-rail tag cloud — and the tag cloud supports
-multi-select (shows items matching *any* selected tag); a "clear all filters"
-button appears whenever something's active. Click through to render
-markdown, play audio/video, or open the mind map.
+from every project, in a server-paginated, sortable, filterable list without a
+silent result ceiling. **Exact** mode uses SQLite FTS5, so commands and quoted
+transcript phrases work, not just titles. **Hybrid** mode retrieves line-aware
+excerpts and optionally blends exact ranking with local Ollama embeddings, so
+conceptual searches can find relevant passages that use different wording.
+Query, mode, type/tag/project filters, ordering, and page are stored in the URL,
+making a filtered view bookmarkable. The **Ask your library** panel retrieves
+supporting excerpts first and requires the configured answer model to cite
+them as `[S1]`, `[S2]`, etc.; it refuses to fill gaps from general knowledge.
+Every citation keeps the excerpt visible, and timestamped sources offer a
+**play @ HH:MM:SS** link that opens the project's source media at that moment.
 
 **Quick-refs** is the accumulating tool/technique/concept/technology
 library — separate from the per-project pipeline because these documents are
@@ -186,18 +205,19 @@ docs can't be deleted until those docs are removed first.
 running, what's queued, and recent history, all streamed over SSE. Whole-
 project "run all" jobs execute one at a time and auto-chain to the next
 queued project; individual steps run concurrently as worker capacity frees
-up. Any queued or running job can be canceled. If the chain ever stalls —
-most commonly because the worker container restarted mid-run, breaking the
-automatic hand-off — a **Continue queue** button appears (the worker also
-resets any job orphaned by its own restart on startup, so Continue always
-has a clean queue to resume).
+up. Any queued or running job can be canceled. Cancellation is fenced in the
+database before worker revocation, so a late provider response cannot publish
+or resurrect canceled work. On worker restart, orphaned rows are marked
+interrupted and the oldest durable whole-project run resumes automatically;
+**Continue queue** remains as a manual recovery control.
 
-**System** is a live resource monitor: host-wide CPU (total and per-core) and
-memory via `psutil`, GPU utilization/VRAM/temperature via `nvidia-smi` when a
-GPU is visible to the container, and which models Ollama currently has
-loaded (tagged gpu/cpu/hybrid by how much of each sits in VRAM). Useful for
-seeing exactly how loaded the box is during a heavy step like transcription
-or TTS, and for confirming the GPU overlay is actually being used.
+**System** combines the live resource monitor (CPU, memory, library disk,
+active jobs, GPU/VRAM, and resident Ollama models) with operational checks.
+It tests the database, broker, worker, media tools, Ollama/embedding model,
+optional provider keys, and free space; shows local per-function model-call
+counts, errors, tokens and duration; reports vault/index integrity; can rebuild
+the SQLite search layer from Markdown; and creates, verifies, downloads, and
+lists backup snapshots.
 
 **Logs** tails the api/worker log files in the browser — no `docker compose
 logs` needed. Toggle between services, filter by minimum level (all / info+ /
@@ -206,13 +226,12 @@ error), filter by text, choose how many lines to tail, watch it live (polls
 every 2s) or freeze it, and download the current tail.
 
 **Settings** holds everything that changes how the pipeline behaves:
-per-function model selection, the correction glossary, TTS voice choices, the
-media-download resolution cap (720p / 1080p / 1440p / best, default 1080p),
-the tag vocabulary (add/rename/delete — renaming merges into an existing tag
-of the new name if one exists, and propagates to every artifact's
-frontmatter), quick-ref categories (above), and an **Advanced** section
-covering prompts, generation parameters, audio/pipeline/ASR/compute tuning,
-and cloud storage — see below.
+provider-compatible per-function model selection, Piper/Kokoro/Gemini host
+voices, built-in and custom pipeline profiles, optional semantic indexing,
+backup schedule/retention/media policy, desktop completion notifications, the
+correction glossary, download resolution, tag vocabulary, quick-ref categories,
+and an **Advanced** section covering prompts, generation parameters,
+audio/pipeline/ASR/compute tuning, and cloud storage — see below.
 
 ## Themes
 
@@ -346,6 +365,37 @@ browser (you'll see `•set•` instead). To rotate a credential, just type the
 new value over the masked field and save again; leaving it as `•set•` or
 blank keeps the previously stored value.
 
+## Backups and encryption
+
+Synapse can create a consistent ZIP containing an SQLite snapshot and the
+entire Markdown library, with archived/browser-uploaded source media optionally included.
+Backups live in `data/backups/`, which is shared by the API and worker. The
+lightweight `beat` service checks once per hour and queues a backup when the
+configured interval is due; scheduling is disabled by default. Retention
+defaults to the five newest archives. Configure the policy in **Settings →
+Backups**, then create, verify, or download snapshots under **System → Backups**.
+Verification checks the archive CRC and runs SQLite's own integrity check on
+the contained database snapshot.
+
+Set `BACKUP_ENCRYPTION_KEY` in `.env` before creating backups if the archive
+should be encrypted. Use a long, random value, store it in a password manager,
+and keep it for as long as any encrypted archive exists—there is no recovery
+path if it is lost. Leaving it blank creates ordinary, unencrypted ZIP files.
+
+`SETTINGS_ENCRYPTION_KEY` protects saved cloud credentials. If it is blank,
+Synapse generates `data/db/.settings.key` instead. For a portable disaster
+recovery setup, set and retain the environment value; otherwise secure a
+separate copy of `.settings.key`, because the database inside a Synapse backup
+does not contain that key. The backup directory is on the same host by
+default, so copy verified archives to another device or storage provider.
+
+The Markdown vault remains independently recoverable: **System → Library
+integrity → Rebuild index from vault** reconstructs projects, artifacts,
+quick-reference relationships, tags, FTS rows, and retrieval chunks. It does
+not overwrite Markdown. Project deletion stages folders before its database
+transaction; startup automatically restores or finishes any staging left by a
+power loss between those operations.
+
 ## The library on disk
 
 Every artifact is a markdown file with YAML frontmatter, plus an SQLite index
@@ -379,7 +429,8 @@ data/library/
 ```
 
 Frontmatter on every file includes `type`, `title`, `project`, `created`,
-`updated`, `provider`, `model`, and `tags`; quick-refs additionally track
+`updated`, `provider`, `model`, `tags`, and provenance hashes/details for the
+effective inputs and configuration; quick-refs additionally track
 `aliases` (name variants matched to this doc). A quick-ref's artifact `type`
 is `quickref_<category-key>` — `quickref_tool`, `quickref_technology`,
 `quickref_<your-custom-key>`, and so on.
@@ -417,12 +468,24 @@ speech).
 
 ## Local files, cookies, and remote GPUs
 
-**Local file input:** set `HOST_MEDIA_DIR` in `.env` to a folder on your host
+**Browser upload (recommended for an ordinary file):** choose **Upload a
+file** on Projects. Synapse streams it into that project's private
+`data/media/<slug>/` folder, keeps a playable transcription-audio sidecar, and
+removes it with the project. The default limit is 20 GiB (`MAX_UPLOAD_BYTES`);
+nginx streams the request instead of buffering it in memory or temporary disk.
+
+**Mounted local-file input (useful for a large existing collection):** set
+`HOST_MEDIA_DIR` in `.env` to a folder on your host
 machine (default is `./data/media`, i.e. inside the project checkout). It's
 mounted read-only into the containers at `/host-media`. When creating a
 project with source type "local file", give a path **relative to that
 directory** — e.g. if `HOST_MEDIA_DIR=D:\Videos` and your file is
 `D:\Videos\talks\recon.mp4`, enter `talks/recon.mp4`.
+
+URL sources reject loopback, link-local, and private IP literals by default.
+Set `ALLOW_PRIVATE_URLS=true` only when you intentionally need a source served
+inside your trusted network. Credentials embedded in a URL are always rejected;
+use the per-project cookies upload for authenticated sites instead.
 
 **Authenticated sites (Udemy, etc.):** on the project detail page, upload a
 `cookies.txt` (Netscape format, exportable with any browser cookie-export
@@ -459,25 +522,65 @@ runs on CPU regardless of the overlay — see
 meaningfully bigger ones — 7–8B-class quantized models remain the practical
 ceiling.
 
+## Network exposure
+
+Synapse does not currently provide user authentication. The normal stack
+therefore publishes only the frontend, and only on `127.0.0.1:8080`; the API
+stays on Docker's private network and is reached through the frontend proxy.
+
+To intentionally make the full app available on your LAN, set
+`SYNAPSE_BIND_ADDRESS=0.0.0.0` in `.env` and restart the stack. Treat that as
+granting everyone who can reach the host full access to the app and its
+library. Do not expose port 8080 directly to the internet; put authentication
+and TLS in a trusted reverse proxy first if remote access is required.
+
+Port 8000 is published only by `docker-compose.dev.yml`, and that development
+overlay also defaults to loopback. It is not needed when using the built-in
+frontend container.
+
 ## Development
 
 Backend tests (pure Python, no Docker needed):
 
 ```bash
 cd backend
-pip install -r requirements.txt
+pip install -r requirements-dev.txt
 pytest tests -q
 ```
 
 Frontend dev server with hot reload (proxies `/api` to `localhost:8000`, so
-run the backend separately or via `docker compose up api redis ollama worker`
-first):
+run the backend separately or start the backend containers with the
+development overlay first):
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up api redis ollama worker beat
+```
+
+Then, in another terminal:
 
 ```bash
 cd frontend
-npm install
+npm ci
 npm run dev
 ```
+
+`npm run typecheck` checks TypeScript without producing a build;
+`npm run build` runs that check and creates the production bundle. CI runs the
+backend tests, frontend type-check/build, and validates the default,
+development, and GPU Compose configurations on every pull request.
+
+Backend container and CI installs are also locked while the requirement files
+remain portable for local development. Edit `requirements.txt` or
+`requirements-dev.txt`, then regenerate their Linux constraint locks from the
+`backend` directory with the same pinned compiler CI expects:
+
+```bash
+python -m pip install pip-tools==7.5.3
+pip-compile --allow-unsafe --no-emit-index-url --no-emit-trusted-host --strip-extras --output-file=constraints.txt requirements.txt
+pip-compile --allow-unsafe --no-emit-index-url --no-emit-trusted-host --strip-extras --output-file=constraints-dev.txt requirements-dev.txt
+```
+
+Commit both the input and generated file, then rerun the backend tests.
 
 Rebuilding after backend/frontend code changes: `docker compose up --build`.
 
@@ -489,10 +592,10 @@ bind mounts under `./data`. To wipe those too, also delete the directory:
 
 ## Logging
 
-Both backend services write structured, timestamped logs to two places at
-once: container stdout (visible via `docker compose logs api` /
-`docker compose logs worker`) and rotating log files on a shared volume —
-`data/logs/synapse-api.log` and `data/logs/synapse-worker.log` (5 MB × 3
+The API, worker, and scheduler write structured, timestamped logs to two
+places at once: container stdout (visible through `docker compose logs`) and
+rotating log files on a shared volume — `data/logs/synapse-api.log`,
+`data/logs/synapse-worker.log`, and `data/logs/synapse-beat.log` (5 MB × 3
 rotations each). Every pipeline step logs its start/completion/failure, LLM
 calls log at debug level, and previously-silent background failures (cloud
 sync enqueueing, auto-tagging, caption fetch fallback) leave a warning trace
@@ -515,7 +618,9 @@ WARNING so it doesn't drown out the app's own log lines.
 ## Troubleshooting
 
 - **A step fails immediately with "missing prerequisite artifact"** — steps depend on earlier ones (e.g. the merge step needs both deep dives). Run the pipeline board top to bottom.
-- **Multiple projects are queued but nothing is running** — whole-project "run all" jobs are serial by design and auto-chain, but a worker restart mid-run (a redeploy, a crash) can break that hand-off. The Jobs tab shows a **Continue queue** button whenever this happens; click it to resume. The worker also clears any job orphaned by its own restart on startup, so this is always safe to click.
+- **Multiple projects are queued but nothing is running** — whole-project runs are serial by design. Worker startup normally clears interrupted jobs and resumes the oldest queued run automatically; if the broker was unavailable during that hand-off, use **Continue queue** in Jobs after Redis/worker readiness checks turn green in System.
+- **A completed card says “update available”** — one of its source artifacts, prompts, models, voices, or tuning values changed. Run the selected profile to refresh every stale consumer, or use **Re-run downstream** on the earliest changed step.
+- **Hybrid search only finds exact phrases** — enable semantic search in Settings, make sure `nomic-embed-text` (or your chosen embedding model) is installed in Ollama, and queue **Rebuild search index**. The System readiness card reports a missing embedding model.
 - **Transcription is slow** — faster-whisper on CPU is realistic for CPU-only hardware but not fast; for long videos, consider assigning the `asr` function to `gemini` in Settings instead, or run the [GPU overlay](#local-files-cookies-and-remote-gpus) if you have an NVIDIA card.
 - **TTS (podcast audio) is slow** — check the **System** tab while it runs: if CPU is pegged and no GPU shows activity, that's expected (TTS is CPU-only today, see [Current limitations](#current-limitations)). Try the `piper` provider if you're on `kokoro` — it's the faster of the two on CPU — and/or raise **Advanced → Audio → TTS parallel workers**.
 - **A frontier-model step errors with an auth/key message** — check the corresponding `_API_KEY` in `.env` and that you restarted (`docker compose up`) after editing it.
@@ -552,7 +657,10 @@ WARNING so it doesn't drown out the app's own log lines.
   behind upstream; if Google/Microsoft ever change their token format in a
   way it can't parse, switching the Dockerfile to rclone's official install
   script would pull the latest release.
-- The job queue's "stalled after a restart" recovery (see
-  [Troubleshooting](#troubleshooting)) is manual by design — Continue queue
-  is a button you click, not an automatic resume — and currently assumes a
-  single worker process, matching what `docker-compose.yml` runs.
+- Job leasing/restart recovery currently assumes the single worker service
+  defined by `docker-compose.yml`. Running multiple independent worker
+  services would need a distributed lease/leader design for the serialized
+  whole-project queue.
+- Semantic retrieval stores vectors in SQLite and scores them in-process. It is
+  intentionally simple and private for a personal library; a very large
+  multi-user collection would warrant a dedicated vector index.

@@ -21,11 +21,16 @@ class Settings(BaseSettings):
     anthropic_api_key: str = ""
     gemini_api_key: str = ""
     elevenlabs_api_key: str = ""
+    allow_private_urls: bool = False
 
     library_dir: Path = Path("./data/library")
     media_dir: Path = Path("./data/media")
     host_media_mount: Path = Path("/host-media")
     db_path: Path = Path("./data/db/vst.sqlite3")
+    backup_dir: Path = Path("./data/backups")
+    backup_encryption_key: str = ""
+    settings_encryption_key: str = ""
+    max_upload_bytes: int = 20 * 1024 * 1024 * 1024
 
 
 settings = Settings()
@@ -43,9 +48,10 @@ FUNCTION_DEFAULTS: dict[str, dict[str, str]] = {
     "trim_spans":     {"provider": "ollama",    "model": "qwen3:8b"},
     "mindmap":        {"provider": "anthropic", "model": "claude-sonnet-5"},
     "tag":            {"provider": "ollama",    "model": "qwen3:8b"},
+    "library_qa":     {"provider": "anthropic", "model": "claude-sonnet-5"},
     # ASR + TTS are not chat providers; handled by their own tasks.
     "asr":            {"provider": "faster-whisper", "model": "distil-large-v3"},
-    "tts":            {"provider": "kokoro",   "model": "kokoro-82m"},
+    "tts":            {"provider": "piper",    "model": "en_US-ryan-medium"},
 }
 
 # Advanced tuning knobs (Settings → Advanced). Stored per-group in the Settings
@@ -55,6 +61,7 @@ ADVANCED_DEFAULTS: dict[str, dict] = {
         "tts_speed": 1.0,        # Kokoro speaking rate multiplier
         "tts_gap": 0.4,          # seconds of silence between dialogue lines
         "tts_workers": 0,        # parallel TTS synthesis workers; 0 = auto
+        "keep_intermediates": False,
         "trim_db": -40,          # silenceremove threshold (dBFS)
         "trim_silence": 1.5,     # minimum silence duration to remove (s)
     },

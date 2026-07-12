@@ -76,6 +76,7 @@ def ingest(job_id: int, project_id: int):
             # this yt-dlp grabs the whole playlist and the wrong video wins the
             # fixed source.* filename.
             "noplaylist": True,
+            "socket_timeout": 30,
         }
         ck = cookies_path(project.slug)
         if ck.exists():
@@ -88,7 +89,9 @@ def ingest(job_id: int, project_id: int):
             }) or project.title
     else:
         progress(job_id, "copying local file")
-        src = media.resolve_local_source(project.source)
+        src = (media.resolve_uploaded_source(project.slug, project.source)
+               if project.source_type == "upload"
+               else media.resolve_local_source(project.source))
         if src.suffix.lower() in {".m4a", ".mp3", ".wav", ".flac", ".ogg", ".opus"}:
             shutil.copy(src, wd / f"source{src.suffix.lower()}")
             audio = wd / f"source{src.suffix.lower()}"
@@ -103,7 +106,17 @@ def ingest(job_id: int, project_id: int):
             project.title = title
         project.status = "ingested"
         session.add(project)
-        session.commit()
+        library.write_artifact(
+            session,
+            project_id=project_id,
+            project_slug=project.slug,
+            type="source_audio",
+            title=f"Source audio — {project.title}",
+            body="Working audio copy used for transcription and timestamp playback.",
+            rel_path=f"projects/{project.slug}/source_audio.md",
+            media_rel=f"media:{project.slug}/{audio.name}",
+            extra_meta={"filesize_bytes": audio.stat().st_size},
+        )
     return str(audio)
 
 
@@ -155,6 +168,7 @@ def download(job_id: int, project_id: int):
         "progress_hooks": [hook],
         "quiet": True,
         "noplaylist": True,  # archive only the submitted video, not its playlist
+        "socket_timeout": 30,
     }
     ck = cookies_path(project.slug)
     if ck.exists():

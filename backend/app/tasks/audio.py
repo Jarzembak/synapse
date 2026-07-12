@@ -7,6 +7,7 @@ import os
 import re
 import subprocess
 import threading
+import shutil
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -55,7 +56,10 @@ def _download(url: str, dest: Path) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(dest.suffix + f".{os.getpid()}.{threading.get_ident()}.part")
     try:
-        with httpx.stream("GET", url, follow_redirects=True, timeout=None) as r:
+        with httpx.stream(
+            "GET", url, follow_redirects=True,
+            timeout=httpx.Timeout(900, connect=15),
+        ) as r:
             r.raise_for_status()
             with open(tmp, "wb") as f:
                 for chunk in r.iter_bytes():
@@ -236,7 +240,7 @@ def _tts_piper(lines, wd: Path, on_progress) -> Path:
         proc = subprocess.run(
             ["piper", "--model", str(onnx), "--config", str(cfg),
              "--output_file", str(out)],
-            input=text, capture_output=True, text=True,
+            input=text, capture_output=True, text=True, timeout=600,
         )
         if proc.returncode != 0 or not out.exists():
             raise RuntimeError(f"piper failed: {proc.stderr[-2000:]}")
@@ -321,18 +325,25 @@ def tts(job_id: int, project_id: int):
     wd = media.workdir(project.slug)
     provider, model = llm.resolve_model("tts")
     on_progress = lambda m: progress(job_id, m)  # noqa: E731
-    if provider == "gemini":
-        out = _tts_gemini(lines, wd, model, on_progress)
-    elif provider == "piper":
-        out = _tts_piper(lines, wd, on_progress)
-    else:
-        out = _tts_kokoro(lines, wd, on_progress)
+    out: Path | None = None
+    try:
+        if provider == "gemini":
+            out = _tts_gemini(lines, wd, model, on_progress)
+        elif provider == "piper":
+            out = _tts_piper(lines, wd, on_progress)
+        else:
+            out = _tts_kokoro(lines, wd, on_progress)
 
-    _store_audio(project_id, project.slug, project.title, out,
-                 type="podcast_audio", title_prefix="Podcast audio",
-                 provider=provider, model=model,
-                 note=f"Two-host podcast audio generated from "
-                      f"{library.wikilink(f'projects/{project.slug}/podcast_script')}.")
+        _store_audio(project_id, project.slug, project.title, out,
+                     type="podcast_audio", title_prefix="Podcast audio",
+                     provider=provider, model=model,
+                     note=f"Two-host podcast audio generated from "
+                          f"{library.wikilink(f'projects/{project.slug}/podcast_script')}.")
+    finally:
+        if not advanced("audio").get("keep_intermediates", False):
+            shutil.rmtree(wd / "tts", ignore_errors=True)
+            if out:
+                out.unlink(missing_ok=True)
 
 
 def hms_to_s(t: str) -> float:
@@ -407,8 +418,10 @@ def trim(job_id: int, project_id: int):
                  provider=provider, model=model,
                  note=f"Source audio with silence and off-topic spans removed.\n\n"
                       f"## Removed spans\n{reasons}",
-                 extra={"original_seconds": total,
-                        "trimmed_seconds": media.duration_seconds(out)})
+                  extra={"original_seconds": total,
+                         "trimmed_seconds": media.duration_seconds(out)})
+    if not advanced("audio").get("keep_intermediates", False):
+        out.unlink(missing_ok=True)
 
 
 def _store_audio(project_id: int, slug: str, title: str, produced: Path, *,
@@ -418,7 +431,12 @@ def _store_audio(project_id: int, slug: str, title: str, produced: Path, *,
     media_rel = f"projects/{slug}/{type}.mp3"
     dest = library.lib_path(media_rel)
     dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_bytes(produced.read_bytes())
+    tmp = dest.with_suffix(dest.suffix + f".{os.getpid()}.tmp")
+    try:
+        shutil.copyfile(produced, tmp)
+        os.replace(tmp, dest)
+    finally:
+        tmp.unlink(missing_ok=True)
 
     with get_session() as session:
         art = library.write_artifact(

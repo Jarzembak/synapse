@@ -124,7 +124,8 @@ def _upsert_quickref(project_id: int, project_slug: str, project_title: str,
     provider, model = llm.resolve_model("quickref")
     source_note = (
         f"\n\nSource material is from the video: {project_title!r}. "
-        "Attribute examples with 'From: " + project_title + "'."
+        "Attribute examples with 'From: " + project_title
+        + " [HH:MM:SS]' using only timestamps already present in the material."
     )
 
     if ref:

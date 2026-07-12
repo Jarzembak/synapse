@@ -1,10 +1,16 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api, QuickRefCategory } from "../api";
 
 interface ModelCfg { provider: string; model: string }
 interface TagInfo { id: number; name: string; kind: string; count: number }
 interface PromptInfo { label: string; value: string; modified: boolean }
 interface Params { temperature?: number | null; max_tokens?: number | null }
+interface VoicesState { kokoro: Record<string, string>; piper: Record<string, string>; gemini: Record<string, string> }
+interface ProfileInfo { label: string; description: string; steps: string[]; custom?: boolean }
+interface StepInfo { name: string; label: string }
+interface SearchConfig { semantic_enabled: boolean; embedding_model: string }
+interface SearchStatus { chunks: number; embeddings: number; semantic_enabled: boolean; embedding_model: string }
+interface BackupConfig { retention: number; schedule_hours: number; include_media: boolean; last?: { at?: string; status?: string; path?: string } | null }
 interface CloudState {
   provider: string;
   providers: string[];
@@ -28,6 +34,7 @@ const FN_LABELS: Record<string, string> = {
   trim_spans: "Trim span detection",
   mindmap: "Mind map",
   tag: "Auto-tagging",
+  library_qa: "Library grounded Q&A",
   download: "Media download",
 };
 
@@ -58,6 +65,21 @@ deep-dive material. Structure (markdown):
 export default function Settings() {
   const [functions, setFunctions] = useState<Record<string, ModelCfg>>({});
   const [providers, setProviders] = useState<string[]>([]);
+  const [providerOptions, setProviderOptions] = useState<Record<string, string[]>>({});
+  const [voices, setVoices] = useState<VoicesState | null>(null);
+  const [profiles, setProfiles] = useState<Record<string, ProfileInfo>>({});
+  const [steps, setSteps] = useState<StepInfo[]>([]);
+  const [profileDraft, setProfileDraft] = useState({
+    key: "", label: "", description: "", steps: [] as string[],
+  });
+  const [editingProfileKey, setEditingProfileKey] = useState<string | null>(null);
+  const [searchConfig, setSearchConfig] = useState<SearchConfig | null>(null);
+  const [searchStatus, setSearchStatus] = useState<SearchStatus | null>(null);
+  const [backupConfig, setBackupConfig] = useState<BackupConfig | null>(null);
+  const [reindexing, setReindexing] = useState(false);
+  const [jobNotifications, setJobNotifications] = useState(
+    () => localStorage.getItem("synapse.jobNotifications") === "on",
+  );
   const [glossary, setGlossary] = useState("");
   const [tags, setTags] = useState<TagInfo[]>([]);
   const [maxHeight, setMaxHeight] = useState(1080);
@@ -71,11 +93,22 @@ export default function Settings() {
   const [catBanner, setCatBanner] = useState("");
   const [saved, setSaved] = useState("");
   const [savedError, setSavedError] = useState(false);
+  const flashTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   function load() {
     Promise.all([
-      api<{ functions: Record<string, ModelCfg>; providers: string[] }>("/settings/models")
-        .then((r) => { setFunctions(r.functions); setProviders(r.providers); }),
+      api<{ functions: Record<string, ModelCfg>; providers: string[]; provider_options: Record<string, string[]> }>("/settings/models")
+        .then((r) => {
+          setFunctions(r.functions);
+          setProviders(r.providers);
+          setProviderOptions(r.provider_options);
+        }),
+      api<VoicesState>("/settings/voices").then(setVoices),
+      api<Record<string, ProfileInfo>>("/settings/profiles").then(setProfiles),
+      api<StepInfo[]>("/projects/steps").then(setSteps),
+      api<SearchConfig>("/settings/search").then(setSearchConfig),
+      api<SearchStatus>("/library/index/status").then(setSearchStatus),
+      api<BackupConfig>("/settings/backup").then(setBackupConfig),
       api<{ terms: string[] }>("/settings/glossary").then((r) => setGlossary(r.terms.join("\n"))),
       api<TagInfo[]>("/tags").then(setTags),
       api<{ max_height: number }>("/settings/download").then((r) => setMaxHeight(r.max_height)),
@@ -87,12 +120,18 @@ export default function Settings() {
       api<QuickRefCategory[]>("/quickrefs/categories").then(setQrCats),
     ]).catch((e) => flash(`couldn't load settings: ${e.message}`, true));
   }
-  useEffect(load, []);
+  useEffect(() => {
+    load();
+    return () => {
+      if (flashTimer.current) clearTimeout(flashTimer.current);
+    };
+  }, []);
 
   function flash(msg: string, isError = false) {
     setSaved(msg);
     setSavedError(isError);
-    setTimeout(() => setSaved(""), isError ? 4000 : 1500);
+    if (flashTimer.current) clearTimeout(flashTimer.current);
+    flashTimer.current = setTimeout(() => setSaved(""), isError ? 4000 : 1500);
   }
 
   async function saveModel(fn: string, cfg: ModelCfg) {
@@ -102,7 +141,9 @@ export default function Settings() {
       await api(`/settings/models/${fn}`, { method: "PUT", body: JSON.stringify(cfg) });
       flash(`saved ${fn}`);
     } catch (e: any) {
-      setFunctions((p) => ({ ...p, [fn]: prev }));  // revert the optimistic edit
+      setFunctions((p) => ({ ...p, [fn]: prev }));
+      api<{ functions: Record<string, ModelCfg> }>("/settings/models")
+        .then((result) => setFunctions(result.functions)).catch(() => {});
       flash(`save failed: ${e.message}`, true);
     }
   }
@@ -128,12 +169,114 @@ export default function Settings() {
     }
   }
 
+  async function saveVoices() {
+    if (!voices) return;
+    try {
+      await api("/settings/voices", { method: "PUT", body: JSON.stringify(voices) });
+      flash("voice assignments saved");
+    } catch (e: any) { flash(`save failed: ${e.message}`, true); }
+  }
+
+  async function saveProfile() {
+    const key = profileDraft.key.trim();
+    if (!key || !profileDraft.label.trim() || profileDraft.steps.length === 0) {
+      flash("a profile needs a key, label, and at least one step", true);
+      return;
+    }
+    try {
+      const stored = await api<ProfileInfo & { key: string }>(`/settings/profiles/${encodeURIComponent(key)}`, {
+        method: "PUT",
+        body: JSON.stringify({
+          label: profileDraft.label,
+          description: profileDraft.description,
+          steps: profileDraft.steps,
+        }),
+      });
+      setProfiles((current) => ({ ...current, [stored.key]: stored }));
+      setProfileDraft({ key: "", label: "", description: "", steps: [] });
+      setEditingProfileKey(null);
+      flash("pipeline profile saved");
+    } catch (e: any) { flash(`profile save failed: ${e.message}`, true); }
+  }
+
+  async function deleteProfile(key: string) {
+    if (!confirm(`Delete the pipeline profile “${profiles[key].label}”?`)) return;
+    try {
+      await api(`/settings/profiles/${encodeURIComponent(key)}`, { method: "DELETE" });
+      setProfiles((current) => {
+        const next = { ...current };
+        delete next[key];
+        return next;
+      });
+      if (editingProfileKey === key) {
+        setEditingProfileKey(null);
+        setProfileDraft({ key: "", label: "", description: "", steps: [] });
+      }
+      flash("pipeline profile deleted");
+    } catch (e: any) { flash(`delete failed: ${e.message}`, true); }
+  }
+
+  async function saveSearch() {
+    if (!searchConfig) return;
+    try {
+      await api("/settings/search", { method: "PUT", body: JSON.stringify(searchConfig) });
+      setSearchStatus((current) => current && ({
+        ...current,
+        semantic_enabled: searchConfig.semantic_enabled,
+        embedding_model: searchConfig.embedding_model,
+      }));
+      flash("library search settings saved");
+    } catch (e: any) { flash(`save failed: ${e.message}`, true); }
+  }
+
+  async function rebuildSearchIndex() {
+    setReindexing(true);
+    try {
+      await api("/library/reindex", { method: "POST" });
+      flash("search reindex queued — progress appears in Jobs");
+    } catch (e: any) { flash(`reindex failed: ${e.message}`, true); }
+    finally { setReindexing(false); }
+  }
+
+  async function saveBackup() {
+    if (!backupConfig) return;
+    try {
+      await api("/settings/backup", { method: "PUT", body: JSON.stringify({
+        retention: backupConfig.retention,
+        schedule_hours: backupConfig.schedule_hours,
+        include_media: backupConfig.include_media,
+      }) });
+      flash("backup policy saved");
+    } catch (e: any) { flash(`save failed: ${e.message}`, true); }
+  }
+
+  async function toggleJobNotifications() {
+    if (jobNotifications) {
+      localStorage.removeItem("synapse.jobNotifications");
+      setJobNotifications(false);
+      flash("completion notifications disabled");
+      return;
+    }
+    if (!("Notification" in window)) {
+      flash("this browser does not support desktop notifications", true);
+      return;
+    }
+    const permission = await Notification.requestPermission();
+    if (permission !== "granted") {
+      flash("notification permission was not granted", true);
+      return;
+    }
+    localStorage.setItem("synapse.jobNotifications", "on");
+    setJobNotifications(true);
+    flash("completion notifications enabled");
+  }
+
   async function savePrompt(name: string) {
     try {
       await api(`/settings/prompts/${name}`, {
         method: "PUT", body: JSON.stringify({ value: prompts[name].value }),
       });
-      api<Record<string, PromptInfo>>("/settings/prompts").then(setPrompts);
+      setPrompts(await api<Record<string, PromptInfo>>("/settings/prompts"));
       flash(`prompt saved: ${name}`);
     } catch (e: any) { flash(`save failed: ${e.message}`, true); }
   }
@@ -176,8 +319,10 @@ export default function Settings() {
           auto: cloud.auto,
         }),
       });
+      const refreshed = await api<CloudState>("/settings/cloud");
+      setCloud(refreshed);
+      setCloudEdit(refreshed.config);
       flash("cloud settings saved");
-      api<CloudState>("/settings/cloud").then((r) => { setCloud(r); setCloudEdit(r.config); });
     } catch (e: any) { flash(`save failed: ${e.message}`, true); }
   }
 
@@ -186,7 +331,7 @@ export default function Settings() {
       await api("/settings/cloud/sync", { method: "POST" });
       flash("full sync queued — watch the job ticker");
     } catch (e: any) {
-      alert(e.message);
+      flash(`sync failed: ${e.message}`, true);
     }
   }
 
@@ -197,21 +342,30 @@ export default function Settings() {
   async function renameTag(t: TagInfo) {
     const name = prompt(`Rename tag "${t.name}" to:`, t.name);
     if (!name || name === t.name) return;
-    await api(`/tags/${t.id}`, { method: "PUT", body: JSON.stringify({ name }) });
-    reloadTags();
+    try {
+      await api(`/tags/${t.id}`, { method: "PUT", body: JSON.stringify({ name }) });
+      await reloadTags();
+      flash("tag renamed");
+    } catch (e: any) { flash(`rename failed: ${e.message}`, true); }
   }
 
   async function deleteTag(t: TagInfo) {
     if (!confirm(`Delete tag "${t.name}" (used ${t.count}×)?`)) return;
-    await api(`/tags/${t.id}`, { method: "DELETE" });
-    reloadTags();
+    try {
+      await api(`/tags/${t.id}`, { method: "DELETE" });
+      await reloadTags();
+      flash("tag deleted");
+    } catch (e: any) { flash(`delete failed: ${e.message}`, true); }
   }
 
   async function addTag() {
     const name = prompt("New tag name:");
     if (!name) return;
-    await api("/tags", { method: "POST", body: JSON.stringify({ name }) });
-    reloadTags();
+    try {
+      await api("/tags", { method: "POST", body: JSON.stringify({ name }) });
+      await reloadTags();
+      flash("tag added");
+    } catch (e: any) { flash(`add failed: ${e.message}`, true); }
   }
 
   const setAdvValue = (group: string, key: string, value: any) =>
@@ -227,14 +381,13 @@ export default function Settings() {
     if (!newCat) return;
     try {
       await api("/quickrefs/categories", { method: "POST", body: JSON.stringify(newCat) });
+      setCatBanner(newCat.label);
+      setNewCat(null);
+      await reloadCats();
+      flash("category added");
     } catch (e: any) {
-      alert(e.message);
-      return;
+      flash(`category creation failed: ${e.message}`, true);
     }
-    setCatBanner(newCat.label);
-    setNewCat(null);
-    reloadCats();
-    flash("category added");
   }
 
   async function saveCategory(c: QuickRefCategory) {
@@ -246,7 +399,7 @@ export default function Settings() {
                                description: c.description, prompt: c.prompt }),
       });
     } catch (e: any) {
-      alert(e.message);
+      flash(`category save failed: ${e.message}`, true);
       return;
     }
     // show what the server actually stored (it trims whitespace)
@@ -258,24 +411,27 @@ export default function Settings() {
     if (!confirm(`Delete quick-ref category "${c.label}"?`)) return;
     try {
       await api(`/quickrefs/categories/${c.key}`, { method: "DELETE" });
+      await reloadCats();
+      flash("category deleted");
     } catch (e: any) {
-      alert(e.message);
-      return;
+      flash(`category delete failed: ${e.message}`, true);
     }
-    reloadCats();
-    flash("category deleted");
   }
 
   return (
     <div className="settings">
-      {saved && <div className={`flash ${savedError ? "flash-error" : ""}`}>{saved}</div>}
+      {saved && (
+        <div className={`flash ${savedError ? "flash-error" : ""}`}
+          role={savedError ? "alert" : "status"}>{saved}</div>
+      )}
 
       <h2>Model matrix</h2>
       <p className="meta">
         Which model runs each pipeline function. Providers: <b>ollama</b> = local
         (or a remote box via OLLAMA_BASE_URL), <b>anthropic</b>/<b>gemini</b> = frontier APIs.
-        ASR providers: <b>faster-whisper</b> (local CPU) or <b>gemini</b>. TTS providers:
-        <b> kokoro</b> (local) or <b>gemini</b>.
+        ASR providers: <b>faster-whisper</b> (local) or <b>gemini</b>. TTS providers:
+        <b> Piper</b>/<b>Kokoro</b> (local) or <b>gemini</b>. Each row only lists
+        providers that support that function.
       </p>
       <table className="list">
         <thead><tr><th>Function</th><th>Provider</th><th>Model</th></tr></thead>
@@ -288,22 +444,190 @@ export default function Settings() {
                   value={cfg.provider}
                   onChange={(e) => saveModel(fn, { ...cfg, provider: e.target.value })}
                 >
-                  {[...new Set([...providers, "faster-whisper", "kokoro", "piper", cfg.provider])].map((p) => (
+                  {[...new Set([...(providerOptions[fn] ?? providers), cfg.provider])].map((p) => (
                     <option key={p} value={p}>{p}</option>
                   ))}
                 </select>
               </td>
               <td>
                 <input
-                  defaultValue={cfg.model}
-                  onBlur={(e) => e.target.value !== cfg.model &&
-                    saveModel(fn, { ...cfg, model: e.target.value })}
+                  value={cfg.model}
+                  onChange={(e) => setFunctions((current) => ({
+                    ...current, [fn]: { ...cfg, model: e.target.value },
+                  }))}
+                  onBlur={(e) => void saveModel(fn, { ...cfg, model: e.target.value })}
                 />
               </td>
             </tr>
           ))}
         </tbody>
       </table>
+
+      <h2>Podcast voices</h2>
+      <p className="meta">
+        Assign the two podcast hosts for every supported speech engine. The active TTS
+        provider in the model matrix chooses which pair is used.
+      </p>
+      {voices && (
+        <div className="settings-grid voice-grid">
+          {(["piper", "kokoro", "gemini"] as const).map((engine) => (
+            <fieldset key={engine} className="card">
+              <legend>{engine}</legend>
+              {(["HOST_A", "HOST_B"] as const).map((host) => (
+                <label key={host}>{host === "HOST_A" ? "Host A" : "Host B"}
+                  <input value={voices[engine][host] ?? ""}
+                    onChange={(event) => setVoices((current) => current && ({
+                      ...current,
+                      [engine]: { ...current[engine], [host]: event.target.value },
+                    }))} />
+                </label>
+              ))}
+            </fieldset>
+          ))}
+          <div><button type="button" onClick={() => void saveVoices()}>Save voices</button></div>
+        </div>
+      )}
+
+      <h2>Pipeline profiles</h2>
+      <p className="meta">
+        Profiles let each project run only the outputs you need. Missing prerequisites are
+        included automatically, and completed outputs only run again when their inputs or
+        settings have changed.
+      </p>
+      <div className="profile-list">
+        {Object.entries(profiles).map(([key, profile]) => (
+          <article className="card profile-card" key={key}>
+            <h3>{profile.label} {profile.custom && <small>custom</small>}</h3>
+            <p>{profile.description}</p>
+            <p className="meta">{profile.steps.map((name) =>
+              steps.find((step) => step.name === name)?.label ?? name).join(" · ")}</p>
+            {profile.custom && (
+              <div className="row">
+                <button type="button" onClick={() => {
+                  setProfileDraft({
+                    key, label: profile.label, description: profile.description,
+                    steps: [...profile.steps],
+                  });
+                  setEditingProfileKey(key);
+                }}>Edit</button>
+                <button type="button" className="linkish danger"
+                  onClick={() => void deleteProfile(key)}>Delete</button>
+              </div>
+            )}
+          </article>
+        ))}
+      </div>
+      <details className="advanced" open={profileDraft.key !== ""}>
+        <summary>{editingProfileKey ? "Edit custom profile" : "Create a custom profile"}</summary>
+        <div className="knobs">
+          <label>Key
+            <input value={profileDraft.key} placeholder="weekly-review"
+              disabled={editingProfileKey !== null}
+              onChange={(event) => setProfileDraft({ ...profileDraft, key: event.target.value })} />
+          </label>
+          <label>Label
+            <input value={profileDraft.label} placeholder="Weekly review"
+              onChange={(event) => setProfileDraft({ ...profileDraft, label: event.target.value })} />
+          </label>
+          <label>Description
+            <input value={profileDraft.description}
+              onChange={(event) => setProfileDraft({ ...profileDraft, description: event.target.value })} />
+          </label>
+          <fieldset className="step-choices">
+            <legend>Outputs</legend>
+            {steps.map((step) => (
+              <label className="checkline" key={step.name}>
+                <input type="checkbox" checked={profileDraft.steps.includes(step.name)}
+                  onChange={(event) => setProfileDraft((current) => ({
+                    ...current,
+                    steps: event.target.checked
+                      ? [...current.steps, step.name]
+                      : current.steps.filter((name) => name !== step.name),
+                  }))} />
+                {step.label}
+              </label>
+            ))}
+          </fieldset>
+          <div className="row">
+            <button type="button" onClick={() => void saveProfile()}>Save profile</button>
+            {editingProfileKey && (
+              <button type="button" onClick={() => {
+                setEditingProfileKey(null);
+                setProfileDraft({ key: "", label: "", description: "", steps: [] });
+              }}>Cancel edit</button>
+            )}
+          </div>
+        </div>
+      </details>
+
+      <h2>Library intelligence</h2>
+      {searchConfig && (
+        <div className="knobs">
+          <label className="checkline">
+            <input type="checkbox" checked={searchConfig.semantic_enabled}
+              onChange={(event) => setSearchConfig({
+                ...searchConfig, semantic_enabled: event.target.checked,
+              })} />
+            blend semantic similarity with exact text search
+          </label>
+          <label>Ollama embedding model
+            <input value={searchConfig.embedding_model}
+              onChange={(event) => setSearchConfig({
+                ...searchConfig, embedding_model: event.target.value,
+              })} />
+          </label>
+          <div className="row">
+            <button type="button" onClick={() => void saveSearch()}>Save search settings</button>
+            <button type="button" onClick={() => void rebuildSearchIndex()} disabled={reindexing}>
+              {reindexing ? "Queuing…" : "Rebuild search index"}
+            </button>
+          </div>
+          <p className="meta">Semantic search remains optional; exact full-text search always works.</p>
+          {searchStatus && (
+            <p className="meta">
+              {searchStatus.chunks.toLocaleString()} retrieval chunks · {searchStatus.embeddings.toLocaleString()} embedded
+              {searchStatus.semantic_enabled && searchStatus.embeddings < searchStatus.chunks
+                ? " · rebuild pending or incomplete" : ""}
+            </p>
+          )}
+        </div>
+      )}
+
+      <h2>Backups</h2>
+      {backupConfig && (
+        <div className="knobs">
+          <label>Keep newest backups
+            <input type="number" min="1" max="100" value={backupConfig.retention}
+              onChange={(event) => setBackupConfig({
+                ...backupConfig, retention: Number(event.target.value),
+              })} />
+          </label>
+          <label>Automatic interval (hours; 0 disables)
+            <input type="number" min="0" max={24 * 30} value={backupConfig.schedule_hours}
+              onChange={(event) => setBackupConfig({
+                ...backupConfig, schedule_hours: Number(event.target.value),
+              })} />
+          </label>
+          <label className="checkline">
+            <input type="checkbox" checked={backupConfig.include_media}
+              onChange={(event) => setBackupConfig({
+                ...backupConfig, include_media: event.target.checked,
+              })} />
+            include archived source and generated audio
+          </label>
+          <button type="button" onClick={() => void saveBackup()}>Save backup policy</button>
+          <p className="meta">
+            Create, verify, and download snapshots from System. Set BACKUP_ENCRYPTION_KEY
+            before creating a backup if it must be encrypted at rest.
+          </p>
+        </div>
+      )}
+
+      <h2>Notifications</h2>
+      <p className="meta">Optionally show a desktop notification when a top-level job finishes.</p>
+      <button type="button" onClick={() => void toggleJobNotifications()}>
+        {jobNotifications ? "Disable completion notifications" : "Enable completion notifications"}
+      </button>
 
       <h2>Media downloads</h2>
       <p className="meta">
@@ -526,6 +850,11 @@ export default function Settings() {
               <input type="number" step="0.1" min="0.3" max="10"
                 value={adv.audio.trim_silence}
                 onChange={(e) => setAdvValue("audio", "trim_silence", Number(e.target.value))} />
+            </label>
+            <label className="checkline">
+              <input type="checkbox" checked={!!adv.audio.keep_intermediates}
+                onChange={(e) => setAdvValue("audio", "keep_intermediates", e.target.checked)} />
+              keep temporary synthesis files for debugging
             </label>
             <button onClick={() => saveAdvanced("audio")}>Save audio settings</button>
           </div>
