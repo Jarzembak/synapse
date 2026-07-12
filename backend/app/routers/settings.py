@@ -7,7 +7,9 @@ from sqlmodel import select, text
 from ..config import ADVANCED_DEFAULTS, FUNCTION_DEFAULTS, advanced
 from ..db import get_session
 from ..models import Job, Tag
-from ..settings_store import get_setting, set_setting
+from ..settings_store import (get_setting, set_setting,
+                              set_cloud_settings_if_no_pending_purge,
+                              set_settings_if_no_repository_jobs)
 from ..tasks.prompts import DEFAULTS as PROMPT_DEFAULTS, PROMPT_LABELS
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
@@ -18,6 +20,13 @@ FUNCTION_PROVIDERS = {
     "asr": ["faster-whisper", "gemini"],
     "tts": ["piper", "kokoro", "gemini"],
 }
+
+
+def _set_repository_sensitive(values: dict[str, object]) -> None:
+    try:
+        set_settings_if_no_repository_jobs(values)
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
 
 
 @router.get("/models")
@@ -47,7 +56,8 @@ def set_model(function: str, req: ModelOverride):
                  f"choose from {', '.join(FUNCTION_PROVIDERS[function])}")
     if not model:
         raise HTTPException(400, "model cannot be blank")
-    set_setting(f"model.{function}", {"provider": provider, "model": model})
+    _set_repository_sensitive({
+        f"model.{function}": {"provider": provider, "model": model}})
     return {"ok": True}
 
 
@@ -83,12 +93,15 @@ class Voices(BaseModel):
 
 @router.put("/voices")
 def set_voices(req: Voices):
+    updates = {}
     if req.kokoro:
-        set_setting("tts.voices", req.kokoro)
+        updates["tts.voices"] = req.kokoro
     if req.piper:
-        set_setting("tts.piper_voices", req.piper)
+        updates["tts.piper_voices"] = req.piper
     if req.gemini:
-        set_setting("tts.gemini_voices", req.gemini)
+        updates["tts.gemini_voices"] = req.gemini
+    if updates:
+        _set_repository_sensitive(updates)
     return {"ok": True}
 
 
@@ -133,9 +146,9 @@ def set_prompt(name: str, req: PromptOverride):
     if name not in PROMPT_DEFAULTS:
         raise HTTPException(400, f"unknown prompt {name!r}")
     if req.value.strip() and req.value.strip() != PROMPT_DEFAULTS[name].strip():
-        set_setting(f"prompt.{name}", req.value)
+        _set_repository_sensitive({f"prompt.{name}": req.value})
     else:
-        set_setting(f"prompt.{name}", None)
+        _set_repository_sensitive({f"prompt.{name}": None})
     return {"ok": True}
 
 
@@ -143,7 +156,7 @@ def set_prompt(name: str, req: PromptOverride):
 def reset_prompt(name: str):
     if name not in PROMPT_DEFAULTS:
         raise HTTPException(400, f"unknown prompt {name!r}")
-    set_setting(f"prompt.{name}", None)
+    _set_repository_sensitive({f"prompt.{name}": None})
     return {"ok": True, "default": PROMPT_DEFAULTS[name]}
 
 
@@ -164,7 +177,7 @@ def set_params(function: str, req: Params):
     if function not in FUNCTION_DEFAULTS:
         raise HTTPException(400, f"unknown function {function!r}")
     payload = {k: v for k, v in req.model_dump().items() if v is not None}
-    set_setting(f"params.{function}", payload or None)
+    _set_repository_sensitive({f"params.{function}": payload or None})
     return {"ok": True}
 
 
@@ -227,7 +240,7 @@ def set_advanced(group: str, req: AdvancedGroup):
     if group not in ADVANCED_DEFAULTS:
         raise HTTPException(400, f"unknown group {group!r}")
     values = _validated_advanced(group, req.values)
-    set_setting(f"advanced.{group}", values or None)
+    _set_repository_sensitive({f"advanced.{group}": values or None})
     return {"ok": True}
 
 
@@ -301,8 +314,10 @@ def save_search_settings(req: SearchConfig):
     model = req.embedding_model.strip()
     if req.semantic_enabled and not model:
         raise HTTPException(422, "an embedding model is required")
-    set_setting("search.semantic_enabled", req.semantic_enabled)
-    set_setting("search.embedding_model", model or "nomic-embed-text")
+    _set_repository_sensitive({
+        "search.semantic_enabled": req.semantic_enabled,
+        "search.embedding_model": model or "nomic-embed-text",
+    })
     return {"ok": True, **req.model_dump()}
 
 
@@ -310,6 +325,7 @@ class BackupConfig(BaseModel):
     retention: int = Field(default=5, ge=1, le=100)
     schedule_hours: int = Field(default=0, ge=0, le=24 * 30)
     include_media: bool = True
+    include_repositories: bool = False
 
 
 @router.get("/backup")
@@ -318,6 +334,7 @@ def get_backup_settings():
         "retention": get_setting("backup.retention", 5),
         "schedule_hours": get_setting("backup.schedule_hours", 0),
         "include_media": get_setting("backup.include_media", True),
+        "include_repositories": get_setting("backup.include_repositories", False),
         "last": get_setting("backup.last"),
     }
 
@@ -374,10 +391,18 @@ def set_cloud(req: CloudConfig):
         if secret and incoming in ("", "•set•"):
             continue  # keep the stored secret unless a new one is supplied
         merged[field] = incoming
-    set_setting("cloud.provider", req.provider or None)
-    set_setting("cloud.config", merged or None)
-    set_setting("cloud.remote_base", req.remote_base)
-    set_setting("cloud.auto", req.auto)
+    try:
+        set_cloud_settings_if_no_pending_purge({
+            "cloud.provider": req.provider or None,
+            "cloud.config": merged or None,
+            "cloud.remote_base": req.remote_base,
+            "cloud.auto": req.auto,
+        })
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    from ..tasks.cloud import enqueue_pending_privacy_purges
+
+    enqueue_pending_privacy_purges()
     return {"ok": True}
 
 
@@ -474,6 +499,8 @@ def rename_tag(tag_id: int, req: TagRename):
         new_name = library.make_slug(req.name)
         existing = session.exec(select(Tag).where(Tag.name == new_name)).first()
         if existing and existing.id != tag_id:
+            existing.restricted = bool(existing.restricted or tag.restricted)
+            session.add(existing)
             session.exec(text(
                 "UPDATE OR IGNORE artifacttag SET tag_id = :new WHERE tag_id = :old"
             ).bindparams(new=existing.id, old=tag_id))

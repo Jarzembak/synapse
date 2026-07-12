@@ -1,6 +1,7 @@
 """Integration tests through the FastAPI app: library writes, FTS search, tags."""
 import pytest
 from fastapi.testclient import TestClient
+from sqlmodel import select
 
 from app.main import app
 from app.db import get_session
@@ -1158,6 +1159,32 @@ def test_transitive_dependents():
     assert hard_downstream == set()
 
 
+def test_mindmap_graph_discards_model_urls_and_arbitrary_fields():
+    from app.tasks.generate import _sanitize_mindmap_graph
+
+    graph = _sanitize_mindmap_graph({
+        "nodes": [{
+            "id": "Root Node", "label": "Root", "kind": "repository",
+            "summary": "Overview", "url": "javascript:alert(1)",
+            "path": "src/main.py", "style": {"background": "url(evil)"},
+        }, {
+            "id": "child", "label": "Child", "kind": "module",
+        }],
+        "edges": [{
+            "source": "Root Node", "target": "child", "label": "contains",
+            "url": "javascript:alert(2)",
+        }],
+    })
+    assert graph == {
+        "nodes": [
+            {"id": "root-node", "label": "Root", "kind": "repository",
+             "summary": "Overview"},
+            {"id": "child", "label": "Child", "kind": "module",
+             "summary": ""},
+        ],
+        "edges": [{"source": "root-node", "target": "child",
+                   "label": "contains"}],
+    }
 def test_dep_satisfied_blocks_failed_selected_run_dependencies():
     from app.tasks.orchestrate import dep_satisfied
 
@@ -1249,6 +1276,11 @@ def test_run_all_queues_and_chains(client, monkeypatch):
     assert sent == [("run_all", [a.json()["id"], p1]),
                     ("run_all", [b.json()["id"], p2])]
     assert client.get("/api/jobs", params={"project_id": p2}).json()[0]["status"] == "running"
+    with get_session() as session:
+        running = session.get(Job, b.json()["id"])
+        running.status = "done"
+        session.add(running)
+        session.commit()
 
 
 def test_cancel_job(client, monkeypatch):
@@ -1281,6 +1313,13 @@ def test_jobs_list_enriched(client, monkeypatch):
     jobs = client.get("/api/jobs", params={"project_id": pid}).json()
     assert jobs[0]["task_label"] == "Run all steps"
     assert jobs[0]["project_title"] == "Enrich demo"
+    with get_session() as session:
+        for job in session.exec(select(Job).where(
+                Job.project_id == pid,
+                Job.status.in_(("queued", "running")))).all():
+            job.status = "done"
+            session.add(job)
+        session.commit()
 
 
 def test_model_override(client):

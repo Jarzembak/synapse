@@ -24,6 +24,8 @@ def _serialize_ref(session, ref: QuickRef) -> dict:
         "sources": [{"id": p.id, "title": p.title} for p in sources],
         "tags": library.current_tags(session, art.id) if art else [],
         "updated": art.updated.isoformat() if art else None,
+        # Missing policy metadata fails closed in the renderer.
+        "restricted": library.artifact_is_restricted(session, art) if art else True,
     }
 
 
@@ -88,7 +90,10 @@ def create_category(req: CategoryCreate):
     cat = {"key": key, "label": label, "plural": plural,
            "icon": req.icon.strip() or "📄", "dir": cat_dir,
            "description": req.description.strip(), "prompt": req.prompt.strip()}
-    categories.save_custom_categories(categories.custom_categories() + [cat])
+    try:
+        categories.save_custom_categories(categories.custom_categories() + [cat])
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
     return {**cat, "builtin": False, "count": 0}
 
 
@@ -110,7 +115,10 @@ def update_category(key: str, req: CategoryUpdate):
         if not value.strip():
             raise HTTPException(400, f"{field} cannot be blank")
         cat[field] = value.strip()
-    categories.save_custom_categories(custom)
+    try:
+        categories.save_custom_categories(custom)
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
     return cat
 
 
@@ -126,7 +134,10 @@ def delete_category(key: str):
     if used:
         raise HTTPException(409, f"{used} quick-ref(s) still use this category — "
                                  "delete those docs first")
-    categories.save_custom_categories([c for c in custom if c["key"] != key])
+    try:
+        categories.save_custom_categories([c for c in custom if c["key"] != key])
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
     return {"ok": True}
 
 

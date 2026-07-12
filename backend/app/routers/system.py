@@ -20,7 +20,7 @@ from sse_starlette.sse import EventSourceResponse
 
 from ..config import settings
 from ..db import get_session
-from ..models import Job, LLMCall
+from ..models import Job, LLMCall, Project
 from ..tasks.celery_app import celery
 from sqlmodel import select, text
 
@@ -125,6 +125,7 @@ def _snapshot(cpu_interval: float | None = None) -> dict:
 
 def _preflight() -> dict:
     checks: list[dict] = []
+    repository_projects_exist = False
 
     def add(name: str, ok: bool, detail: str, required: bool = True):
         checks.append({"name": name, "ok": ok, "detail": detail, "required": required})
@@ -132,6 +133,9 @@ def _preflight() -> dict:
     try:
         with get_session() as session:
             session.exec(text("SELECT 1")).one()
+            repository_projects_exist = bool(session.exec(select(Project.id).where(
+                Project.source_type == "github"
+            )).first())
         add("database", True, "SQLite is writable and reachable")
     except Exception as exc:
         add("database", False, str(exc))
@@ -161,8 +165,28 @@ def _preflight() -> dict:
         add("embedding model", any(name == embed or name.startswith(embed + ":") for name in models),
             f"{embed} {'is installed' if any(name == embed or name.startswith(embed + ':') for name in models) else 'must be pulled'}",
             required=False)
+        from ..repository import repository_local_model
+
+        try:
+            repo_model = repository_local_model()
+            repo_model_installed = any(
+                name == repo_model or name.startswith(repo_model + ":")
+                for name in models)
+            add(
+                "repository model",
+                repo_model_installed,
+                f"{repo_model} "
+                f"{'is installed' if repo_model_installed else 'must be pulled before repository analysis'}",
+                required=repository_projects_exist,
+            )
+        except ValueError as exc:
+            add(
+                "repository model", False, str(exc),
+                required=repository_projects_exist)
     except Exception as exc:
         add("ollama", False, str(exc), required=False)
+        if repository_projects_exist:
+            add("repository model", False, "Ollama is unreachable", required=True)
     add("Anthropic key", bool(settings.anthropic_api_key),
         "configured" if settings.anthropic_api_key else "not configured", required=False)
     add("Gemini key", bool(settings.gemini_api_key),

@@ -34,12 +34,17 @@ def backups():
 
 class BackupRequest(BaseModel):
     include_media: bool | None = None
+    include_repositories: bool | None = None
 
 
 @router.post("")
 def start_backup(req: BackupRequest):
     include_media = (bool(get_setting("backup.include_media", True))
                      if req.include_media is None else req.include_media)
+    include_repositories = (
+        bool(get_setting("backup.include_repositories", False))
+        if req.include_repositories is None else req.include_repositories
+    )
     with get_session() as session:
         active = session.exec(
             select(Job).where(Job.task == "create_backup",
@@ -47,12 +52,20 @@ def start_backup(req: BackupRequest):
         ).first()
         if active:
             raise HTTPException(409, "a backup is already active")
+        processing = session.exec(select(Job).where(
+            Job.status.in_(("queued", "running")),
+            Job.task != "create_backup",
+        )).first()
+        if processing:
+            raise HTTPException(
+                409, "wait for active processing jobs to finish before creating a backup")
         job = Job(task="create_backup")
         session.add(job)
         session.commit()
         session.refresh(job)
         try:
-            result = celery.send_task("create_backup", args=[job.id, include_media])
+            result = celery.send_task(
+                "create_backup", args=[job.id, include_media, include_repositories])
             job.celery_id = result.id
             session.add(job)
             session.commit()

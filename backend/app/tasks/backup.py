@@ -12,13 +12,17 @@ from .common import set_job, transition_job
 
 
 @celery.task(name="create_backup")
-def backup_task(job_id: int, include_media: bool = True):
+def backup_task(job_id: int, include_media: bool = True,
+                include_repositories: bool = False):
     with get_session() as session:
         if not transition_job(session, job_id, {"queued"}, "running",
                               progress="snapshotting database and vault"):
             return
     try:
-        path = create_backup(include_media=include_media)
+        path = create_backup(
+            include_media=include_media,
+            include_repositories=include_repositories,
+        )
         set_setting("backup.last", {
             "status": "ok", "path": path.name,
             "at": datetime.now(timezone.utc).isoformat(),
@@ -53,7 +57,7 @@ def scheduled_backup_check():
         return
     with get_session() as session:
         if session.exec(select(Job).where(
-            Job.task == "create_backup", Job.status.in_(("queued", "running"))
+            Job.status.in_(("queued", "running"))
         )).first():
             return
         job = Job(task="create_backup")
@@ -63,7 +67,11 @@ def scheduled_backup_check():
         try:
             result = celery.send_task(
                 "create_backup",
-                args=[job.id, bool(get_setting("backup.include_media", True))],
+                args=[
+                    job.id,
+                    bool(get_setting("backup.include_media", True)),
+                    bool(get_setting("backup.include_repositories", False)),
+                ],
             )
             job.celery_id = result.id
             session.add(job)

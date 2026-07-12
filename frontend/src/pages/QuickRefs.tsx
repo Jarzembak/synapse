@@ -13,6 +13,7 @@ interface Ref {
   sources: { id: number; title: string }[];
   tags: string[];
   updated: string | null;
+  restricted: boolean;
 }
 
 interface RefDetail {
@@ -22,6 +23,18 @@ interface RefDetail {
 }
 
 const FALLBACK_META = { label: "", plural: "", icon: "📄" };
+
+function safeRestrictedImageSource(src: string | undefined): boolean {
+  if (!src) return true;
+  if (!src.startsWith("/") || src.startsWith("//") || /[\\\u0000-\u001f\u007f]/.test(src)) {
+    return false;
+  }
+  try {
+    return new URL(src, window.location.origin).origin === window.location.origin;
+  } catch {
+    return false;
+  }
+}
 
 export default function QuickRefs() {
   const [refs, setRefs] = useState<Ref[]>([]);
@@ -225,7 +238,18 @@ export default function QuickRefs() {
             </div>
           )}
           <article className="markdown">
-            <ReactMarkdown remarkPlugins={[remarkGfm]}>
+            <ReactMarkdown
+              remarkPlugins={[remarkGfm]}
+              components={{
+                img: ({ node: _node, src, alt, ...props }) => {
+                  const local = safeRestrictedImageSource(src);
+                  if (open.ref.restricted && !local) {
+                    return <span className="notice">External image omitted for local-only safety{alt ? `: ${alt}` : ""}</span>;
+                  }
+                  return <img {...props} src={src} alt={alt ?? ""} />;
+                },
+              }}
+            >
               {versionBody ? versionBody.body : open.body}
             </ReactMarkdown>
           </article>
