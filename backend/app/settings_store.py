@@ -8,10 +8,53 @@ Keys in use:
 from __future__ import annotations
 
 import json
+import base64
+import hashlib
 
+from cryptography.fernet import Fernet, InvalidToken
 from sqlmodel import select
 
 from .models import Setting
+
+SECRET_KEYS = {"cloud.config"}
+
+
+def _fernet() -> Fernet:
+    from .config import settings
+
+    if settings.settings_encryption_key:
+        key = base64.urlsafe_b64encode(
+            hashlib.sha256(settings.settings_encryption_key.encode("utf-8")).digest())
+        return Fernet(key)
+    path = settings.db_path.parent / ".settings.key"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        generated = Fernet.generate_key()
+        try:
+            with path.open("xb") as handle:
+                handle.write(generated)
+            path.chmod(0o600)
+        except FileExistsError:
+            pass
+    return Fernet(path.read_bytes().strip())
+
+
+def _loads(key: str, raw: str):
+    if key in SECRET_KEYS and raw.startswith("enc:"):
+        try:
+            raw = _fernet().decrypt(raw[4:].encode("ascii")).decode("utf-8")
+        except InvalidToken as exc:
+            raise RuntimeError(
+                f"encrypted setting {key!r} cannot be decrypted; check SETTINGS_ENCRYPTION_KEY"
+            ) from exc
+    return json.loads(raw)
+
+
+def _dumps(key: str, value) -> str:
+    raw = json.dumps(value)
+    if key in SECRET_KEYS and value is not None:
+        return "enc:" + _fernet().encrypt(raw.encode("utf-8")).decode("ascii")
+    return raw
 
 
 def get_setting(key: str, default=None):
@@ -21,7 +64,7 @@ def get_setting(key: str, default=None):
         row = session.get(Setting, key)
         if row is None or row.value == "":
             return default
-        return json.loads(row.value)
+        return _loads(key, row.value)
 
 
 def set_setting(key: str, value) -> None:
@@ -29,7 +72,7 @@ def set_setting(key: str, value) -> None:
 
     with get_session() as session:
         row = session.get(Setting, key) or Setting(key=key)
-        row.value = json.dumps(value)
+        row.value = _dumps(key, value)
         session.add(row)
         session.commit()
 
@@ -39,7 +82,7 @@ def all_settings() -> dict:
 
     with get_session() as session:
         rows = session.exec(select(Setting)).all()
-        return {r.key: json.loads(r.value) for r in rows if r.value}
+        return {r.key: _loads(r.key, r.value) for r in rows if r.value}
 
 
 def delete_settings_prefix(prefix: str) -> None:

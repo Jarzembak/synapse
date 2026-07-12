@@ -3,9 +3,14 @@ data/
 __pycache__/
 *.pyc
 .pytest_cache/
+.coverage
+htmlcov/
+.ruff_cache/
+.venv/
 backend/tests/_lib/
 backend/tests/_media/
 backend/tests/_db/
 backend/tests/_logs/
 node_modules/
 frontend/dist/
+npm-debug.log*

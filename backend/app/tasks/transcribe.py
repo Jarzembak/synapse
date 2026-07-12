@@ -68,6 +68,7 @@ def fetch_site_captions(url: str, project_slug: str) -> str | None:
         "outtmpl": str(wd / "captions.%(ext)s"),
         "quiet": True,
         "noplaylist": True,  # captions for the submitted video only
+        "socket_timeout": 30,
     }
     ck = cookies_path(project_slug)
     if ck.exists():
@@ -160,20 +161,36 @@ def whisper_transcribe(audio: Path, on_progress) -> str:
 
 
 def gemini_transcribe(audio: Path) -> str:
+    import logging
+
     from google import genai
 
     client = genai.Client(api_key=settings.gemini_api_key)
-    uploaded = client.files.upload(file=str(audio))
-    _, model_name = llm.resolve_model("deepdive_gemini")
-    resp = client.models.generate_content(
-        model=model_name,
-        contents=[
-            "Transcribe this audio verbatim. Prefix each paragraph with its "
-            "start timestamp as [HH:MM:SS]. Output only the transcript.",
-            uploaded,
-        ],
-    )
-    return resp.text or ""
+    _, model_name = llm.resolve_model("asr")
+    uploaded = None
+    try:
+        uploaded = client.files.upload(file=str(audio))
+        resp = client.models.generate_content(
+            model=model_name,
+            contents=[
+                "Transcribe this audio verbatim. Prefix each paragraph with its "
+                "start timestamp as [HH:MM:SS]. Output only the transcript.",
+                uploaded,
+            ],
+        )
+        return resp.text or ""
+    finally:
+        # Gemini file uploads persist independently of the generation request.
+        # Always remove this temporary server-side copy, including when model
+        # generation raises; cleanup failure must not hide the real result.
+        if uploaded is not None:
+            try:
+                client.files.delete(name=uploaded.name)
+            except Exception as e:
+                logging.getLogger(__name__).warning(
+                    "could not delete Gemini ASR upload %s: %s",
+                    getattr(uploaded, "name", "<unknown>"), e,
+                )
 
 
 @celery.task(name="transcribe")

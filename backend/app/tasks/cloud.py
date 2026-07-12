@@ -15,9 +15,10 @@ For the OAuth providers the user pastes the token JSON produced by running
 """
 from __future__ import annotations
 
-import json
 import logging
+import os
 import subprocess
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -90,7 +91,27 @@ def _conf_path() -> Path:
     if provider == "webdav" and cfg.get("password"):
         cfg["_obscured_password"] = obscure(cfg["password"])
     path = settings.db_path.parent / "rclone.conf"
-    path.write_text(build_config(provider, cfg), encoding="utf-8")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="\n",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            tmp = Path(handle.name)
+            handle.write(build_config(provider, cfg))
+            handle.flush()
+            os.fsync(handle.fileno())
+        tmp.chmod(0o600)
+        os.replace(tmp, path)
+    finally:
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
     path.chmod(0o600)
     return path
 
@@ -125,8 +146,18 @@ def _record(status: str, detail: str) -> None:
 @celery.task(name="cloud_sync_paths")
 def sync_paths(paths: list[str]):
     """Upload individual artifact files (library-relative or 'media:' paths)."""
+    uploaded = 0
+    skipped = 0
+    seen: set[str] = set()
     try:
         for p in paths:
+            # A retried/duplicated enqueue can contain the same sidecar or media
+            # path more than once.  copyto targets a stable exact destination;
+            # de-duplicating here avoids redundant uploads within this attempt.
+            if p in seen:
+                skipped += 1
+                continue
+            seen.add(p)
             if p.startswith("media:"):
                 rel = p.removeprefix("media:")
                 src = settings.media_dir / rel
@@ -134,12 +165,19 @@ def sync_paths(paths: list[str]):
             else:
                 src = settings.library_dir / p
                 dest = _dest(f"library/{p}")
-            if src.exists():
-                _rclone(["copyto", str(src), dest])
-        _record("ok", f"synced {len(paths)} file(s)")
-        log.info("cloud sync: uploaded %d file(s)", len(paths))
+            if not src.is_file():
+                skipped += 1
+                continue
+            _rclone(["copyto", str(src), dest])
+            uploaded += 1
+        detail = f"uploaded {uploaded} file(s); skipped {skipped} file(s)"
+        _record("ok", detail)
+        log.info("cloud sync: %s", detail)
+        return {"uploaded": uploaded, "skipped": skipped}
     except Exception as e:
-        _record("error", str(e)[:500])
+        detail = (f"uploaded {uploaded} file(s); skipped {skipped} file(s); "
+                  f"error: {e}")
+        _record("error", detail[:500])
         log.error("cloud sync failed for %s: %s", paths, e)
         raise
 

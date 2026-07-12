@@ -12,7 +12,7 @@ setup_logging()
 from .config import SEED_TAGS, settings  # noqa: E402
 from .db import get_session, init_db  # noqa: E402
 from .models import Tag  # noqa: E402
-from .routers import artifacts, jobs, logs, projects, quickrefs, system  # noqa: E402
+from .routers import artifacts, backup, jobs, logs, projects, quickrefs, recovery, search, system  # noqa: E402
 from .routers.settings import router as settings_router, tags_router  # noqa: E402
 
 
@@ -21,6 +21,9 @@ async def lifespan(app: FastAPI):
     settings.library_dir.mkdir(parents=True, exist_ok=True)
     settings.media_dir.mkdir(parents=True, exist_ok=True)
     init_db()
+    from .recovery import recover_interrupted_deletions
+
+    recover_interrupted_deletions()
     with get_session() as session:
         if not session.exec(select(Tag)).first():
             for name, kind in SEED_TAGS:
@@ -34,6 +37,9 @@ app.include_router(projects.router)
 app.include_router(jobs.router)
 app.include_router(artifacts.router)
 app.include_router(quickrefs.router)
+app.include_router(search.router)
+app.include_router(recovery.router)
+app.include_router(backup.router)
 app.include_router(settings_router)
 app.include_router(tags_router)
 app.include_router(logs.router)

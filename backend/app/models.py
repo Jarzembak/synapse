@@ -14,8 +14,9 @@ class Project(SQLModel, table=True):
     slug: str = Field(index=True, unique=True)
     title: str
     source: str  # URL or media-relative path
-    source_type: str  # "url" | "local"
+    source_type: str  # "url" | "local" | "upload"
     status: str = "new"
+    deleting: bool = Field(default=False, index=True)
     created: datetime = Field(default_factory=utcnow)
 
 
@@ -33,6 +34,9 @@ class Artifact(SQLModel, table=True):
     media_path: str | None = None
     provider: str | None = None
     model: str | None = None
+    input_hash: str = ""
+    config_hash: str = ""
+    provenance: str = "{}"  # JSON: upstream/config/source details
     created: datetime = Field(default_factory=utcnow)
     updated: datetime = Field(default_factory=utcnow)
 
@@ -66,12 +70,54 @@ class Job(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
     project_id: int | None = Field(default=None, foreign_key="project.id", index=True)
     task: str
-    status: str = "queued"  # queued | running | done | error
+    status: str = "queued"  # queued | running | done | error | canceled
     progress: str = ""
     error: str = ""
     celery_id: str = ""
+    parent_job_id: int | None = Field(default=None, index=True)
+    options: str = "{}"  # JSON run options (profile / explicit step set)
+    started: datetime | None = None
+    finished: datetime | None = None
+    heartbeat: datetime | None = None
     created: datetime = Field(default_factory=utcnow)
     updated: datetime = Field(default_factory=utcnow)
+
+
+class SearchChunk(SQLModel, table=True):
+    """Retrievable excerpt used by FTS, semantic search, and grounded Q&A."""
+
+    id: int | None = Field(default=None, primary_key=True)
+    artifact_id: int = Field(foreign_key="artifact.id", index=True)
+    chunk_index: int
+    body: str
+    start_time: str = ""
+    body_hash: str = Field(index=True)
+
+
+class ChunkEmbedding(SQLModel, table=True):
+    """Provider-neutral float32 vector for one SearchChunk."""
+
+    chunk_id: int = Field(foreign_key="searchchunk.id", primary_key=True)
+    model: str = Field(primary_key=True)
+    dimensions: int
+    vector: bytes
+    body_hash: str = Field(index=True)
+
+
+class LLMCall(SQLModel, table=True):
+    id: int | None = Field(default=None, primary_key=True)
+    job_id: int | None = Field(default=None, index=True)
+    function: str = Field(index=True)
+    provider: str = Field(index=True)
+    model: str = Field(index=True)
+    input_chars: int = 0
+    output_chars: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    duration_seconds: float = 0
+    status: str = "ok"
+    error: str = ""
+    created: datetime = Field(default_factory=utcnow, index=True)
 
 
 class Setting(SQLModel, table=True):

@@ -79,6 +79,64 @@ def test_artifact_view_and_tag_edit(client):
     assert sorted(meta["tags"]) == ["ansible", "linux"]
 
 
+def test_tag_replace_rolls_back_when_frontmatter_write_fails(client, monkeypatch):
+    """A disk failure must not publish a half-replaced DB tag set."""
+    from app.models import Artifact
+
+    aid = seed_artifact("Tag rollback target", "some body", tags=["original-tag"])
+
+    def fail_write(*_args, **_kwargs):
+        raise OSError("disk unavailable")
+
+    with get_session() as session:
+        art = session.get(Artifact, aid)
+        monkeypatch.setattr(library, "_write_doc", fail_write)
+        with pytest.raises(OSError, match="disk unavailable"):
+            library.apply_tags(session, art, ["replacement-tag"])
+
+    with get_session() as session:
+        assert library.current_tags(session, aid) == ["original-tag"]
+    meta, _ = library.read_doc(
+        f"projects/demo/{library.make_slug('Tag rollback target')}.md")
+    assert meta["tags"] == ["original-tag"]
+
+
+def test_artifact_write_failure_does_not_publish_db_row(client, monkeypatch):
+    """A failed Markdown write must roll back the flushed Artifact row."""
+    from sqlmodel import select
+
+    from app.models import Artifact
+
+    project = client.post("/api/projects", json={
+        "source": "https://example.com/atomic-failure",
+        "source_type": "url",
+        "title": "Atomic failure",
+    }).json()
+    rel_path = f"projects/{project['slug']}/failed.md"
+    monkeypatch.setattr(
+        library, "_write_doc",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("disk full")),
+    )
+
+    with get_session() as session:
+        with pytest.raises(OSError, match="disk full"):
+            library.write_artifact(
+                session,
+                project_id=project["id"],
+                project_slug=project["slug"],
+                type="summary",
+                title="Failed artifact",
+                body="never published",
+                rel_path=rel_path,
+            )
+
+    with get_session() as session:
+        assert session.exec(
+            select(Artifact).where(Artifact.path == rel_path)
+        ).first() is None
+    assert not library.lib_path(rel_path).exists()
+
+
 def test_tag_rename_propagates(client):
     aid = seed_artifact("Rename target", "body", tags=["oldname"])
     tag = next(t for t in client.get("/api/tags").json() if t["name"] == "oldname")
@@ -253,6 +311,65 @@ def test_quickref_concept_kind(client):
     hit = next(r for r in refs if r["slug"] == "least-privilege")
     assert hit["tags"] == ["hardening"]
     assert hit["updated"] is not None
+
+
+def test_quickref_version_name_must_belong_to_requested_ref(client):
+    """A sibling doc's valid history basename cannot be read or reverted."""
+    from pathlib import Path
+
+    from app.models import QuickRef
+
+    target_path = "tools/history-guard-target.md"
+    sibling_path = "tools/history-guard-sibling.md"
+    library._write_doc(target_path, {"title": "History target"}, "target current")
+    target_snapshot = library.snapshot_history(target_path)
+    assert target_snapshot
+    library._write_doc(target_path, {"title": "History target"}, "target newer")
+    library._write_doc(sibling_path, {"title": "History sibling"}, "sibling secret")
+    sibling_snapshot = library.snapshot_history(sibling_path)
+    assert sibling_snapshot
+
+    with get_session() as session:
+        target = QuickRef(
+            kind="tool", slug="history-guard-target", title="History target",
+            path=target_path, aliases="[]",
+        )
+        sibling = QuickRef(
+            kind="tool", slug="history-guard-sibling", title="History sibling",
+            path=sibling_path, aliases="[]",
+        )
+        session.add(target)
+        session.add(sibling)
+        session.commit()
+        session.refresh(target)
+        target_id = target.id
+
+    target_name = Path(target_snapshot).name
+    valid = client.get(f"/api/quickrefs/{target_id}/versions/{target_name}")
+    assert valid.status_code == 200 and "target current" in valid.json()["body"]
+    assert client.post(
+        f"/api/quickrefs/{target_id}/revert/{target_name}"
+    ).status_code == 200
+    preserved = client.get(f"/api/quickrefs/{target_id}/versions/{target_name}")
+    assert preserved.status_code == 200
+    assert "target current" in preserved.json()["body"]
+    # History is also a recovery path when the user deleted the live vault file.
+    library.lib_path(target_path).unlink()
+    assert client.post(
+        f"/api/quickrefs/{target_id}/revert/{target_name}"
+    ).status_code == 200
+    _, restored_body = library.read_doc(target_path)
+    assert restored_body == "target current"
+
+    sibling_name = Path(sibling_snapshot).name
+    assert client.get(
+        f"/api/quickrefs/{target_id}/versions/{sibling_name}"
+    ).status_code == 404
+    assert client.post(
+        f"/api/quickrefs/{target_id}/revert/{sibling_name}"
+    ).status_code == 404
+    _, body = library.read_doc(target_path)
+    assert body == "target current"
 
 
 def test_quickref_categories_builtins(client):
@@ -1041,11 +1158,11 @@ def test_transitive_dependents():
     assert hard_downstream == set()
 
 
-def test_dep_satisfied_soft_vs_hard_failures():
+def test_dep_satisfied_blocks_failed_selected_run_dependencies():
     from app.tasks.orchestrate import dep_satisfied
 
-    # correct failed → summarize (soft dep on correct) may still launch
-    assert dep_satisfied("summarize", "correct",
+    # Selected-run ordering is strict: summary must not consume stale corrected output.
+    assert not dep_satisfied("summarize", "correct",
                          done=set(), pending=set(), running=set(), failed={"correct"})
     # merge hard-requires the deep dives → a failed one blocks it
     assert not dep_satisfied("merge", "deepdive_claude",

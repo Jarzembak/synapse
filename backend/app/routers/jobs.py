@@ -10,7 +10,8 @@ from sqlmodel import select
 from ..db import get_session
 from ..models import Job, Project
 from ..tasks.celery_app import celery
-from ..tasks.orchestrate import STEP_LABELS
+from ..tasks.common import transition_job
+from ..tasks.orchestrate import STEP_LABELS, cancel_children, maybe_start_next_run_all
 
 router = APIRouter(prefix="/api/jobs", tags=["jobs"])
 
@@ -33,6 +34,10 @@ def _serialize(job: Job, titles: dict[int, str]) -> dict:
         "status": job.status, "progress": job.progress, "error": job.error,
         "created": job.created.isoformat(),
         "updated": job.updated.isoformat(),
+        "started": job.started.isoformat() if job.started else None,
+        "finished": job.finished.isoformat() if job.finished else None,
+        "parent_job_id": job.parent_job_id,
+        "connected": True,
     }
 
 
@@ -40,7 +45,7 @@ def _serialize(job: Job, titles: dict[int, str]) -> dict:
 def list_jobs(project_id: int | None = None, limit: int = 100):
     with get_session() as session:
         titles = _project_titles(session)
-        q = select(Job).order_by(Job.created.desc()).limit(limit)
+        q = select(Job).order_by(Job.created.desc()).limit(max(1, min(limit, 1000)))
         if project_id is not None:
             q = q.where(Job.project_id == project_id)
         return [_serialize(j, titles) for j in session.exec(q).all()]
@@ -54,8 +59,6 @@ def continue_queue():
     event-driven — if the worker restarts mid-run (crash, redeploy, reboot) the
     chain breaks and queued jobs wait forever. This kicks the next one; it's a
     no-op if one is already running or nothing is queued."""
-    from ..tasks.orchestrate import maybe_start_next_run_all
-
     with get_session() as session:
         running = session.exec(
             select(Job).where(Job.task == "run_all", Job.status == "running")
@@ -78,6 +81,12 @@ def cancel_job(job_id: int):
             raise HTTPException(404)
         if job.status not in ("queued", "running"):
             raise HTTPException(409, f"job is already {job.status}")
+        # Fence database state before revocation so a task picked up in the
+        # small race window sees a terminal state and exits without publishing.
+        transition_job(session, job.id, {"queued", "running"}, "canceled",
+                       error="canceled by user")
+        if job.task == "run_all":
+            cancel_children(job.id, "run-all canceled by user")
         if job.celery_id:
             try:
                 # terminate=True stops a task that's already executing, not just
@@ -85,10 +94,9 @@ def cancel_job(job_id: int):
                 celery.control.revoke(job.celery_id, terminate=True)
             except Exception:
                 pass
-        job.status = "canceled"
-        job.error = "canceled by user"
-        session.add(job)
-        session.commit()
+    # Canceling the active orchestrator should immediately release the serial
+    # queue even if the revoked task never reaches its finally block.
+    maybe_start_next_run_all()
     return {"ok": True}
 
 

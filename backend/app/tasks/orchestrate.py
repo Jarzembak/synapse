@@ -1,30 +1,21 @@
-"""Pipeline step graph + the run-all orchestrator.
-
-Single source of truth for step ordering and dependencies, used by:
-- the projects router (pipeline board: prerequisite gating/dimming)
-- the run_all task (dependency-driven dispatch, concurrent where possible)
-
-Two dependency maps on purpose:
-- HARD_DEPS gates what a step *needs* to run at all (UI dimming + manual runs).
-  e.g. the deep dives only need a transcript — corrected is optional.
-- RUN_DEPS orders a full run for best *quality*: the deep dives wait for the
-  correction pass so they read the corrected transcript.
-"""
+"""Dependency-aware, restart-safe orchestration for the media pipeline."""
 from __future__ import annotations
 
+import json
 import logging
 import time
 
-from sqlmodel import select
+from sqlalchemy.exc import IntegrityError
+from sqlmodel import select, text
 
 from ..db import get_session
 from ..models import Artifact, Job, Project
+from ..settings_store import get_setting
 from .celery_app import celery
-from .common import set_job
+from .common import TERMINAL_JOB_STATES, set_job, transition_job
 
 log = logging.getLogger("synapse.pipeline")
 
-# step name → human label; order defines the pipeline board
 STEPS: list[tuple[str, str]] = [
     ("ingest", "Ingest media"),
     ("download", "Download & keep media"),
@@ -43,7 +34,6 @@ STEPS: list[tuple[str, str]] = [
 STEP_NAMES = {s for s, _ in STEPS}
 STEP_LABELS = dict(STEPS)
 
-# what a step truly requires before it can run (UI gating, manual runs)
 HARD_DEPS: dict[str, set[str]] = {
     "ingest": set(),
     "download": set(),
@@ -60,8 +50,6 @@ HARD_DEPS: dict[str, set[str]] = {
     "mindmap": {"merge"},
 }
 
-# ordering for a full run — quality-preferring (deep dives read the corrected
-# transcript, so they wait for the correction pass)
 RUN_DEPS: dict[str, set[str]] = {
     **HARD_DEPS,
     "summarize": {"correct"},
@@ -69,7 +57,6 @@ RUN_DEPS: dict[str, set[str]] = {
     "deepdive_gemini": {"correct"},
 }
 
-# the artifact each step produces (None → checked another way)
 STEP_OUTPUT: dict[str, str | None] = {
     "ingest": None,
     "download": "source_video",
@@ -79,22 +66,85 @@ STEP_OUTPUT: dict[str, str | None] = {
     "deepdive_claude": "deepdive_claude",
     "deepdive_gemini": "deepdive_gemini",
     "merge": "deepdive_merged",
-    "quickref": None,  # emits many quickref_* docs; done = last job succeeded
+    "quickref": None,
     "podcast_script": "podcast_script",
     "tts": "podcast_audio",
     "trim": "trimmed_audio",
     "mindmap": "mindmap",
 }
 
+BUILTIN_PROFILES: dict[str, dict] = {
+    "full": {
+        "label": "Full production",
+        "description": "Every applicable artifact, including media, podcast audio and trim.",
+        "steps": [s for s, _ in STEPS],
+    },
+    "research": {
+        "label": "Research library",
+        "description": "Transcript, analysis, quick-references and mind map; no generated audio.",
+        "steps": [
+            "ingest", "transcribe", "correct", "summarize",
+            "deepdive_claude", "deepdive_gemini", "merge", "quickref", "mindmap",
+        ],
+    },
+    "quick": {
+        "label": "Quick notes",
+        "description": "Ingest, transcript correction and summary only.",
+        "steps": ["ingest", "transcribe", "correct", "summarize"],
+    },
+    "audio": {
+        "label": "Audio edition",
+        "description": "Analysis plus podcast and cleaned source audio.",
+        "steps": [
+            "ingest", "transcribe", "correct", "deepdive_claude",
+            "deepdive_gemini", "merge", "podcast_script", "tts", "trim",
+        ],
+    },
+}
+
+
+def pipeline_profiles() -> dict[str, dict]:
+    custom = get_setting("pipeline.profiles") or {}
+    clean: dict[str, dict] = {}
+    for key, profile in custom.items():
+        steps = [s for s in profile.get("steps", []) if s in STEP_NAMES]
+        if key and steps:
+            clean[key] = {
+                "label": profile.get("label") or key,
+                "description": profile.get("description") or "Custom pipeline profile",
+                "steps": steps,
+                "custom": True,
+            }
+    return {**BUILTIN_PROFILES, **clean}
+
 
 def applicable_steps(project: Project) -> list[str]:
-    """download only applies to URL sources."""
     return [s for s, _ in STEPS if s != "download" or project.source_type == "url"]
+
+
+def _artifact_for_step(session, project_id: int, step: str) -> Artifact | None:
+    output = STEP_OUTPUT[step]
+    if not output:
+        return None
+    return session.exec(
+        select(Artifact).where(Artifact.project_id == project_id, Artifact.type == output)
+    ).first()
+
+
+def step_stale(session, project: Project, step: str) -> bool:
+    """Whether the output was produced from older inputs/configuration."""
+    try:
+        from ..provenance import is_step_stale
+
+        return is_step_stale(session, project, step)
+    except Exception:
+        log.warning("could not evaluate staleness for project=%s step=%s",
+                    project.id, step, exc_info=True)
+        return False
 
 
 def step_done(session, project: Project, step: str,
               artifact_types: set[str] | None = None) -> bool:
-    """Has this step produced its output for this project?"""
     if artifact_types is None:
         artifact_types = {
             a.type for a in session.exec(
@@ -105,9 +155,9 @@ def step_done(session, project: Project, step: str,
         from .ingest import source_audio
 
         try:
-            source_audio(project.slug)
-            return True
-        except FileNotFoundError:
+            path = source_audio(project.slug)
+            return path.is_file() and path.stat().st_size > 0
+        except (FileNotFoundError, OSError):
             return False
     if step == "quickref":
         job = session.exec(
@@ -120,59 +170,73 @@ def step_done(session, project: Project, step: str,
 
 def missing_deps(session, project: Project, step: str,
                  artifact_types: set[str] | None = None) -> list[str]:
-    """Labels of unmet HARD prerequisites for a step (drives UI dimming)."""
     return [STEP_LABELS[d] for d in sorted(HARD_DEPS[step])
             if not step_done(session, project, d, artifact_types)]
 
 
 def transitive_dependents(step: str, deps: dict[str, set[str]]) -> set[str]:
-    """Every step that (directly or indirectly) depends on `step`."""
     out: set[str] = set()
     changed = True
     while changed:
         changed = False
-        for s, ds in deps.items():
-            if s not in out and (step in ds or ds & out):
-                out.add(s)
+        for candidate, requirements in deps.items():
+            if candidate not in out and (step in requirements or requirements & out):
+                out.add(candidate)
                 changed = True
+    return out
+
+
+def dependency_closure(steps: set[str], deps: dict[str, set[str]] = RUN_DEPS) -> set[str]:
+    out = set(steps)
+    changed = True
+    while changed:
+        changed = False
+        for step in list(out):
+            before = len(out)
+            out.update(deps[step])
+            changed = changed or len(out) != before
     return out
 
 
 def dep_satisfied(step: str, dep: str, done: set[str], pending: set[str],
                   running: set[str], failed: set[str]) -> bool:
-    """Is `dep` satisfied enough to launch `step` during a run-all?
-
-    - finished this run, or not part of this run at all → satisfied
-    - still pending/running → wait
-    - failed: blocks only if it's a HARD requirement; soft (quality-only)
-      deps fall back gracefully (e.g. deep dives use the raw transcript
-      when the correction pass failed).
-    """
     if dep in done:
         return True
     if dep in pending or dep in running:
         return False
     if dep in failed:
-        return dep not in HARD_DEPS[step]
-    return True  # already done before this run started
+        # A profile run deliberately ordered this dependency. Continuing would
+        # let consumers read an older artifact left behind by the failed
+        # attempt (for example a stale corrected transcript). Direct manual
+        # runs retain their raw-input fallbacks because they bypass this graph.
+        return False
+    return True
+
+
+def _job_options(job: Job) -> dict:
+    try:
+        value = json.loads(job.options or "{}")
+        return value if isinstance(value, dict) else {}
+    except (TypeError, json.JSONDecodeError):
+        return {}
+
+
+def _selected_steps(project: Project, options: dict) -> set[str]:
+    applicable = set(applicable_steps(project))
+    if options.get("steps") is not None:
+        selected = {s for s in options["steps"] if s in STEP_NAMES}
+    else:
+        profile = pipeline_profiles().get(options.get("profile") or "full", BUILTIN_PROFILES["full"])
+        selected = set(profile["steps"])
+    return dependency_closure(selected) & applicable
 
 
 def maybe_start_next_run_all() -> None:
-    """Start the oldest queued whole-project run, if none is running.
-
-    Run-alls are serial by design: each orchestrator holds a worker slot for
-    its entire run, so several at once would starve the very steps they wait
-    on. Queued run_all jobs (task='run_all', status='queued') wait in line and
-    auto-chain — the finishing orchestrator calls this, and so does the enqueue
-    endpoint. A compare-and-swap on the status makes concurrent callers safe.
-    """
-    from sqlmodel import text
-
+    """Atomically claim and dispatch the oldest queued whole-project run."""
     with get_session() as session:
-        running = session.exec(
+        if session.exec(
             select(Job).where(Job.task == "run_all", Job.status == "running")
-        ).first()
-        if running:
+        ).first():
             return
         nxt = session.exec(
             select(Job).where(Job.task == "run_all", Job.status == "queued")
@@ -180,140 +244,202 @@ def maybe_start_next_run_all() -> None:
         ).first()
         if not nxt:
             return
-        res = session.exec(text(
-            "UPDATE job SET status='running', progress='starting' "
-            "WHERE id=:id AND status='queued'").bindparams(id=nxt.id))
-        session.commit()
-        if getattr(res, "rowcount", 0) != 1:
-            return  # another caller won the compare-and-swap
         try:
-            celery.send_task("run_all", args=[nxt.id, nxt.project_id])
+            result = session.exec(text(
+                "UPDATE job SET status='running', progress='starting', "
+                "started=CURRENT_TIMESTAMP, heartbeat=CURRENT_TIMESTAMP, "
+                "updated=CURRENT_TIMESTAMP WHERE id=:id AND status='queued' "
+                "AND NOT EXISTS (SELECT 1 FROM job WHERE task='run_all' "
+                "AND status='running' AND id<>:id)"
+            ).bindparams(id=nxt.id))
+            session.commit()
+        except IntegrityError:
+            session.rollback()
+            return
+        if getattr(result, "rowcount", 0) != 1:
+            return
+        try:
+            async_result = celery.send_task("run_all", args=[nxt.id, nxt.project_id])
+            set_job(session, nxt.id, celery_id=async_result.id)
             log.info("run_all: started project=%s (job=%s)", nxt.project_id, nxt.id)
-        except Exception as e:  # don't strand a 'running' job with no task behind it
-            log.exception("run_all: dispatch failed for job=%s", nxt.id)
-            set_job(session, nxt.id, status="error", error=f"could not dispatch: {e}")
+        except Exception as exc:
+            log.exception("run_all dispatch failed for job=%s", nxt.id)
+            set_job(session, nxt.id, status="error", error=f"could not dispatch: {exc}")
+
+
+def _active_step(session, project_id: int, step: str) -> Job | None:
+    return session.exec(
+        select(Job).where(Job.project_id == project_id, Job.task == step,
+                          Job.status.in_(("queued", "running")))
+        .order_by(Job.created.desc())
+    ).first()
+
+
+def _create_step_job(parent_id: int, project_id: int, step: str) -> Job | None:
+    with get_session() as session:
+        existing = _active_step(session, project_id, step)
+        if existing:
+            # A queued row without a broker id is a prior split-brain/plan ghost.
+            if existing.status == "queued" and not existing.celery_id:
+                set_job(session, existing.id, status="error",
+                        error="orphaned before broker dispatch")
+            else:
+                return existing
+        job = Job(project_id=project_id, task=step, parent_job_id=parent_id)
+        session.add(job)
+        try:
+            session.commit()
+            session.refresh(job)
+            return job
+        except IntegrityError:
+            session.rollback()
+            return _active_step(session, project_id, step)
+
+
+def _dispatch_step(parent_id: int, project_id: int, step: str) -> tuple[Job | None, Exception | None]:
+    job = _create_step_job(parent_id, project_id, step)
+    if not job:
+        return None, RuntimeError("could not claim an active step job")
+    if job.celery_id or job.status == "running":
+        return job, None
+    try:
+        result = celery.send_task(step, args=[job.id, project_id])
+        with get_session() as session:
+            set_job(session, job.id, celery_id=result.id)
+            return session.get(Job, job.id), None
+    except Exception as exc:
+        with get_session() as session:
+            set_job(session, job.id, status="error", error=f"could not dispatch: {exc}")
+        return job, exc
+
+
+def _skip_steps(parent_id: int, project_id: int, steps: set[str], reason: str) -> None:
+    for step in steps:
+        with get_session() as session:
+            existing = _active_step(session, project_id, step)
+            if existing:
+                set_job(session, existing.id, status="error", error=reason)
+                continue
+            job = Job(project_id=project_id, task=step, parent_job_id=parent_id,
+                      status="error", error=reason)
+            session.add(job)
+            try:
+                session.commit()
+            except IntegrityError:
+                session.rollback()
+
+
+def cancel_children(parent_job_id: int, reason: str = "parent run canceled") -> int:
+    """Revoke and terminally fence every nonterminal child of a run."""
+    with get_session() as session:
+        children = session.exec(
+            select(Job).where(Job.parent_job_id == parent_job_id,
+                              Job.status.in_(("queued", "running")))
+        ).all()
+        for child in children:
+            transition_job(session, child.id, {"queued", "running"}, "canceled", error=reason)
+            if child.celery_id:
+                try:
+                    celery.control.revoke(child.celery_id, terminate=True)
+                except Exception:
+                    log.warning("could not revoke child job=%s", child.id, exc_info=True)
+        return len(children)
 
 
 @celery.task(name="run_all")
 def run_all(job_id: int, project_id: int):
-    """Run every remaining step, launching each as soon as its dependencies
-    finish — concurrent where the graph allows, sequential where it doesn't.
-
-    Failure policy: a failed step skips only its HARD transitive dependents;
-    independent branches (and soft-dependent steps, which have fallbacks)
-    keep running.
-    """
+    """Run the selected profile, dispatching steps as dependencies complete."""
     jobs: dict[str, int] = {}
     try:
         with get_session() as session:
-            set_job(session, job_id, status="running", progress="planning")
-            project = session.get(Project, project_id)
-            if not project:
-                set_job(session, job_id, status="error", error="project not found")
+            parent = session.get(Job, job_id)
+            if not parent or parent.status != "running":
                 return
-            todo = [s for s in applicable_steps(project)
-                    if not step_done(session, project, s)]
+            project = session.get(Project, project_id)
+            if not project or project.deleting:
+                set_job(session, job_id, status="error", error="project not found or deleting")
+                return
+            options = _job_options(parent)
+            selected = _selected_steps(project, options)
+            force_steps = {s for s in options.get("force_steps", []) if s in selected}
+            todo = [s for s in applicable_steps(project) if s in selected and (
+                s in force_steps or not step_done(session, project, s) or step_stale(session, project, s)
+            )]
             if not todo:
                 set_job(session, job_id, status="done", progress="nothing to run")
                 return
-            # adopt steps a user managed to start between our enqueue and now,
-            # instead of dispatching them a second time
+
             adopted: set[str] = set()
             for step in todo:
-                existing = session.exec(
-                    select(Job).where(Job.project_id == project_id, Job.task == step,
-                                      Job.status.in_(("queued", "running")))
-                ).first()
-                if existing:
+                existing = _active_step(session, project_id, step)
+                if existing and (existing.status == "running" or existing.celery_id):
                     jobs[step] = existing.id
                     adopted.add(step)
-                else:
-                    # one queued Job per step, upfront, so the board shows the
-                    # whole plan (and run_step rejects duplicate manual runs)
-                    j = Job(project_id=project_id, task=step, status="queued")
-                    session.add(j)
-                    session.commit()
-                    session.refresh(j)
-                    jobs[step] = j.id
 
-        log.info("run_all project=%s: %d step(s): %s",
-                 project_id, len(todo), ", ".join(todo))
+        log.info("run_all project=%s profile=%s: %s", project_id,
+                 options.get("profile", "full"), ", ".join(todo))
         pending = set(todo) - adopted
-        running: set[str] = set(adopted)
+        running = set(adopted)
         done: set[str] = set()
         failed: set[str] = set()
-        canceled = False
-        deadline = time.monotonic() + 6 * 3600
+        deadline = time.monotonic() + float(options.get("timeout_seconds") or 6 * 3600)
 
         while (pending or running) and time.monotonic() < deadline:
-            with get_session() as session:  # user cancellation via the Jobs tab
-                me = session.get(Job, job_id)
-                if me and me.status == "canceled":
-                    _abort_leftovers(session, jobs, pending | running, "run-all canceled")
-                    canceled = True
-                    break
+            with get_session() as session:
+                parent = session.get(Job, job_id)
+                if not parent or parent.status != "running":
+                    cancel_children(job_id)
+                    return
+                set_job(session, job_id, heartbeat=parent.updated)
 
-            for step in [s for s in list(pending)
-                         if all(dep_satisfied(s, d, done, pending, running, failed)
-                                for d in RUN_DEPS[s])]:
+            ready = [s for s in list(pending)
+                     if all(dep_satisfied(s, dep, done, pending, running, failed)
+                            for dep in RUN_DEPS[s])]
+            for step in ready:
                 pending.discard(step)
-                try:
-                    res = celery.send_task(step, args=[jobs[step], project_id])
-                    running.add(step)
-                    # record the celery id so a Jobs-tab cancel can revoke this
-                    # orchestrated step (manual runs already store theirs)
-                    with get_session() as session:
-                        set_job(session, jobs[step], celery_id=res.id)
-                    log.info("run_all project=%s: launched %s", project_id, step)
-                except Exception as e:
+                child, error = _dispatch_step(job_id, project_id, step)
+                if child:
+                    jobs[step] = child.id
+                if error or not child:
                     failed.add(step)
-                    # a dispatch failure never entered `running`, so also skip
-                    # the steps that HARD-depend on it — otherwise they sit in
-                    # `pending` forever and the run spins until the deadline
-                    skipped = transitive_dependents(step, HARD_DEPS) & pending
-                    with get_session() as session:
-                        set_job(session, jobs[step], status="error",
-                                error=f"could not dispatch: {e}")
-                        for dep in skipped:
-                            pending.discard(dep)
-                            failed.add(dep)
-                            set_job(session, jobs[dep], status="error",
-                                    error=f"skipped: prerequisite step "
-                                          f"'{STEP_LABELS[step]}' failed")
+                    skipped = transitive_dependents(step, RUN_DEPS) & pending
+                    pending.difference_update(skipped)
+                    failed.update(skipped)
+                    _skip_steps(job_id, project_id, skipped,
+                                f"skipped: prerequisite '{STEP_LABELS[step]}' failed")
+                else:
+                    running.add(step)
 
-            time.sleep(2)
-
+            time.sleep(1)
             with get_session() as session:
                 for step in list(running):
-                    job = session.get(Job, jobs[step])
-                    if job is None or job.status == "done":
-                        running.discard(step)
-                        done.add(step)
-                    elif job.status in ("error", "canceled"):  # canceled step = failed here
+                    child = session.get(Job, jobs[step])
+                    if child is None:
                         running.discard(step)
                         failed.add(step)
-                        # skip only steps that HARD-require the failed one
-                        skipped = transitive_dependents(step, HARD_DEPS) & pending
-                        for dep in skipped:
-                            pending.discard(dep)
-                            failed.add(dep)
-                            set_job(session, jobs[dep], status="error",
-                                    error=f"skipped: prerequisite step "
-                                          f"'{STEP_LABELS[step]}' failed")
-                        log.warning("run_all project=%s: %s %s; skipped %s",
-                                    project_id, step, job.status if job else "gone",
-                                    sorted(skipped))
-                set_job(session, job_id,
-                        progress=f"{len(done)} done"
-                                 + (f", running: {', '.join(sorted(running))}" if running else "")
-                                 + (f", {len(pending)} waiting" if pending else "")
-                                 + (f", {len(failed)} failed/skipped" if failed else ""))
+                        continue
+                    if child.status == "done":
+                        running.discard(step)
+                        done.add(step)
+                    elif child.status in ("error", "canceled"):
+                        running.discard(step)
+                        failed.add(step)
+                        skipped = transitive_dependents(step, RUN_DEPS) & pending
+                        pending.difference_update(skipped)
+                        failed.update(skipped)
+                        _skip_steps(job_id, project_id, skipped,
+                                    f"skipped: prerequisite '{STEP_LABELS[step]}' failed")
+                set_job(
+                    session, job_id,
+                    progress=f"{len(done)} done"
+                    + (f", running: {', '.join(sorted(running))}" if running else "")
+                    + (f", {len(pending)} waiting" if pending else "")
+                    + (f", {len(failed)} failed/skipped" if failed else ""),
+                )
 
         with get_session() as session:
-            if canceled:
-                pass  # status already 'canceled'
-            elif pending or running:
-                _abort_leftovers(session, jobs, pending | running, "run-all timed out")
+            if pending or running:
+                cancel_children(job_id, "run timed out")
                 set_job(session, job_id, status="error",
                         error=f"timed out with {sorted(pending | running)} unfinished")
             elif failed:
@@ -323,25 +449,22 @@ def run_all(job_id: int, project_id: int):
             else:
                 set_job(session, job_id, status="done",
                         progress=f"all {len(done)} step(s) complete")
-    except Exception as e:
-        # never leave the plan's queued Job rows stranded — they 409-block
-        # every future run of those steps
+    except Exception as exc:
         log.exception("run_all project=%s crashed", project_id)
+        cancel_children(job_id, f"run aborted: {exc}")
         with get_session() as session:
-            for step, jid in jobs.items():
-                job = session.get(Job, jid)
-                if job and job.status == "queued":
-                    set_job(session, jid, status="error",
-                            error=f"run-all aborted: {e}")
-            set_job(session, job_id, status="error", error=str(e)[:2000])
+            set_job(session, job_id, status="error", error=str(exc)[:2000])
         raise
     finally:
-        # this run is terminal now → let the next queued project run start
         maybe_start_next_run_all()
 
 
 def _abort_leftovers(session, jobs: dict[str, int], steps: set[str], reason: str):
+    """Compatibility helper retained for tests/older callers."""
     for step in steps:
-        job = session.get(Job, jobs[step])
-        if job and job.status in ("queued", "running"):
-            set_job(session, jobs[step], status="error", error=reason)
+        job_id = jobs.get(step)
+        if not job_id:
+            continue
+        child = session.get(Job, job_id)
+        if child and child.status in ("queued", "running"):
+            transition_job(session, child.id, {"queued", "running"}, "canceled", error=reason)

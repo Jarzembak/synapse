@@ -69,6 +69,7 @@ export interface Artifact {
 export interface Job {
   id: number;
   project_id: number | null;
+  parent_job_id?: number | null;
   task: string;
   task_label?: string;
   project_title?: string;
@@ -77,6 +78,8 @@ export interface Job {
   error: string;
   created?: string;
   updated?: string;
+  started?: string | null;
+  finished?: string | null;
 }
 
 export interface Step {

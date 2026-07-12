@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlmodel import select, text
 
 from ..config import ADVANCED_DEFAULTS, FUNCTION_DEFAULTS, advanced
@@ -13,6 +13,11 @@ from ..tasks.prompts import DEFAULTS as PROMPT_DEFAULTS, PROMPT_LABELS
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 
 PROVIDERS = ["ollama", "anthropic", "gemini"]
+FUNCTION_PROVIDERS = {
+    **{name: PROVIDERS for name in FUNCTION_DEFAULTS},
+    "asr": ["faster-whisper", "gemini"],
+    "tts": ["piper", "kokoro", "gemini"],
+}
 
 
 @router.get("/models")
@@ -20,7 +25,10 @@ def get_models():
     out = {}
     for fn, default in FUNCTION_DEFAULTS.items():
         out[fn] = get_setting(f"model.{fn}") or default
-    return {"functions": out, "providers": PROVIDERS, "defaults": FUNCTION_DEFAULTS}
+    return {
+        "functions": out, "providers": PROVIDERS, "defaults": FUNCTION_DEFAULTS,
+        "provider_options": FUNCTION_PROVIDERS,
+    }
 
 
 class ModelOverride(BaseModel):
@@ -32,7 +40,14 @@ class ModelOverride(BaseModel):
 def set_model(function: str, req: ModelOverride):
     if function not in FUNCTION_DEFAULTS:
         raise HTTPException(400, f"unknown function {function!r}")
-    set_setting(f"model.{function}", {"provider": req.provider, "model": req.model})
+    provider, model = req.provider.strip(), req.model.strip()
+    if provider not in FUNCTION_PROVIDERS[function]:
+        raise HTTPException(
+            400, f"provider {provider!r} is not valid for {function}; "
+                 f"choose from {', '.join(FUNCTION_PROVIDERS[function])}")
+    if not model:
+        raise HTTPException(400, "model cannot be blank")
+    set_setting(f"model.{function}", {"provider": provider, "model": model})
     return {"ok": True}
 
 
@@ -55,12 +70,14 @@ def set_glossary(req: Glossary):
 def get_voices():
     return {
         "kokoro": get_setting("tts.voices", {"HOST_A": "am_michael", "HOST_B": "af_heart"}),
+        "piper": get_setting("tts.piper_voices", {"HOST_A": "en_US-ryan-medium", "HOST_B": "en_US-amy-medium"}),
         "gemini": get_setting("tts.gemini_voices", {"HOST_A": "Charon", "HOST_B": "Kore"}),
     }
 
 
 class Voices(BaseModel):
     kokoro: dict[str, str] | None = None
+    piper: dict[str, str] | None = None
     gemini: dict[str, str] | None = None
 
 
@@ -68,6 +85,8 @@ class Voices(BaseModel):
 def set_voices(req: Voices):
     if req.kokoro:
         set_setting("tts.voices", req.kokoro)
+    if req.piper:
+        set_setting("tts.piper_voices", req.piper)
     if req.gemini:
         set_setting("tts.gemini_voices", req.gemini)
     return {"ok": True}
@@ -136,8 +155,8 @@ def get_params():
 
 
 class Params(BaseModel):
-    temperature: float | None = None
-    max_tokens: int | None = None
+    temperature: float | None = Field(default=None, ge=0, le=2)
+    max_tokens: int | None = Field(default=None, ge=1, le=200_000)
 
 
 @router.put("/params/{function}")
@@ -163,13 +182,150 @@ class AdvancedGroup(BaseModel):
     values: dict
 
 
+def _validated_advanced(group: str, values: dict) -> dict:
+    clean = {key: value for key, value in values.items()
+             if key in ADVANCED_DEFAULTS[group]}
+    numeric = {
+        ("audio", "tts_speed"): (0.25, 3.0),
+        ("audio", "tts_gap"): (0.05, 10.0),
+        ("audio", "tts_workers"): (0, 32),
+        ("audio", "trim_db"): (-100, 0),
+        ("audio", "trim_silence"): (0.1, 60),
+        ("pipeline", "chunk_chars"): (1_000, 500_000),
+        ("pipeline", "podcast_segments"): (0, 100),
+        ("pipeline", "max_tags"): (1, 50),
+    }
+    enums = {
+        ("pipeline", "deepdive_depth"): {"concise", "standard", "exhaustive"},
+        ("compute", "whisper_device"): {"auto", "cpu", "cuda"},
+        ("compute", "whisper_compute_type"): {
+            "auto", "int8", "int8_float16", "float16"},
+        ("compute", "kokoro_device"): {"auto", "cpu", "cuda"},
+    }
+    booleans = {
+        ("pipeline", "allow_new_tags"), ("asr", "vad"),
+        ("audio", "keep_intermediates"),
+    }
+    for key, value in clean.items():
+        rule = numeric.get((group, key))
+        if rule:
+            if not isinstance(value, (int, float)) or isinstance(value, bool) \
+                    or not rule[0] <= value <= rule[1]:
+                raise HTTPException(422, f"{key} must be between {rule[0]} and {rule[1]}")
+        allowed = enums.get((group, key))
+        if allowed and value not in allowed:
+            raise HTTPException(422, f"{key} must be one of {', '.join(sorted(allowed))}")
+        if (group, key) in booleans and not isinstance(value, bool):
+            raise HTTPException(422, f"{key} must be true or false")
+    if group == "asr" and not isinstance(clean.get("language", ""), str):
+        raise HTTPException(422, "language must be a string")
+    return clean
+
+
 @router.put("/advanced/{group}")
 def set_advanced(group: str, req: AdvancedGroup):
     if group not in ADVANCED_DEFAULTS:
         raise HTTPException(400, f"unknown group {group!r}")
-    allowed = set(ADVANCED_DEFAULTS[group])
-    values = {k: v for k, v in req.values.items() if k in allowed}
+    values = _validated_advanced(group, req.values)
     set_setting(f"advanced.{group}", values or None)
+    return {"ok": True}
+
+
+# --- pipeline profiles / search / backup ---
+
+
+@router.get("/profiles")
+def get_profiles():
+    from ..tasks.orchestrate import pipeline_profiles
+
+    return pipeline_profiles()
+
+
+class ProfileConfig(BaseModel):
+    label: str
+    description: str = ""
+    steps: list[str]
+
+
+@router.put("/profiles/{key}")
+def save_profile(key: str, req: ProfileConfig):
+    from .. import library
+    from ..tasks.orchestrate import BUILTIN_PROFILES, STEP_NAMES
+
+    clean_key = library.make_slug(key)
+    if clean_key in BUILTIN_PROFILES:
+        raise HTTPException(400, "built-in profiles cannot be overwritten")
+    unknown = set(req.steps) - STEP_NAMES
+    if unknown:
+        raise HTTPException(422, f"unknown step(s): {', '.join(sorted(unknown))}")
+    if not req.label.strip() or not req.steps:
+        raise HTTPException(422, "profile label and at least one step are required")
+    profiles = get_setting("pipeline.profiles") or {}
+    profiles[clean_key] = {
+        "label": req.label.strip(), "description": req.description.strip(),
+        "steps": list(dict.fromkeys(req.steps)),
+    }
+    set_setting("pipeline.profiles", profiles)
+    return {"key": clean_key, **profiles[clean_key], "custom": True}
+
+
+@router.delete("/profiles/{key}")
+def delete_profile(key: str):
+    from ..tasks.orchestrate import BUILTIN_PROFILES
+
+    if key in BUILTIN_PROFILES:
+        raise HTTPException(400, "built-in profiles cannot be deleted")
+    profiles = get_setting("pipeline.profiles") or {}
+    if key not in profiles:
+        raise HTTPException(404)
+    del profiles[key]
+    set_setting("pipeline.profiles", profiles or None)
+    return {"ok": True}
+
+
+class SearchConfig(BaseModel):
+    semantic_enabled: bool = False
+    embedding_model: str = "nomic-embed-text"
+
+
+@router.get("/search")
+def get_search_settings():
+    return {
+        "semantic_enabled": bool(get_setting("search.semantic_enabled", False)),
+        "embedding_model": get_setting("search.embedding_model", "nomic-embed-text"),
+    }
+
+
+@router.put("/search")
+def save_search_settings(req: SearchConfig):
+    model = req.embedding_model.strip()
+    if req.semantic_enabled and not model:
+        raise HTTPException(422, "an embedding model is required")
+    set_setting("search.semantic_enabled", req.semantic_enabled)
+    set_setting("search.embedding_model", model or "nomic-embed-text")
+    return {"ok": True, **req.model_dump()}
+
+
+class BackupConfig(BaseModel):
+    retention: int = Field(default=5, ge=1, le=100)
+    schedule_hours: int = Field(default=0, ge=0, le=24 * 30)
+    include_media: bool = True
+
+
+@router.get("/backup")
+def get_backup_settings():
+    return {
+        "retention": get_setting("backup.retention", 5),
+        "schedule_hours": get_setting("backup.schedule_hours", 0),
+        "include_media": get_setting("backup.include_media", True),
+        "last": get_setting("backup.last"),
+    }
+
+
+@router.put("/backup")
+def save_backup_settings(req: BackupConfig):
+    for key, value in req.model_dump().items():
+        set_setting(f"backup.{key}", value)
     return {"ok": True}
 
 
