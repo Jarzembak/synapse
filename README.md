@@ -11,7 +11,7 @@ Everything accumulates in one browsable, taggable library with exact and
 semantic search, source-grounded Q&A, timestamp playback links, and an optional
 push to your own cloud storage instead of living as scattered files.
 
-Fully vibe coded by Fable and inspired by Jeff McJunkin's methodology.
+Vibe coded by Fable and Sol and inspired by Jeff McJunkin's methodology.
 
 It supports both local models — the bundled Ollama (CPU-friendly by default)
 or any OpenAI-compatible server you already run, like LM Studio, llama.cpp,
