@@ -20,19 +20,46 @@ def embedding_model() -> str:
     return get_setting("search.embedding_model", DEFAULT_EMBED_MODEL)
 
 
+def embedding_provider() -> str:
+    return get_setting("search.embedding_provider", "ollama")
+
+
 def embed_texts(values: list[str], model: str | None = None) -> list[list[float]]:
     if not values:
         return []
-    response = httpx.post(
-        f"{settings.ollama_base_url}/api/embed",
-        json={"model": model or embedding_model(), "input": values},
-        timeout=httpx.Timeout(180, connect=5),
-    )
-    response.raise_for_status()
-    vectors = response.json().get("embeddings") or []
+    if embedding_provider() == "openai_compat":
+        vectors = _embed_openai_compat(values, model or embedding_model())
+    else:
+        response = httpx.post(
+            f"{settings.ollama_base_url}/api/embed",
+            json={"model": model or embedding_model(), "input": values},
+            timeout=httpx.Timeout(180, connect=5),
+        )
+        response.raise_for_status()
+        vectors = response.json().get("embeddings") or []
     if len(vectors) != len(values) or any(not vector for vector in vectors):
         raise RuntimeError("embedding provider returned an unexpected response")
     return [[float(value) for value in vector] for vector in vectors]
+
+
+def _embed_openai_compat(values: list[str], model: str) -> list[list[float]]:
+    """OpenAI-style /embeddings on the configured local server (LM Studio, …)."""
+    base = (settings.openai_compat_base_url or "").rstrip("/")
+    if not base:
+        raise RuntimeError(
+            "embedding provider openai_compat needs OPENAI_COMPAT_BASE_URL in .env")
+    headers = {}
+    if settings.openai_compat_api_key:
+        headers["Authorization"] = f"Bearer {settings.openai_compat_api_key}"
+    response = httpx.post(
+        f"{base}/embeddings", headers=headers,
+        json={"model": model, "input": values},
+        timeout=httpx.Timeout(180, connect=5),
+    )
+    response.raise_for_status()
+    rows = response.json().get("data") or []
+    rows.sort(key=lambda item: item.get("index", 0))
+    return [row.get("embedding") or [] for row in rows]
 
 
 def _pack(vector: list[float]) -> bytes:

@@ -148,6 +148,19 @@ def effective_config(step: str) -> dict:
             "model": model,
             "params": get_setting(f"params.{function}") or {},
         })
+        if provider in ("ollama", "openai_compat"):
+            # only knobs that change what the model sees/produces are hashed;
+            # timeout and keep_alive stay out. json_mode grammar-constrains
+            # decoding, so it counts — but only on steps that request JSON.
+            local = advanced("local")
+            local_sig: dict = {}
+            if provider == "ollama":
+                local_sig.update({"num_ctx": local.get("num_ctx"),
+                                  "think": local.get("think")})
+            if step in {"trim", "mindmap", "podcast_script", "quickref"}:
+                local_sig["json_mode"] = local.get("json_mode")
+            if local_sig:
+                value["local"] = local_sig
     prompts = STEP_PROMPTS.get(step, [])
     if prompts:
         value["prompts"] = {

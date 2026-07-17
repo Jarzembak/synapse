@@ -150,19 +150,48 @@ def _preflight() -> dict:
     for command in ("ffmpeg", "ffprobe", "rclone"):
         path = shutil.which(command)
         add(command, bool(path), path or "not installed", required=command != "rclone")
+    ollama_models: list[str] | None = None
     try:
         response = httpx.get(f"{settings.ollama_base_url}/api/tags", timeout=2)
         response.raise_for_status()
-        models = [item.get("name", "") for item in response.json().get("models", [])]
-        add("ollama", True, f"{len(models)} model(s) installed", required=False)
-        from ..search import embedding_model
-
-        embed = embedding_model()
-        add("embedding model", any(name == embed or name.startswith(embed + ":") for name in models),
-            f"{embed} {'is installed' if any(name == embed or name.startswith(embed + ':') for name in models) else 'must be pulled'}",
-            required=False)
+        ollama_models = [item.get("name", "") for item in response.json().get("models", [])]
+        add("ollama", True, f"{len(ollama_models)} model(s) installed", required=False)
     except Exception as exc:
         add("ollama", False, str(exc), required=False)
+    compat_models: list[str] | None = None
+    compat_base = (settings.openai_compat_base_url or "").rstrip("/")
+    if compat_base:
+        try:
+            headers = {}
+            if settings.openai_compat_api_key:
+                headers["Authorization"] = f"Bearer {settings.openai_compat_api_key}"
+            response = httpx.get(f"{compat_base}/models", headers=headers, timeout=2)
+            response.raise_for_status()
+            compat_models = [item.get("id", "") for item in response.json().get("data", [])]
+            add("OpenAI-compatible server", True,
+                f"{len(compat_models)} model(s) available", required=False)
+        except Exception as exc:
+            add("OpenAI-compatible server", False, str(exc), required=False)
+    else:
+        add("OpenAI-compatible server", False,
+            "OPENAI_COMPAT_BASE_URL not configured", required=False)
+    try:
+        from ..search import embedding_model, embedding_provider
+
+        embed = embedding_model()
+        embed_provider = embedding_provider()
+        available = compat_models if embed_provider == "openai_compat" else ollama_models
+        if available is None:
+            add("embedding model", False,
+                f"{embed}: the {embed_provider} server is unreachable", required=False)
+        else:
+            installed = any(name == embed or name.startswith(embed + ":")
+                            for name in available)
+            add("embedding model", installed,
+                f"{embed} {'is installed' if installed else 'must be pulled'} "
+                f"({embed_provider})", required=False)
+    except Exception as exc:
+        add("embedding model", False, str(exc), required=False)
     add("Anthropic key", bool(settings.anthropic_api_key),
         "configured" if settings.anthropic_api_key else "not configured", required=False)
     add("Gemini key", bool(settings.gemini_api_key),

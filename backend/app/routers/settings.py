@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import re
+
+import httpx
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 from sqlmodel import select, text
 
-from ..config import ADVANCED_DEFAULTS, FUNCTION_DEFAULTS, advanced
+from ..config import ADVANCED_DEFAULTS, FUNCTION_DEFAULTS, advanced, settings
 from ..db import get_session
 from ..models import Job, Tag
 from ..settings_store import get_setting, set_setting
@@ -12,12 +15,18 @@ from ..tasks.prompts import DEFAULTS as PROMPT_DEFAULTS, PROMPT_LABELS
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 
-PROVIDERS = ["ollama", "anthropic", "gemini"]
+PROVIDERS = ["ollama", "openai_compat", "anthropic", "gemini"]
 FUNCTION_PROVIDERS = {
     **{name: PROVIDERS for name in FUNCTION_DEFAULTS},
     "asr": ["faster-whisper", "gemini"],
     "tts": ["piper", "kokoro", "gemini"],
 }
+
+# Ollama keep-alive: a bare number ("300" seconds, "-1" keep forever — sent as
+# JSON numbers, the only form Ollama gives those semantics) or a Go duration
+# ("5m", "24h", "1h30m", "500ms").
+KEEP_ALIVE_RE = re.compile(
+    r"^-?(\d+(\.\d+)?|(\d+(\.\d+)?(ns|us|µs|ms|s|m|h))+)$")
 
 
 @router.get("/models")
@@ -29,6 +38,41 @@ def get_models():
         "functions": out, "providers": PROVIDERS, "defaults": FUNCTION_DEFAULTS,
         "provider_options": FUNCTION_PROVIDERS,
     }
+
+
+@router.get("/local-models")
+def local_models():
+    """Installed models on each local server, for the model-matrix dropdowns.
+    Best-effort: an unreachable server reports ok=False rather than erroring."""
+    out: dict[str, dict] = {}
+    try:
+        response = httpx.get(f"{settings.ollama_base_url}/api/tags", timeout=3)
+        response.raise_for_status()
+        names = sorted(item.get("name", "") for item in response.json().get("models", []))
+        out["ollama"] = {"configured": True, "ok": True,
+                         "models": [name for name in names if name], "detail": ""}
+    except Exception as exc:
+        out["ollama"] = {"configured": True, "ok": False, "models": [],
+                         "detail": str(exc)[:300]}
+    base = (settings.openai_compat_base_url or "").rstrip("/")
+    if not base:
+        out["openai_compat"] = {"configured": False, "ok": False, "models": [],
+                                "detail": "OPENAI_COMPAT_BASE_URL is not set"}
+    else:
+        try:
+            headers = {}
+            if settings.openai_compat_api_key:
+                headers["Authorization"] = f"Bearer {settings.openai_compat_api_key}"
+            response = httpx.get(f"{base}/models", headers=headers, timeout=3)
+            response.raise_for_status()
+            names = sorted(item.get("id", "") for item in response.json().get("data", []))
+            out["openai_compat"] = {"configured": True, "ok": True,
+                                    "models": [name for name in names if name],
+                                    "detail": ""}
+        except Exception as exc:
+            out["openai_compat"] = {"configured": True, "ok": False, "models": [],
+                                    "detail": str(exc)[:300]}
+    return out
 
 
 class ModelOverride(BaseModel):
@@ -194,6 +238,8 @@ def _validated_advanced(group: str, values: dict) -> dict:
         ("pipeline", "chunk_chars"): (1_000, 500_000),
         ("pipeline", "podcast_segments"): (0, 100),
         ("pipeline", "max_tags"): (1, 50),
+        ("local", "num_ctx"): (1_024, 262_144),
+        ("local", "timeout_seconds"): (30, 3_600),
     }
     enums = {
         ("pipeline", "deepdive_depth"): {"concise", "standard", "exhaustive"},
@@ -201,10 +247,11 @@ def _validated_advanced(group: str, values: dict) -> dict:
         ("compute", "whisper_compute_type"): {
             "auto", "int8", "int8_float16", "float16"},
         ("compute", "kokoro_device"): {"auto", "cpu", "cuda"},
+        ("local", "think"): {"auto", "on", "off"},
     }
     booleans = {
         ("pipeline", "allow_new_tags"), ("asr", "vad"),
-        ("audio", "keep_intermediates"),
+        ("audio", "keep_intermediates"), ("local", "json_mode"),
     }
     for key, value in clean.items():
         rule = numeric.get((group, key))
@@ -219,6 +266,13 @@ def _validated_advanced(group: str, values: dict) -> dict:
             raise HTTPException(422, f"{key} must be true or false")
     if group == "asr" and not isinstance(clean.get("language", ""), str):
         raise HTTPException(422, "language must be a string")
+    if group == "local" and "keep_alive" in clean:
+        keep_alive = clean["keep_alive"]
+        if not isinstance(keep_alive, str) or \
+                (keep_alive and not KEEP_ALIVE_RE.match(keep_alive)):
+            raise HTTPException(
+                422, 'keep_alive must be an Ollama duration like "5m", "24h", '
+                     '"0", or "-1" (blank = server default)')
     return clean
 
 
@@ -285,6 +339,7 @@ def delete_profile(key: str):
 
 class SearchConfig(BaseModel):
     semantic_enabled: bool = False
+    embedding_provider: str = "ollama"
     embedding_model: str = "nomic-embed-text"
 
 
@@ -292,16 +347,20 @@ class SearchConfig(BaseModel):
 def get_search_settings():
     return {
         "semantic_enabled": bool(get_setting("search.semantic_enabled", False)),
+        "embedding_provider": get_setting("search.embedding_provider", "ollama"),
         "embedding_model": get_setting("search.embedding_model", "nomic-embed-text"),
     }
 
 
 @router.put("/search")
 def save_search_settings(req: SearchConfig):
+    if req.embedding_provider not in ("ollama", "openai_compat"):
+        raise HTTPException(422, "embedding provider must be ollama or openai_compat")
     model = req.embedding_model.strip()
     if req.semantic_enabled and not model:
         raise HTTPException(422, "an embedding model is required")
     set_setting("search.semantic_enabled", req.semantic_enabled)
+    set_setting("search.embedding_provider", req.embedding_provider)
     set_setting("search.embedding_model", model or "nomic-embed-text")
     return {"ok": True, **req.model_dump()}
 
