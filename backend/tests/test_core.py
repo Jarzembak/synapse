@@ -279,3 +279,265 @@ def test_media_mime():
     assert media_mime("source_audio.m4a") == "audio/mp4"
     assert media_mime("podcast_audio.mp3") == "audio/mpeg"
     assert media_mime("weird.xyz") == "application/octet-stream"
+
+
+# --- local-LLM support (llm.py) ---
+
+
+LOCAL_CFG = {"num_ctx": 8192, "keep_alive": "10m", "think": "off",
+             "timeout_seconds": 120, "json_mode": True}
+
+
+def test_strip_think():
+    from app.llm import _strip_think
+
+    assert _strip_think("<think>plan</think>answer") == "answer"
+    assert _strip_think("a<think>x</think>b<think>y</think>c") == "abc"
+    assert _strip_think("no tags here") == "no tags here"
+    # unclosed think: everything after the tag is reasoning, nothing usable
+    assert _strip_think("<think>never finished") == ""
+
+
+def test_extract_json_tolerates_prose_and_think():
+    import json as jsonlib
+
+    from app.llm import _extract_json
+
+    assert _extract_json('{"a": 1}') == {"a": 1}
+    assert _extract_json('```json\n{"a": 1}\n```') == {"a": 1}
+    assert _extract_json('Sure! {"a": 1} Hope this helps!') == {"a": 1}
+    assert _extract_json('<think>hmm</think>[1, 2] done') == [1, 2]
+    with pytest.raises(jsonlib.JSONDecodeError):
+        _extract_json("not json at all")
+
+
+def test_ollama_payload_mapping(monkeypatch):
+    from app import llm
+
+    captured = {}
+
+    class FakeResponse:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"message": {"content": '<think>meh</think>{"ok": true}'},
+                    "prompt_eval_count": 7, "eval_count": 3}
+
+    def fake_post(url, *, json=None, timeout=None):
+        captured["url"] = url
+        captured["payload"] = json
+        return FakeResponse()
+
+    monkeypatch.setattr(llm.httpx, "post", fake_post)
+    monkeypatch.setattr(llm, "advanced", lambda group: dict(LOCAL_CFG))
+    out = llm._ollama("sys", "user", "qwen3:8b", 512, 0.2, json_format=True)
+    assert out == '{"ok": true}'
+    payload = captured["payload"]
+    assert captured["url"].endswith("/api/chat")
+    assert payload["options"] == {"num_predict": 512, "num_ctx": 8192,
+                                  "temperature": 0.2}
+    assert payload["keep_alive"] == "10m"
+    assert payload["think"] is False
+    assert payload["format"] == "json"
+    assert payload["messages"][0] == {"role": "system", "content": "sys"}
+
+
+def test_ollama_auto_think_omits_flag_and_format(monkeypatch):
+    from app import llm
+
+    captured = {}
+
+    class FakeResponse:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"message": {"content": "plain answer"}}
+
+    def fake_post(url, *, json=None, timeout=None):
+        captured["payload"] = json
+        return FakeResponse()
+
+    monkeypatch.setattr(llm.httpx, "post", fake_post)
+    monkeypatch.setattr(llm, "advanced",
+                        lambda group: {**LOCAL_CFG, "think": "auto", "keep_alive": ""})
+    out = llm._ollama("sys", "user", "qwen3:8b", 512, None)
+    assert out == "plain answer"
+    payload = captured["payload"]
+    assert "think" not in payload
+    assert "format" not in payload
+    assert "keep_alive" not in payload
+    assert "temperature" not in payload["options"]
+
+
+def test_ollama_error_body_surfaces_and_is_not_transient(monkeypatch):
+    from app import llm
+
+    class FakeResponse:
+        status_code = 404
+        text = "irrelevant"
+
+        @staticmethod
+        def json():
+            return {"error": 'model "nope" not found, try pulling it first'}
+
+    monkeypatch.setattr(llm.httpx, "post", lambda *a, **k: FakeResponse())
+    monkeypatch.setattr(llm, "advanced", lambda group: dict(LOCAL_CFG))
+    with pytest.raises(llm.LLMHTTPError, match="not found") as err:
+        llm._ollama("s", "u", "nope", 10, None)
+    assert err.value.status_code == 404
+    assert not llm._is_transient(err.value)
+    assert llm._is_transient(llm.LLMHTTPError("busy", 503))
+
+
+def test_openai_compat_requires_base_url(monkeypatch):
+    from app import llm
+
+    monkeypatch.setattr(llm.settings, "openai_compat_base_url", "")
+    monkeypatch.setattr(llm, "advanced", lambda group: dict(LOCAL_CFG))
+    with pytest.raises(RuntimeError, match="OPENAI_COMPAT_BASE_URL"):
+        llm._openai_compat("s", "u", "m", 10, None)
+
+
+def test_openai_compat_response_format_fallback(monkeypatch):
+    import types
+
+    import openai
+
+    from app import llm
+
+    inits = []
+    calls = []
+
+    class FakeCompletions:
+        @staticmethod
+        def create(**kwargs):
+            calls.append(kwargs)
+            if "response_format" in kwargs:
+                exc = RuntimeError("response_format is not supported")
+                exc.status_code = 400
+                raise exc
+            message = types.SimpleNamespace(content='<think>x</think>{"ok": 1}')
+            return types.SimpleNamespace(
+                choices=[types.SimpleNamespace(message=message)],
+                usage=types.SimpleNamespace(prompt_tokens=5, completion_tokens=2),
+            )
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            inits.append(kwargs)
+            self.chat = types.SimpleNamespace(completions=FakeCompletions())
+
+    monkeypatch.setattr(llm.settings, "openai_compat_base_url", "http://box:1234/v1")
+    monkeypatch.setattr(llm, "advanced", lambda group: dict(LOCAL_CFG))
+    monkeypatch.setattr(openai, "OpenAI", FakeClient)
+    out = llm._openai_compat("s", "u", "m", 64, None, json_format=True)
+    assert out == '{"ok": 1}'
+    assert inits[0]["base_url"] == "http://box:1234/v1"
+    assert "response_format" in calls[0]
+    assert "response_format" not in calls[1]
+
+
+def test_complete_retries_empty_responses(monkeypatch):
+    from app import llm
+
+    outputs = iter(["", "   ", "real answer"])
+    monkeypatch.setattr(llm, "_ollama", lambda *a, **k: next(outputs))
+    monkeypatch.setattr(llm, "resolve_model", lambda fn: ("ollama", "m"))
+    monkeypatch.setattr(llm, "resolve_params", lambda fn: (None, 128))
+    monkeypatch.setattr(llm, "get_setting", lambda key, default=None: default)
+    monkeypatch.setattr(llm.time, "sleep", lambda seconds: None)
+    assert llm.complete("tag", "s", "u") == "real answer"
+
+
+def test_complete_json_retries_then_extracts(monkeypatch):
+    from app import llm
+
+    replies = iter(["not json", 'Sure! {"a": 1} done'])
+    monkeypatch.setattr(llm, "complete", lambda *a, **k: next(replies))
+    assert llm.complete_json("tag", "s", "u") == {"a": 1}
+
+
+def test_json_mode_off_suppresses_native_json_enforcement(monkeypatch):
+    import types
+
+    import openai
+
+    from app import llm
+
+    monkeypatch.setattr(llm, "advanced",
+                        lambda group: {**LOCAL_CFG, "json_mode": False})
+
+    ollama_payload = {}
+
+    class FakeResponse:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"message": {"content": '{"ok": 1}'}}
+
+    def fake_post(url, *, json=None, timeout=None):
+        ollama_payload.update(json)
+        return FakeResponse()
+
+    monkeypatch.setattr(llm.httpx, "post", fake_post)
+    llm._ollama("s", "u", "m", 64, None, json_format=True)
+    assert "format" not in ollama_payload
+
+    compat_calls = []
+
+    class FakeCompletions:
+        @staticmethod
+        def create(**kwargs):
+            compat_calls.append(kwargs)
+            message = types.SimpleNamespace(content='{"ok": 1}')
+            return types.SimpleNamespace(
+                choices=[types.SimpleNamespace(message=message)], usage=None)
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            self.chat = types.SimpleNamespace(completions=FakeCompletions())
+
+    monkeypatch.setattr(llm.settings, "openai_compat_base_url", "http://box:1234/v1")
+    monkeypatch.setattr(openai, "OpenAI", FakeClient)
+    llm._openai_compat("s", "u", "m", 64, None, json_format=True)
+    assert "response_format" not in compat_calls[0]
+
+
+def test_ollama_keep_alive_numeric_strings_sent_as_numbers(monkeypatch):
+    from app import llm
+
+    captured = {}
+
+    class FakeResponse:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"message": {"content": "ok"}}
+
+    def fake_post(url, *, json=None, timeout=None):
+        captured["payload"] = json
+        return FakeResponse()
+
+    monkeypatch.setattr(llm.httpx, "post", fake_post)
+    # Ollama's seconds / negative-means-forever semantics only exist for JSON
+    # numbers; a string "-1" is a Go ParseDuration error (HTTP 400)
+    monkeypatch.setattr(llm, "advanced", lambda g: {**LOCAL_CFG, "keep_alive": "-1"})
+    llm._ollama("s", "u", "m", 8, None)
+    assert captured["payload"]["keep_alive"] == -1
+    monkeypatch.setattr(llm, "advanced", lambda g: {**LOCAL_CFG, "keep_alive": "1.5"})
+    llm._ollama("s", "u", "m", 8, None)
+    assert captured["payload"]["keep_alive"] == 1.5
+    monkeypatch.setattr(llm, "advanced", lambda g: {**LOCAL_CFG, "keep_alive": "1h30m"})
+    llm._ollama("s", "u", "m", 8, None)
+    assert captured["payload"]["keep_alive"] == "1h30m"
+
+
+def test_extract_json_top_level_array_not_truncated():
+    from app.llm import _extract_json
+
+    assert _extract_json('[{"a": 1}, {"b": 2}]') == [{"a": 1}, {"b": 2}]
+    assert _extract_json('Here: [{"a": 1}, {"b": 2}] done') == [{"a": 1}, {"b": 2}]

@@ -18,6 +18,10 @@ class Settings(BaseSettings):
 
     redis_url: str = "redis://localhost:6379/0"
     ollama_base_url: str = "http://localhost:11434"
+    # Any OpenAI-compatible server (LM Studio, llama.cpp, vLLM, LocalAI, …).
+    # Include the /v1 suffix, e.g. http://host.docker.internal:1234/v1.
+    openai_compat_base_url: str = ""
+    openai_compat_api_key: str = ""
     anthropic_api_key: str = ""
     gemini_api_key: str = ""
     elevenlabs_api_key: str = ""
@@ -35,7 +39,8 @@ class Settings(BaseSettings):
 
 settings = Settings()
 
-# Providers: "ollama" (local, OpenAI-compatible), "anthropic", "gemini".
+# Providers: "ollama" (local, native API), "openai_compat" (any local
+# OpenAI-compatible server), "anthropic", "gemini".
 # The value here is the *shipping default*; the Settings table can override it.
 FUNCTION_DEFAULTS: dict[str, dict[str, str]] = {
     "correct":        {"provider": "ollama",    "model": "qwen3:8b"},
@@ -86,6 +91,17 @@ ADVANCED_DEFAULTS: dict[str, dict] = {
         # onnxruntime exposes it; the shipped images use CPU onnxruntime (see the
         # Dockerfile note), so this is CPU in practice — Piper is the fast path.
         "kokoro_device": "auto",         # auto | cpu | cuda
+    },
+    "local": {
+        # Ollama loads models with a small default context window (4k in current
+        # releases) and silently truncates anything longer — far below the ~24k-char
+        # transcript chunks the correction pass sends. num_ctx is requested per
+        # call, so no Modelfile edits are needed. Raising it raises RAM/VRAM use.
+        "num_ctx": 16384,        # Ollama context window (tokens); ollama only
+        "keep_alive": "5m",      # how long Ollama keeps the model loaded ("-1" = forever)
+        "think": "auto",         # thinking models: auto = model default | on | off
+        "timeout_seconds": 300,  # per-request timeout for local providers
+        "json_mode": True,       # enforce native JSON output on structured steps
     },
 }
 

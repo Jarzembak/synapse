@@ -13,9 +13,11 @@ push to your own cloud storage instead of living as scattered files.
 
 Fully vibe coded by Fable and inspired by Jeff McJunkin's methodology.
 
-It supports both local models (via Ollama, CPU-friendly by default) and
-frontier APIs (Claude, Gemini), configurable **per pipeline step**, so you can
-run cheaply on local hardware and reserve API spend for the steps that need it.
+It supports both local models — the bundled Ollama (CPU-friendly by default)
+or any OpenAI-compatible server you already run, like LM Studio, llama.cpp,
+or vLLM — and frontier APIs (Claude, Gemini), configurable **per pipeline
+step**, so you can run cheaply on local hardware and reserve API spend for
+the steps that need it.
 Nearly every behavior — the prompts each step sends its model, generation
 temperature, audio pacing, tagging rules — is tunable from **Settings → Advanced**
 without touching code.
@@ -49,7 +51,7 @@ Six containers, orchestrated by `docker-compose.yml`:
 | `worker` | Celery worker — runs every pipeline step (this is where yt-dlp, ffmpeg, faster-whisper, Kokoro/Piper, and all LLM calls actually execute) |
 | `beat` | Celery scheduler — checks hourly whether a configured backup is due |
 | `redis` | Celery broker + result backend |
-| `ollama` | Local model server (OpenAI-compatible API) for any step configured to use a local model |
+| `ollama` | Local model server for any step configured to use a local model (Synapse can also use an OpenAI-compatible server you run yourself — see [Configuring models](#configuring-models)) |
 
 `api`, `worker`, and `beat` share the same backend image and codebase; `api`
 serves HTTP/SSE, `worker` consumes jobs, and `beat` only schedules periodic
@@ -449,16 +451,50 @@ Every LLM-driven step has an independent provider/model setting in
 **Settings → Model matrix**. Providers:
 
 - **ollama** — local, via the bundled `ollama` container (or point `OLLAMA_BASE_URL` in `.env` at a bigger box on your network — see below). Default for correction, trim-span detection, and tagging (`qwen3:8b`).
+- **openai_compat** — any OpenAI-compatible server you run yourself: LM Studio, llama.cpp server, vLLM, LocalAI, Jan, and the like. Set `OPENAI_COMPAT_BASE_URL` in `.env` (include the `/v1` suffix — e.g. LM Studio on the Docker host is `http://host.docker.internal:1234/v1`), plus `OPENAI_COMPAT_API_KEY` if your server enforces one. Any chat step — and semantic-search embeddings, via the provider dropdown under **Settings → Library intelligence** — can be assigned to it.
 - **anthropic** — Claude API. Default for summary, the Claude deep dive, the merge, quick-references, the podcast script, and the mind map (all `claude-sonnet-5`; swap in `claude-opus-4-8` for more depth on any of these, or `claude-haiku-4-5` to cut cost on summary/quick-refs).
 - **gemini** — Gemini API. Default for the Gemini deep dive (`gemini-3.5-flash`); can also be assigned to ASR (native audio transcription) or TTS (native multi-speaker speech) if you'd rather not run those locally.
 
-Changing a dropdown takes effect on the *next run* of that step — nothing
-needs restarting. There's no requirement to use both frontier providers; if
-you only have an Anthropic key, for example, reassign the Gemini deep-dive
-step to `anthropic`/`claude-sonnet-5` (you'll get two Claude passes merged
-into one instead of a Claude+Gemini cross-check — still useful, just not the
-default two-perspective design) or to `ollama` if you'd rather keep it fully
+The model fields for the two local providers suggest what's actually
+installed on each server (Ollama's model list, or the server's `/models`
+endpoint), so you can pick instead of typing. Changing a dropdown takes
+effect on the *next run* of that step — nothing needs restarting. There's no
+requirement to use both frontier providers; if you only have an Anthropic
+key, for example, reassign the Gemini deep-dive step to
+`anthropic`/`claude-sonnet-5` (you'll get two Claude passes merged into one
+instead of a Claude+Gemini cross-check — still useful, just not the default
+two-perspective design) or to a local provider if you'd rather keep it fully
 local.
+
+### Local model tuning
+
+**Settings → Advanced → Local models** controls how local providers are
+called:
+
+- **Context window** (`num_ctx`, Ollama only) — requested per call, so no
+  Modelfile edits are needed. Synapse defaults to 16k tokens because Ollama's
+  own default (4k in current releases) silently truncates the correction
+  pass's ~24k-character transcript chunks; raise it (up to 256k) for
+  local deep dives over long sources, or lower it if a big window doesn't fit
+  your RAM/VRAM. For `openai_compat` servers, set the context length in the
+  server itself (LM Studio's model settings, llama.cpp's `-c` flag).
+- **Keep model loaded** (Ollama only) — Ollama's `keep_alive`: `"5m"`
+  default, `"-1"` pins the model in memory between steps, `"0"` frees it
+  immediately after each call.
+- **Thinking** (Ollama only) — for reasoning models like `qwen3` or
+  `deepseek-r1`: `auto` keeps the model's default, `off` answers faster and
+  avoids reasoning loops on mechanical steps (tagging, correction), `on`
+  forces deliberate reasoning. Leave on `auto` for models without thinking
+  support — forcing a value errors on them. Inline `<think>` blocks are
+  stripped from outputs regardless.
+- **Request timeout** — for both local providers (default 300 s). Raise it if
+  a CPU-only box times out generating long outputs.
+- **JSON enforcement** — structured steps (trim spans, mind map, quick-ref
+  matching, tagging, the podcast-script outline) ask the server for
+  guaranteed-valid JSON (Ollama's `format`, OpenAI-compatible
+  `response_format`). Servers that reject `response_format` are retried
+  without it automatically; disable the toggle only if yours misbehaves with
+  it.
 
 The `asr` and `tts` rows aren't LLM chat calls, so they have their own
 provider sets: **asr** is `faster-whisper` (local, default) or `gemini`
@@ -497,7 +533,10 @@ your network already running Ollama, set `OLLAMA_BASE_URL` in `.env` to its
 address (e.g. `http://10.0.0.5:11434`) instead of the bundled container. Every
 step assigned to the `ollama` provider then runs there — no code changes,
 just point Settings at bigger model names (e.g. `qwen3:30b-a3b-instruct`)
-once they're pulled on that box.
+once they're pulled on that box. If that box runs LM Studio, llama.cpp,
+vLLM, or another OpenAI-compatible server instead of Ollama, set
+`OPENAI_COMPAT_BASE_URL` to it and assign steps to the `openai_compat`
+provider — same effect.
 
 **Local NVIDIA GPU:** if the machine running Docker has an NVIDIA GPU, start
 the stack with the GPU overlay instead:
@@ -625,7 +664,9 @@ WARNING so it doesn't drown out the app's own log lines.
 - **TTS (podcast audio) is slow** — check the **System** tab while it runs: if CPU is pegged and no GPU shows activity, that's expected (TTS is CPU-only today, see [Current limitations](#current-limitations)). Try the `piper` provider if you're on `kokoro` — it's the faster of the two on CPU — and/or raise **Advanced → Audio → TTS parallel workers**.
 - **A frontier-model step errors with an auth/key message** — check the corresponding `_API_KEY` in `.env` and that you restarted (`docker compose up`) after editing it.
 - **yt-dlp fails on a URL** — the site may need cookies (see above) or may not be supported; check the **Logs** tab (or `docker compose logs worker`) for the underlying yt-dlp error.
-- **JSON-producing steps (trim spans, mind map, quick-ref matching) occasionally fail** — local models are more prone to malformed JSON than frontier ones; the app retries automatically, but if a local model consistently fails structured-output steps, assign those specific functions to a frontier provider instead.
+- **JSON-producing steps (trim spans, mind map, quick-ref matching) occasionally fail** — local models are more prone to malformed JSON than frontier ones. Synapse asks local servers for guaranteed-valid JSON natively (see [Local model tuning](#local-model-tuning)) and retries automatically; if a local model still consistently fails structured-output steps, assign those specific functions to a frontier provider instead.
+- **A local model seems to "forget" the start of long inputs, or a correction pass drops content** — the input exceeded the model's context window. Raise **Advanced → Local models → Context window** (Ollama), or your server's own context setting (`openai_compat`), and check the model itself supports that length.
+- **A step assigned to `openai_compat` errors immediately** — set `OPENAI_COMPAT_BASE_URL` in `.env` (include the `/v1` suffix) and restart the stack; the System tab's readiness card shows whether the server is reachable and how many models it offers (their names appear in the Settings model matrix's suggestions).
 - **Cloud sync fails** — check the status line under Settings → Advanced → Cloud storage for the specific rclone error. Common causes: an S3 `endpoint`/`bucket` typo, a WebDAV `password` that's your login password instead of an app password, or an expired Drive/Dropbox/OneDrive token (re-run `rclone authorize` and paste the fresh token).
 - **Google Drive shows duplicate files for the same artifact** — this can happen if two full syncs ever overlapped (Drive allows same-name duplicates in a folder, unlike the other four backends). Click **Sync everything now**: its final dedupe pass folds duplicates back down to the newest copy automatically.
 

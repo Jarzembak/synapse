@@ -8,7 +8,8 @@ interface Params { temperature?: number | null; max_tokens?: number | null }
 interface VoicesState { kokoro: Record<string, string>; piper: Record<string, string>; gemini: Record<string, string> }
 interface ProfileInfo { label: string; description: string; steps: string[]; custom?: boolean }
 interface StepInfo { name: string; label: string }
-interface SearchConfig { semantic_enabled: boolean; embedding_model: string }
+interface SearchConfig { semantic_enabled: boolean; embedding_provider: string; embedding_model: string }
+interface LocalModelsInfo { configured: boolean; ok: boolean; models: string[]; detail: string }
 interface SearchStatus { chunks: number; embeddings: number; semantic_enabled: boolean; embedding_model: string }
 interface BackupConfig { retention: number; schedule_hours: number; include_media: boolean; last?: { at?: string; status?: string; path?: string } | null }
 interface CloudState {
@@ -38,6 +39,8 @@ const FN_LABELS: Record<string, string> = {
   download: "Media download",
 };
 
+const LOCAL_PROVIDERS = ["ollama", "openai_compat"];
+
 const CLOUD_LABELS: Record<string, string> = {
   s3: "S3-compatible (AWS / MinIO / B2 / Wasabi)",
   webdav: "WebDAV (Nextcloud / ownCloud)",
@@ -66,6 +69,7 @@ export default function Settings() {
   const [functions, setFunctions] = useState<Record<string, ModelCfg>>({});
   const [providers, setProviders] = useState<string[]>([]);
   const [providerOptions, setProviderOptions] = useState<Record<string, string[]>>({});
+  const [localModels, setLocalModels] = useState<Record<string, LocalModelsInfo>>({});
   const [voices, setVoices] = useState<VoicesState | null>(null);
   const [profiles, setProfiles] = useState<Record<string, ProfileInfo>>({});
   const [steps, setSteps] = useState<StepInfo[]>([]);
@@ -103,6 +107,7 @@ export default function Settings() {
           setProviders(r.providers);
           setProviderOptions(r.provider_options);
         }),
+      api<Record<string, LocalModelsInfo>>("/settings/local-models").then(setLocalModels),
       api<VoicesState>("/settings/voices").then(setVoices),
       api<Record<string, ProfileInfo>>("/settings/profiles").then(setProfiles),
       api<StepInfo[]>("/projects/steps").then(setSteps),
@@ -428,10 +433,12 @@ export default function Settings() {
       <h2>Model matrix</h2>
       <p className="meta">
         Which model runs each pipeline function. Providers: <b>ollama</b> = local
-        (or a remote box via OLLAMA_BASE_URL), <b>anthropic</b>/<b>gemini</b> = frontier APIs.
+        (or a remote box via OLLAMA_BASE_URL), <b>openai_compat</b> = any local
+        OpenAI-compatible server — LM Studio, llama.cpp, vLLM, LocalAI — via
+        OPENAI_COMPAT_BASE_URL, <b>anthropic</b>/<b>gemini</b> = frontier APIs.
         ASR providers: <b>faster-whisper</b> (local) or <b>gemini</b>. TTS providers:
         <b> Piper</b>/<b>Kokoro</b> (local) or <b>gemini</b>. Each row only lists
-        providers that support that function.
+        providers that support that function; local rows suggest installed models.
       </p>
       <table className="list">
         <thead><tr><th>Function</th><th>Provider</th><th>Model</th></tr></thead>
@@ -452,6 +459,8 @@ export default function Settings() {
               <td>
                 <input
                   value={cfg.model}
+                  list={LOCAL_PROVIDERS.includes(cfg.provider)
+                    ? `local-models-${cfg.provider}` : undefined}
                   onChange={(e) => setFunctions((current) => ({
                     ...current, [fn]: { ...cfg, model: e.target.value },
                   }))}
@@ -462,6 +471,23 @@ export default function Settings() {
           ))}
         </tbody>
       </table>
+      {LOCAL_PROVIDERS.map((p) => (
+        <datalist id={`local-models-${p}`} key={p}>
+          {(localModels[p]?.models ?? []).map((m) => <option key={m} value={m} />)}
+        </datalist>
+      ))}
+      {Object.keys(localModels).length > 0 && (
+        <p className="meta">
+          Local servers:{" "}
+          {LOCAL_PROVIDERS.map((p) => {
+            const info = localModels[p];
+            if (!info) return null;
+            const status = !info.configured ? "not configured"
+              : info.ok ? `${info.models.length} model(s)` : `unreachable — ${info.detail}`;
+            return <span key={p}><b>{p}</b>: {status}{p === "ollama" ? " · " : ""}</span>;
+          })}
+        </p>
+      )}
 
       <h2>Podcast voices</h2>
       <p className="meta">
@@ -570,8 +596,18 @@ export default function Settings() {
               })} />
             blend semantic similarity with exact text search
           </label>
-          <label>Ollama embedding model
+          <label>Embedding provider
+            <select value={searchConfig.embedding_provider}
+              onChange={(event) => setSearchConfig({
+                ...searchConfig, embedding_provider: event.target.value,
+              })}>
+              <option value="ollama">ollama</option>
+              <option value="openai_compat">openai_compat</option>
+            </select>
+          </label>
+          <label>Embedding model
             <input value={searchConfig.embedding_model}
+              list={`local-models-${searchConfig.embedding_provider}`}
               onChange={(event) => setSearchConfig({
                 ...searchConfig, embedding_model: event.target.value,
               })} />
@@ -913,6 +949,52 @@ export default function Settings() {
             </label>
             <p className="meta">Whisper model size is set in the Model matrix (asr row): tiny / base / small / medium / distil-large-v3 / large-v3.</p>
             <button onClick={() => saveAdvanced("asr")}>Save ASR settings</button>
+          </div>
+        )}
+      </details>
+
+      <details className="advanced">
+        <summary>Local models <small>— context window, keep-alive, thinking, timeouts</small></summary>
+        {adv.local && (
+          <div className="knobs">
+            <label title="Requested per call from Ollama. Ollama's own default (4k in current releases) silently truncates long transcript chunks — raise this if a local model seems to 'forget' the start of its input. Higher values use more RAM/VRAM."
+              >Context window (tokens, Ollama only)
+              <input type="number" step="1024" min="1024" max="262144"
+                value={adv.local.num_ctx}
+                onChange={(e) => setAdvValue("local", "num_ctx", Number(e.target.value))} />
+            </label>
+            <label title='How long Ollama keeps the model in memory after a call. "5m" default; "-1" pins it loaded; "0" unloads immediately. Blank = server default.'
+              >Keep model loaded (Ollama only)
+              <input type="text" placeholder="5m" value={adv.local.keep_alive}
+                onChange={(e) => setAdvValue("local", "keep_alive", e.target.value)} />
+            </label>
+            <label title="Thinking models (qwen3, deepseek-r1). auto = model default; off answers faster and avoids reasoning loops in tagging/correction; on reasons harder. Leave auto for models without thinking support — forcing a value errors on them."
+              >Thinking (Ollama only)
+              <select value={adv.local.think}
+                onChange={(e) => setAdvValue("local", "think", e.target.value)}>
+                <option value="auto">auto (model default)</option>
+                <option value="on">on</option>
+                <option value="off">off</option>
+              </select>
+            </label>
+            <label title="Per-request ceiling for both local providers. CPU boxes generating long outputs may need more than the default 300s."
+              >Request timeout (seconds)
+              <input type="number" step="30" min="30" max="3600"
+                value={adv.local.timeout_seconds}
+                onChange={(e) => setAdvValue("local", "timeout_seconds", Number(e.target.value))} />
+            </label>
+            <label className="checkline"
+              title="Ask the server to constrain structured steps (trim spans, mind map, quick-ref matching, tagging, podcast outline) to valid JSON — Ollama format, OpenAI-compatible response_format. Turn off only if your server errors on it.">
+              <input type="checkbox" checked={!!adv.local.json_mode}
+                onChange={(e) => setAdvValue("local", "json_mode", e.target.checked)} />
+              enforce native JSON output on structured steps
+            </label>
+            <p className="meta">
+              Applies to steps assigned to the <b>ollama</b> or <b>openai_compat</b>{" "}
+              providers. For openai_compat, set the context window in the server
+              itself (LM Studio's model settings, llama.cpp's <code>-c</code> flag).
+            </p>
+            <button onClick={() => saveAdvanced("local")}>Save local model settings</button>
           </div>
         )}
       </details>

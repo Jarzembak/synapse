@@ -1291,3 +1291,106 @@ def test_model_override(client):
     assert models["summarize"] == {"provider": "anthropic", "model": "claude-haiku-4-5"}
     assert client.put("/api/settings/models/nope",
                       json={"provider": "x", "model": "y"}).status_code == 400
+
+
+def test_openai_compat_provider_for_chat_functions_only(client):
+    assert "openai_compat" in client.get("/api/settings/models").json()["providers"]
+    r = client.put("/api/settings/models/merge",
+                   json={"provider": "openai_compat", "model": "qwen2.5-7b-instruct"})
+    assert r.status_code == 200
+    assert client.put("/api/settings/models/tts",
+                      json={"provider": "openai_compat", "model": "x"}).status_code == 400
+    assert client.put("/api/settings/models/asr",
+                      json={"provider": "openai_compat", "model": "x"}).status_code == 400
+    client.put("/api/settings/models/merge",
+               json={"provider": "anthropic", "model": "claude-sonnet-5"})  # restore
+
+
+def test_local_models_endpoint(client, monkeypatch):
+    from app.config import settings as app_settings
+    from app.routers import settings as settings_router
+
+    monkeypatch.setattr(app_settings, "openai_compat_base_url", "")
+
+    class FakeResponse:
+        @staticmethod
+        def raise_for_status():
+            pass
+
+        @staticmethod
+        def json():
+            return {"models": [{"name": "qwen3:8b"},
+                               {"name": "nomic-embed-text:latest"}]}
+
+    monkeypatch.setattr(settings_router.httpx, "get",
+                        lambda url, **kw: FakeResponse())
+    out = client.get("/api/settings/local-models").json()
+    assert out["ollama"]["ok"] is True
+    assert out["ollama"]["models"] == ["nomic-embed-text:latest", "qwen3:8b"]
+    # openai_compat is unconfigured by default: reported, not an error
+    assert out["openai_compat"]["configured"] is False
+    assert out["openai_compat"]["models"] == []
+
+
+def test_local_models_endpoint_openai_compat(client, monkeypatch):
+    from app.config import settings as app_settings
+    from app.routers import settings as settings_router
+
+    def fake_get(url, headers=None, timeout=None):
+        class FakeResponse:
+            @staticmethod
+            def raise_for_status():
+                pass
+
+            @staticmethod
+            def json():
+                if url.endswith("/api/tags"):
+                    return {"models": []}
+                return {"data": [{"id": "qwen2.5-7b-instruct"}, {"id": "gemma-3-12b"}]}
+        return FakeResponse()
+
+    monkeypatch.setattr(settings_router.httpx, "get", fake_get)
+    monkeypatch.setattr(app_settings, "openai_compat_base_url", "http://box:1234/v1")
+    out = client.get("/api/settings/local-models").json()
+    assert out["openai_compat"]["ok"] is True
+    assert out["openai_compat"]["models"] == ["gemma-3-12b", "qwen2.5-7b-instruct"]
+
+
+def test_search_settings_embedding_provider(client):
+    r = client.put("/api/settings/search", json={
+        "semantic_enabled": True, "embedding_provider": "openai_compat",
+        "embedding_model": "text-embedding-nomic"})
+    assert r.status_code == 200
+    got = client.get("/api/settings/search").json()
+    assert got["embedding_provider"] == "openai_compat"
+    assert got["embedding_model"] == "text-embedding-nomic"
+    assert client.put("/api/settings/search", json={
+        "semantic_enabled": False, "embedding_provider": "bogus",
+        "embedding_model": "x"}).status_code == 422
+    client.put("/api/settings/search", json={
+        "semantic_enabled": False, "embedding_provider": "ollama",
+        "embedding_model": "nomic-embed-text"})  # restore
+
+
+def test_advanced_local_group_validation(client):
+    r = client.put("/api/settings/advanced/local", json={"values": {
+        "num_ctx": 32768, "keep_alive": "-1", "think": "off",
+        "timeout_seconds": 600, "json_mode": False}})
+    assert r.status_code == 200
+    got = client.get("/api/settings/advanced").json()["groups"]["local"]
+    assert got["num_ctx"] == 32768
+    assert got["think"] == "off"
+    assert got["keep_alive"] == "-1"
+    assert client.put("/api/settings/advanced/local",
+                      json={"values": {"think": "sometimes"}}).status_code == 422
+    assert client.put("/api/settings/advanced/local",
+                      json={"values": {"keep_alive": "1h30m"}}).status_code == 200
+    assert client.put("/api/settings/advanced/local",
+                      json={"values": {"keep_alive": "whenever"}}).status_code == 422
+    assert client.put("/api/settings/advanced/local",
+                      json={"values": {"keep_alive": "1h30"}}).status_code == 422
+    assert client.put("/api/settings/advanced/local",
+                      json={"values": {"num_ctx": 4}}).status_code == 422
+    assert client.put("/api/settings/advanced/local",
+                      json={"values": {"json_mode": "yes"}}).status_code == 422
+    client.put("/api/settings/advanced/local", json={"values": {}})  # restore
