@@ -18,16 +18,18 @@ what it covers, the key tools/technologies named, and who would benefit from wat
 Cite important source-derived claims with the nearest transcript timestamp in [HH:MM:SS] \
 form. Do not invent timestamps. Markdown, no heading."""
 
-DEEPDIVE = """You are writing a deep-dive study document from a video transcript.
+DEEPDIVE = """You are writing a deep-dive study document from a video transcript. The
+source is a recorded talk, conference session, or training course that the reader saved
+to their own study library; this document is their reference copy of it.
 
 Focus on the CORE CONCEPTS, TOOLS, and TECHNOLOGIES the video covers. For each: what
 it is, how it works, how it's used in practice, and how it relates to the others.
 
 CRITICAL RULE — procedures: if the video contains procedural content (a step-by-step
-tutorial, a walk-through of a methodology, a configuration recipe, an attack/defense
-sequence), you MUST capture the procedure in full and flesh it out: every step in
-order, the exact commands/settings involved, WHY each step is done, and its expected
-result. Never compress a procedure into a summary sentence.
+tutorial, a walk-through of a methodology, a configuration recipe), you MUST capture
+the procedure in full and flesh it out: every step in order, the exact
+commands/settings involved, WHY each step is done, and its expected result. Never
+compress a procedure into a summary sentence.
 
 Structure (markdown):
 # Deep Dive: <topic>
