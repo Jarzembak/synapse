@@ -32,12 +32,49 @@ class Settings(BaseSettings):
     host_media_mount: Path = Path("/host-media")
     db_path: Path = Path("./data/db/vst.sqlite3")
     backup_dir: Path = Path("./data/backups")
+    repository_dir: Path = Path("./data/repositories")
     backup_encryption_key: str = ""
     settings_encryption_key: str = ""
     max_upload_bytes: int = 20 * 1024 * 1024 * 1024
+    max_repository_download_bytes: int = 512 * 1024 * 1024
+    max_repository_unpacked_bytes: int = 1024 * 1024 * 1024
+    max_repository_files: int = 50_000
+    # Archives may legitimately contain large binary assets; they are retained
+    # but excluded from analysis by the much smaller text-file limit below.
+    max_repository_file_bytes: int = 256 * 1024 * 1024
+    max_repository_text_file_bytes: int = 5 * 1024 * 1024
+    max_repository_indexed_bytes: int = 250 * 1024 * 1024
+    repository_chunk_lines: int = 200
+    repository_chunk_chars: int = 24_000
+    repository_max_compression_ratio: int = 200
+    repository_max_map_chunks: int = 64
+    repository_max_map_input_chars: int = 800_000
+    repository_local_model: str = "qwen3:8b"
 
 
 settings = Settings()
+
+
+def validate_storage_roots() -> None:
+    """Raw repository snapshots must never sit inside a synced/backup tree."""
+    repository = settings.repository_dir.resolve()
+    protected = {
+        "library": settings.library_dir.resolve(),
+        "media": settings.media_dir.resolve(),
+        "backups": settings.backup_dir.resolve(),
+        "database": settings.db_path.resolve(),
+    }
+    for label, path in protected.items():
+        overlap = (
+            repository == path
+            or repository in path.parents
+            or path in repository.parents
+        )
+        if overlap:
+            raise RuntimeError(
+                f"REPOSITORY_DIR must not overlap the {label} storage path"
+            )
+
 
 # Providers: "ollama" (local, native API), "openai_compat" (any local
 # OpenAI-compatible server), "anthropic", "gemini".
@@ -54,6 +91,15 @@ FUNCTION_DEFAULTS: dict[str, dict[str, str]] = {
     "mindmap":        {"provider": "anthropic", "model": "claude-sonnet-5"},
     "tag":            {"provider": "ollama",    "model": "qwen3:8b"},
     "library_qa":     {"provider": "anthropic", "model": "claude-sonnet-5"},
+    # Every repository job enforces the local boundary independently of these
+    # defaults at the LLM call boundary, regardless of GitHub visibility.
+    "repository_map":          {"provider": "ollama", "model": "qwen3:8b"},
+    "repository_inventory":    {"provider": "ollama", "model": "qwen3:8b"},
+    "repository_overview":     {"provider": "ollama", "model": "qwen3:8b"},
+    "repository_usage":        {"provider": "ollama", "model": "qwen3:8b"},
+    "repository_architecture": {"provider": "ollama", "model": "qwen3:8b"},
+    "repository_expertise":    {"provider": "ollama", "model": "qwen3:8b"},
+    "repository_environment":  {"provider": "ollama", "model": "qwen3:8b"},
     # ASR + TTS are not chat providers; handled by their own tasks.
     "asr":            {"provider": "faster-whisper", "model": "distil-large-v3"},
     "tts":            {"provider": "piper",    "model": "en_US-ryan-medium"},

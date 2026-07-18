@@ -324,15 +324,18 @@ def test_ollama_payload_mapping(monkeypatch):
             return {"message": {"content": '<think>meh</think>{"ok": true}'},
                     "prompt_eval_count": 7, "eval_count": 3}
 
-    def fake_post(url, *, json=None, timeout=None):
+    def fake_post(url, *, json=None, timeout=None, trust_env=None):
         captured["url"] = url
         captured["payload"] = json
+        captured["trust_env"] = trust_env
         return FakeResponse()
 
     monkeypatch.setattr(llm.httpx, "post", fake_post)
     monkeypatch.setattr(llm, "advanced", lambda group: dict(LOCAL_CFG))
     out = llm._ollama("sys", "user", "qwen3:8b", 512, 0.2, json_format=True)
     assert out == '{"ok": true}'
+    # local transport boundary: HTTP(S)_PROXY env vars must never apply
+    assert captured["trust_env"] is False
     payload = captured["payload"]
     assert captured["url"].endswith("/api/chat")
     assert payload["options"] == {"num_predict": 512, "num_ctx": 8192,
@@ -341,6 +344,69 @@ def test_ollama_payload_mapping(monkeypatch):
     assert payload["think"] is False
     assert payload["format"] == "json"
     assert payload["messages"][0] == {"role": "system", "content": "sys"}
+
+
+def test_ollama_restricted_floors_context_timeout_and_disables_think(monkeypatch):
+    """Repository (local-only) calls must not inherit the general-purpose
+    num_ctx/timeout tuned for transcript chunks, and never spend budget on
+    hidden reasoning."""
+    from app import llm
+
+    captured = {}
+
+    class FakeResponse:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"message": {"content": "ok"}}
+
+    def fake_post(url, *, json=None, timeout=None, trust_env=None):
+        captured["payload"] = json
+        captured["timeout"] = timeout
+        return FakeResponse()
+
+    monkeypatch.setattr(llm.httpx, "post", fake_post)
+    monkeypatch.setattr(llm, "advanced",
+                        lambda group: {**LOCAL_CFG, "think": "on"})
+    llm._ollama("sys", "user", "qwen3:8b", 512, None, restricted=True)
+    payload = captured["payload"]
+    assert payload["options"]["num_ctx"] == llm.REPOSITORY_NUM_CTX
+    assert payload["think"] is False  # forced off even with think: "on"
+    assert captured["timeout"].read == llm.REPOSITORY_TIMEOUT_SECONDS
+
+
+def test_ollama_drops_think_flag_when_model_rejects_it(monkeypatch):
+    """Models without the thinking capability 400 on the flag; one retry
+    without it (mirrors the response_format fallback in _openai_compat)."""
+    from app import llm
+
+    sent = []
+
+    class Rejected:
+        status_code = 400
+
+        @staticmethod
+        def json():
+            return {"error": 'registry model "x" does not support thinking'}
+
+        text = "does not support thinking"
+
+    class Accepted:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"message": {"content": "ok"}}
+
+    def fake_post(url, *, json=None, timeout=None, trust_env=None):
+        sent.append(dict(json))
+        return Rejected() if "think" in json else Accepted()
+
+    monkeypatch.setattr(llm.httpx, "post", fake_post)
+    monkeypatch.setattr(llm, "advanced", lambda group: {**LOCAL_CFG, "think": "off"})
+    assert llm._ollama("sys", "user", "llama3.2", 64, None) == "ok"
+    assert len(sent) == 2 and "think" in sent[0] and "think" not in sent[1]
 
 
 def test_ollama_auto_think_omits_flag_and_format(monkeypatch):
@@ -355,7 +421,7 @@ def test_ollama_auto_think_omits_flag_and_format(monkeypatch):
         def json():
             return {"message": {"content": "plain answer"}}
 
-    def fake_post(url, *, json=None, timeout=None):
+    def fake_post(url, *, json=None, timeout=None, trust_env=None):
         captured["payload"] = json
         return FakeResponse()
 
@@ -478,7 +544,7 @@ def test_json_mode_off_suppresses_native_json_enforcement(monkeypatch):
         def json():
             return {"message": {"content": '{"ok": 1}'}}
 
-    def fake_post(url, *, json=None, timeout=None):
+    def fake_post(url, *, json=None, timeout=None, trust_env=None):
         ollama_payload.update(json)
         return FakeResponse()
 
@@ -518,7 +584,7 @@ def test_ollama_keep_alive_numeric_strings_sent_as_numbers(monkeypatch):
         def json():
             return {"message": {"content": "ok"}}
 
-    def fake_post(url, *, json=None, timeout=None):
+    def fake_post(url, *, json=None, timeout=None, trust_env=None):
         captured["payload"] = json
         return FakeResponse()
 

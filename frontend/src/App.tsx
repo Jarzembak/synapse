@@ -6,6 +6,7 @@ import ThemeSelect from "./components/ThemeSelect";
 
 const Library = lazy(() => import("./pages/Library"));
 const Projects = lazy(() => import("./pages/Projects"));
+const RepositoryImport = lazy(() => import("./pages/RepositoryImport"));
 const ProjectDetail = lazy(() => import("./pages/ProjectDetail"));
 const ArtifactView = lazy(() => import("./pages/ArtifactView"));
 const QuickRefs = lazy(() => import("./pages/QuickRefs"));
@@ -54,6 +55,7 @@ export default function App() {
             <Routes>
               <Route path="/" element={<Library />} />
               <Route path="/projects" element={<Projects />} />
+              <Route path="/projects/new/repository" element={<RepositoryImport />} />
               <Route path="/projects/:id" element={<ProjectDetail />} />
               <Route path="/artifacts/:id" element={<ArtifactView />} />
               <Route path="/quickrefs" element={<QuickRefs />} />

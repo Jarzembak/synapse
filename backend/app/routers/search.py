@@ -9,7 +9,10 @@ from sqlmodel import select
 
 from .. import library, llm
 from ..db import get_session
-from ..models import Artifact, ArtifactTag, ChunkEmbedding, Job, Project, SearchChunk, Tag
+from ..models import (
+    Artifact, ArtifactTag, ChunkEmbedding, Job, Project, RepositoryChunk,
+    SearchChunk, Tag,
+)
 from ..search import embedding_model, hybrid_chunks
 from ..settings_store import get_setting
 from ..tasks.celery_app import celery
@@ -145,31 +148,69 @@ def ask_library(req: AskRequest):
     question = req.question.strip()
     if not question:
         raise HTTPException(400, "question is required")
+    policy_by_project: dict[int, bool] = {}
+    if req.project_id is not None:
+        with get_session() as session:
+            requested_project = session.get(Project, req.project_id)
+        if requested_project and requested_project.source_type == "github":
+            from ..repository import repository_processing_policy
+
+            policy_by_project[req.project_id] = repository_processing_policy(
+                req.project_id)
     with get_session() as session:
         sources = hybrid_chunks(
             session, question, max(1, min(req.limit, 12)),
             artifact_types=set(req.type) or None, project_id=req.project_id,
             tags=set(req.tags) or None,
+            force_local_semantic=any(policy_by_project.values()),
         )
     if not sources:
         return {
             "answer": "I couldn't find enough library material to answer that question.",
             "sources": [], "grounded": True,
         }
+    repository_project_ids = {
+        int(source["project_id"]) for source in sources
+        if source.get("project_id") is not None
+    }
+    with get_session() as session:
+        repository_project_ids = {
+            project_id for project_id in repository_project_ids
+            if (session.get(Project, project_id)
+                and session.get(Project, project_id).source_type == "github")
+        }
+    if repository_project_ids:
+        from ..repository import repository_processing_policy
+
+        for project_id in sorted(repository_project_ids):
+            if project_id not in policy_by_project:
+                policy_by_project[project_id] = repository_processing_policy(project_id)
+
     context = []
     public_sources = []
     for index, source in enumerate(sources, 1):
         marker = f"S{index}"
         where = source.get("project_title") or "Shared library"
-        timestamp = f" at {source['start_time']}" if source.get("start_time") else ""
+        if source.get("source_kind") == "repository":
+            timestamp = (
+                f" at {source.get('path')}:{source.get('start_line')}"
+                f"-{source.get('end_line')} ({str(source.get('commit_sha') or '')[:12]})"
+            )
+        else:
+            timestamp = f" at {source['start_time']}" if source.get("start_time") else ""
         context.append(
             f"[{marker}] {where} — {source['artifact_title']}{timestamp}\n"
             f"{source['excerpt']}"
         )
         public_sources.append({**source, "marker": marker})
+    local_only = bool(
+        repository_project_ids
+        or any(policy_by_project.values())
+        or any(bool(source.get("restricted")) for source in sources))
     answer = llm.complete(
         "library_qa", get_prompt("library_qa"),
         f"QUESTION:\n{question}\n\nLIBRARY EXCERPTS:\n\n" + "\n\n---\n\n".join(context),
+        local_only=local_only,
     ).strip()
     if not answer:
         raise HTTPException(502, "the configured answer model returned no text")
@@ -205,11 +246,13 @@ def rebuild_index():
 def index_status():
     with get_session() as session:
         chunks = len(session.exec(select(SearchChunk.id)).all())
+        repository_chunks = len(session.exec(select(RepositoryChunk.id)).all())
         embeddings = len(session.exec(
             select(ChunkEmbedding.chunk_id).where(ChunkEmbedding.model == embedding_model())
         ).all())
     return {
-        "chunks": chunks, "embeddings": embeddings,
+        "chunks": chunks, "repository_chunks": repository_chunks,
+        "embeddings": embeddings,
         "semantic_enabled": bool(get_setting("search.semantic_enabled", False)),
         "embedding_model": embedding_model(),
     }

@@ -1,5 +1,10 @@
 import { useEffect, useRef, useState } from "react";
-import { api, QuickRefCategory } from "../api";
+import {
+  api,
+  GitHubCredentialStatus,
+  QuickRefCategory,
+  RepositorySettings,
+} from "../api";
 
 interface ModelCfg { provider: string; model: string }
 interface TagInfo { id: number; name: string; kind: string; count: number }
@@ -11,7 +16,13 @@ interface StepInfo { name: string; label: string }
 interface SearchConfig { semantic_enabled: boolean; embedding_provider: string; embedding_model: string }
 interface LocalModelsInfo { configured: boolean; ok: boolean; models: string[]; detail: string }
 interface SearchStatus { chunks: number; embeddings: number; semantic_enabled: boolean; embedding_model: string }
-interface BackupConfig { retention: number; schedule_hours: number; include_media: boolean; last?: { at?: string; status?: string; path?: string } | null }
+interface BackupConfig {
+  retention: number;
+  schedule_hours: number;
+  include_media: boolean;
+  include_repositories: boolean;
+  last?: { at?: string; status?: string; path?: string } | null;
+}
 interface CloudState {
   provider: string;
   providers: string[];
@@ -80,6 +91,10 @@ export default function Settings() {
   const [searchConfig, setSearchConfig] = useState<SearchConfig | null>(null);
   const [searchStatus, setSearchStatus] = useState<SearchStatus | null>(null);
   const [backupConfig, setBackupConfig] = useState<BackupConfig | null>(null);
+  const [githubCredential, setGithubCredential] = useState<GitHubCredentialStatus | null>(null);
+  const [githubToken, setGithubToken] = useState("");
+  const [githubPending, setGithubPending] = useState<"save" | "remove" | "settings" | "">("");
+  const [repositorySettings, setRepositorySettings] = useState<RepositorySettings | null>(null);
   const [reindexing, setReindexing] = useState(false);
   const [jobNotifications, setJobNotifications] = useState(
     () => localStorage.getItem("synapse.jobNotifications") === "on",
@@ -114,6 +129,8 @@ export default function Settings() {
       api<SearchConfig>("/settings/search").then(setSearchConfig),
       api<SearchStatus>("/library/index/status").then(setSearchStatus),
       api<BackupConfig>("/settings/backup").then(setBackupConfig),
+      api<GitHubCredentialStatus>("/repositories/credentials").then(setGithubCredential),
+      api<RepositorySettings>("/repositories/settings").then(setRepositorySettings),
       api<{ terms: string[] }>("/settings/glossary").then((r) => setGlossary(r.terms.join("\n"))),
       api<TagInfo[]>("/tags").then(setTags),
       api<{ max_height: number }>("/settings/download").then((r) => setMaxHeight(r.max_height)),
@@ -250,9 +267,70 @@ export default function Settings() {
         retention: backupConfig.retention,
         schedule_hours: backupConfig.schedule_hours,
         include_media: backupConfig.include_media,
+        include_repositories: backupConfig.include_repositories,
       }) });
       flash("backup policy saved");
     } catch (e: any) { flash(`save failed: ${e.message}`, true); }
+  }
+
+  async function saveGitHubCredential() {
+    const token = githubToken.trim();
+    if (!token) {
+      flash("paste a GitHub token to save it", true);
+      return;
+    }
+    setGithubPending("save");
+    try {
+      const status = await api<GitHubCredentialStatus>("/repositories/credentials", {
+        method: "PUT",
+        body: JSON.stringify({ token }),
+      });
+      setGithubCredential(status);
+      setGithubToken("");
+      flash("GitHub token encrypted and saved; repository access is checked during inspection");
+    } catch (e: any) {
+      flash(`GitHub token could not be saved: ${e.message}`, true);
+    } finally {
+      setGithubPending("");
+    }
+  }
+
+  async function removeGitHubCredential() {
+    if (!confirm("Remove the saved GitHub token? Existing snapshots and generated guides remain available, but private repositories cannot be imported or updated.")) return;
+    setGithubPending("remove");
+    try {
+      const status = await api<GitHubCredentialStatus>("/repositories/credentials", {
+        method: "DELETE",
+      });
+      setGithubCredential(status);
+      setGithubToken("");
+      flash("GitHub token removed");
+    } catch (e: any) {
+      flash(`could not remove GitHub token: ${e.message}`, true);
+    } finally {
+      setGithubPending("");
+    }
+  }
+
+  async function saveRepositorySettings() {
+    if (!repositorySettings) return;
+    setGithubPending("settings");
+    try {
+      const stored = await api<RepositorySettings>("/repositories/settings", {
+        method: "PUT",
+        body: JSON.stringify({
+          local_model: repositorySettings.local_model,
+          limits: repositorySettings.limits,
+          default_exclusions: repositorySettings.default_exclusions,
+        }),
+      });
+      setRepositorySettings(stored);
+      flash("repository analysis settings saved");
+    } catch (e: any) {
+      flash(`repository settings save failed: ${e.message}`, true);
+    } finally {
+      setGithubPending("");
+    }
   }
 
   async function toggleJobNotifications() {
@@ -429,6 +507,209 @@ export default function Settings() {
         <div className={`flash ${savedError ? "flash-error" : ""}`}
           role={savedError ? "alert" : "status"}>{saved}</div>
       )}
+
+      <section id="github-access" className="settings-section github-settings" aria-labelledby="github-access-title">
+        <h2 id="github-access-title">GitHub repository access</h2>
+        <p className="meta">
+          Public repositories work without credentials. For private repositories, use a
+          fine-grained personal access token limited to selected repositories with read-only
+          <b> Contents</b> permission. Synapse encrypts the token before storing it and never
+          puts it in repository URLs, logs, jobs, or generated guides.
+        </p>
+        <div className="settings-grid github-settings-grid">
+          <div className="card credential-card">
+            <h3>Private repository token</h3>
+            {githubCredential?.configured ? (
+              <p className="credential-status">
+                <span className={`jobstatus ${githubCredential.valid === false ? "error" : "done"}`}>
+                  {githubCredential.valid === false ? "Needs attention" : "Configured"}
+                </span>
+                {(githubCredential.masked_token || githubCredential.token) && (
+                  <code>{githubCredential.masked_token || githubCredential.token}</code>
+                )}
+                {githubCredential.login && <span>GitHub account: <b>{githubCredential.login}</b></span>}
+              </p>
+            ) : (
+              <p className="notice">No token is stored. Private repository imports will ask you to configure one.</p>
+            )}
+            <label className="stacked" htmlFor="github-token">
+              {githubCredential?.configured ? "Replace token" : "Fine-grained token"}
+              <input id="github-token" type="password" autoComplete="new-password"
+                value={githubToken} placeholder="github_pat_..."
+                onChange={(event) => setGithubToken(event.target.value)} />
+            </label>
+            <div className="row">
+              <button type="button" onClick={() => void saveGitHubCredential()}
+                disabled={!githubToken.trim() || githubPending !== ""}>
+                {githubPending === "save" ? "Saving..." : "Encrypt and save token"}
+              </button>
+              {githubCredential?.configured && (
+                <button type="button" className="linkish danger"
+                  onClick={() => void removeGitHubCredential()} disabled={githubPending !== ""}>
+                  {githubPending === "remove" ? "Removing..." : "Remove token"}
+                </button>
+              )}
+            </div>
+            {githubCredential?.message && <p className="meta" role="status">{githubCredential.message}</p>}
+          </div>
+
+          <div className="card repository-model-card">
+            <h3>Local repository analysis</h3>
+            <p>
+              Public and private repository source are <b>always local-only</b> in this release.
+              Every language-model step is forced through a local Ollama endpoint, regardless of
+              the model matrix below. Repository-derived artifacts are excluded from cloud sync.
+            </p>
+            {repositorySettings && (
+              <>
+                <label className="stacked" htmlFor="repository-local-model">Ollama model
+                  <input id="repository-local-model" value={repositorySettings.local_model}
+                    placeholder="qwen3:8b"
+                    onChange={(event) => setRepositorySettings({
+                      ...repositorySettings, local_model: event.target.value,
+                    })} />
+                </label>
+                <p className="hint">The model must already be available to the configured Ollama service.</p>
+              </>
+            )}
+          </div>
+        </div>
+
+        {repositorySettings && (
+          <details className="advanced repository-limits">
+            <summary>Repository safety limits <small>— bounds for static snapshots and analysis</small></summary>
+            <div className="knobs">
+              {repositorySettings.limits.max_download_bytes !== undefined && (
+                <label>Maximum archive size (MB)
+                  <input type="number" min="1" value={Math.round(repositorySettings.limits.max_download_bytes / 1_048_576)}
+                    onChange={(event) => setRepositorySettings({
+                      ...repositorySettings,
+                      limits: {
+                        ...repositorySettings.limits,
+                        max_download_bytes: Number(event.target.value) * 1_048_576,
+                      },
+                    })} />
+                </label>
+              )}
+              {repositorySettings.limits.max_unpacked_bytes !== undefined && (
+                <label>Maximum expanded size (MB)
+                  <input type="number" min="1" value={Math.round(repositorySettings.limits.max_unpacked_bytes / 1_048_576)}
+                    onChange={(event) => setRepositorySettings({
+                      ...repositorySettings,
+                      limits: {
+                        ...repositorySettings.limits,
+                        max_unpacked_bytes: Number(event.target.value) * 1_048_576,
+                      },
+                    })} />
+                </label>
+              )}
+              {repositorySettings.limits.max_files !== undefined && (
+                <label>Maximum files
+                  <input type="number" min="1" value={repositorySettings.limits.max_files}
+                    onChange={(event) => setRepositorySettings({
+                      ...repositorySettings,
+                      limits: { ...repositorySettings.limits, max_files: Number(event.target.value) },
+                    })} />
+                </label>
+              )}
+              {repositorySettings.limits.max_file_bytes !== undefined && (
+                <label>Maximum single file (MB)
+                  <input type="number" min="1" value={Math.round(repositorySettings.limits.max_file_bytes / 1_048_576)}
+                    onChange={(event) => setRepositorySettings({
+                      ...repositorySettings,
+                      limits: {
+                        ...repositorySettings.limits,
+                        max_file_bytes: Number(event.target.value) * 1_048_576,
+                      },
+                    })} />
+                </label>
+              )}
+              {repositorySettings.limits.max_text_file_bytes !== undefined && (
+                <label>Maximum indexed text file (MB)
+                  <input type="number" min="1" value={Math.round(repositorySettings.limits.max_text_file_bytes / 1_048_576)}
+                    onChange={(event) => setRepositorySettings({
+                      ...repositorySettings,
+                      limits: {
+                        ...repositorySettings.limits,
+                        max_text_file_bytes: Number(event.target.value) * 1_048_576,
+                      },
+                    })} />
+                </label>
+              )}
+              {repositorySettings.limits.max_indexed_bytes !== undefined && (
+                <label>Maximum indexed source (MB)
+                  <input type="number" min="1" value={Math.round(repositorySettings.limits.max_indexed_bytes / 1_048_576)}
+                    onChange={(event) => setRepositorySettings({
+                      ...repositorySettings,
+                      limits: {
+                        ...repositorySettings.limits,
+                        max_indexed_bytes: Number(event.target.value) * 1_048_576,
+                      },
+                    })} />
+                </label>
+              )}
+              {repositorySettings.limits.chunk_lines !== undefined && (
+                <label>Evidence chunk lines
+                  <input type="number" min="10" max="5000" value={repositorySettings.limits.chunk_lines}
+                    onChange={(event) => setRepositorySettings({
+                      ...repositorySettings,
+                      limits: { ...repositorySettings.limits, chunk_lines: Number(event.target.value) },
+                    })} />
+                </label>
+              )}
+              {repositorySettings.limits.chunk_chars !== undefined && (
+                <label>Evidence chunk characters
+                  <input type="number" min="1000" value={repositorySettings.limits.chunk_chars}
+                    onChange={(event) => setRepositorySettings({
+                      ...repositorySettings,
+                      limits: { ...repositorySettings.limits, chunk_chars: Number(event.target.value) },
+                    })} />
+                </label>
+              )}
+              {repositorySettings.limits.max_map_chunks !== undefined && (
+                <label>Maximum model map chunks
+                  <input type="number" min="1" max="5000" value={repositorySettings.limits.max_map_chunks}
+                    onChange={(event) => setRepositorySettings({
+                      ...repositorySettings,
+                      limits: { ...repositorySettings.limits, max_map_chunks: Number(event.target.value) },
+                    })} />
+                </label>
+              )}
+              {repositorySettings.limits.max_map_input_chars !== undefined && (
+                <label>Maximum map input characters
+                  <input type="number" min="10000" value={repositorySettings.limits.max_map_input_chars}
+                    onChange={(event) => setRepositorySettings({
+                      ...repositorySettings,
+                      limits: { ...repositorySettings.limits, max_map_input_chars: Number(event.target.value) },
+                    })} />
+                </label>
+              )}
+              {repositorySettings.limits.max_compression_ratio !== undefined && (
+                <label>Maximum archive compression ratio
+                  <input type="number" min="2" max="1000" value={repositorySettings.limits.max_compression_ratio}
+                    onChange={(event) => setRepositorySettings({
+                      ...repositorySettings,
+                      limits: { ...repositorySettings.limits, max_compression_ratio: Number(event.target.value) },
+                    })} />
+                </label>
+              )}
+              {repositorySettings.default_exclusions && (
+                <label className="stacked">Default exclusions
+                  <textarea rows={7} value={repositorySettings.default_exclusions.join("\n")}
+                    onChange={(event) => setRepositorySettings({
+                      ...repositorySettings,
+                      default_exclusions: event.target.value.split(/\r?\n/).map((value) => value.trim()).filter(Boolean),
+                    })} />
+                </label>
+              )}
+              <button type="button" onClick={() => void saveRepositorySettings()}
+                disabled={githubPending !== "" || !repositorySettings.local_model.trim()}>
+                {githubPending === "settings" ? "Saving..." : "Save repository settings"}
+              </button>
+            </div>
+          </details>
+        )}
+      </section>
 
       <h2>Model matrix</h2>
       <p className="meta">
@@ -651,6 +932,19 @@ export default function Settings() {
               })} />
             include archived source and generated audio
           </label>
+          <label className="checkline">
+            <input type="checkbox" checked={!!backupConfig.include_repositories}
+              onChange={(event) => setBackupConfig({
+                ...backupConfig, include_repositories: event.target.checked,
+              })} />
+            include retained raw repository snapshots
+          </label>
+          <p className="warning">
+            Raw repository snapshots may be large and can contain sensitive code.
+            Generated guides and the repository evidence index are included regardless of this
+            option. If any repository analysis exists, Synapse refuses to create an unencrypted
+            backup; set <code>BACKUP_ENCRYPTION_KEY</code> first.
+          </p>
           <button type="button" onClick={() => void saveBackup()}>Save backup policy</button>
           <p className="meta">
             Create, verify, and download snapshots from System. Set BACKUP_ENCRYPTION_KEY

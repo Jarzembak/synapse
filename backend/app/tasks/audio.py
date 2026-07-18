@@ -3,6 +3,7 @@ silence/off-topic trim of the source audio."""
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import subprocess
@@ -12,10 +13,12 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import httpx
+from sqlmodel import select, text
 
 from ..config import advanced, settings
 from ..db import get_session
 from .. import library, llm
+from ..models import Artifact
 from ..settings_store import get_setting
 from .celery_app import celery
 from .common import artifact_body, auto_tag, get_project, pipeline_task, progress
@@ -30,6 +33,7 @@ KOKORO_FILES = {
         "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin",
 }
 DEFAULT_VOICES = {"HOST_A": "am_michael", "HOST_B": "af_heart"}
+log = logging.getLogger("synapse.audio")
 # Piper: single-speaker ONNX voices pulled per-name from the rhasspy voice repo.
 DEFAULT_PIPER_VOICES = {"HOST_A": "en_US-ryan-medium", "HOST_B": "en_US-amy-medium"}
 PIPER_REPO = "https://huggingface.co/rhasspy/piper-voices/resolve/main"
@@ -317,6 +321,18 @@ def tts(job_id: int, project_id: int):
     with get_session() as session:
         project = get_project(session, project_id)
         script = artifact_body(session, project_id, "podcast_script")
+        script_artifact = session.exec(
+            select(Artifact).where(
+                Artifact.project_id == project_id,
+                Artifact.type == "podcast_script",
+            )
+        ).first()
+        restricted = bool(
+            (script_artifact and script_artifact.restricted)
+            or (script_artifact and library.artifact_is_repository_derived(
+                session, script_artifact))
+            or library.project_is_restricted(session, project_id)
+        )
 
     lines = parse_script(script)
     if not lines:
@@ -324,6 +340,11 @@ def tts(job_id: int, project_id: int):
 
     wd = media.workdir(project.slug)
     provider, model = llm.resolve_model("tts")
+    # Gemini TTS receives the full generated script. Repository derivatives
+    # must never leave the host, regardless of the global TTS
+    # selection, so force the established local Piper path.
+    if restricted and provider == "gemini":
+        provider, model = "piper", "en_US-ryan-medium"
     on_progress = lambda m: progress(job_id, m)  # noqa: E731
     out: Path | None = None
     try:
@@ -432,23 +453,49 @@ def _store_audio(project_id: int, slug: str, title: str, produced: Path, *,
     dest = library.lib_path(media_rel)
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(dest.suffix + f".{os.getpid()}.tmp")
+    previous = dest.read_bytes() if dest.exists() else None
+    art = None
     try:
-        shutil.copyfile(produced, tmp)
-        os.replace(tmp, dest)
-    finally:
-        tmp.unlink(missing_ok=True)
-
-    with get_session() as session:
-        art = library.write_artifact(
-            session,
-            project_id=project_id,
-            project_slug=slug,
-            type=type,
-            title=f"{title_prefix} — {title}",
-            body=note,
-            media_rel=media_rel,
-            provider=provider,
-            model=model,
-            extra_meta={"duration_seconds": media.duration_seconds(dest), **(extra or {})},
-        )
-        auto_tag(project_id, art.id)  # inherits the project's canonical tag set
+        with get_session() as session:
+            # Keep a writer lease from payload publication through sidecar/DB
+            # commit so backups and deletion cannot capture a half-published
+            # audio artifact.
+            session.exec(text("BEGIN IMMEDIATE"))
+            try:
+                shutil.copyfile(produced, tmp)
+                os.replace(tmp, dest)
+            finally:
+                tmp.unlink(missing_ok=True)
+            art = library.write_artifact(
+                session,
+                project_id=project_id,
+                project_slug=slug,
+                type=type,
+                title=f"{title_prefix} — {title}",
+                body=note,
+                media_rel=media_rel,
+                provider=provider,
+                model=model,
+                extra_meta={"duration_seconds": media.duration_seconds(dest), **(extra or {})},
+            )
+    except Exception:
+        # A canceled/deleted job can lose the guarded sidecar publication after
+        # synthesis. Restore the previous payload (or remove the new one) so no
+        # untracked private MP3 survives for backup or cloud discovery.
+        if previous is None:
+            dest.unlink(missing_ok=True)
+        else:
+            library._atomic_write_bytes(dest, previous)
+        try:
+            dest.parent.rmdir()
+        except OSError:
+            pass
+        raise
+    try:
+        # Tagging is an asynchronous enhancement after publication. A broker
+        # error must not roll back an already committed sidecar/DB row or make
+        # the payload disappear underneath a queued cloud upload.
+        auto_tag(project_id, art.id)
+    except Exception:
+        log.warning("could not queue tags for audio artifact %s", art.id,
+                    exc_info=True)

@@ -8,6 +8,7 @@ from sqlmodel import select
 from .. import library
 from ..db import get_session
 from ..models import Artifact
+from ..recovery import rebuild_repository_fts
 from ..search import index_artifact
 from ..settings_store import get_setting
 from .celery_app import celery
@@ -51,8 +52,16 @@ def rebuild_search(job_id: int):
                 set_job(session, job_id,
                         progress=f"indexed {position}/{len(artifact_ids)} artifacts")
         with get_session() as session:
+            repository_indexed = rebuild_repository_fts(
+                session,
+                on_progress=lambda message: set_job(
+                    session, job_id, progress=message),
+            )
+            session.commit()
+        with get_session() as session:
             transition_job(session, job_id, {"running"}, "done",
-                           progress=f"complete; {indexed} semantic chunks")
+                           progress=(f"complete; {indexed} semantic chunks; "
+                                     f"{repository_indexed} repository chunks"))
     except Exception as exc:
         log.exception("search rebuild failed")
         with get_session() as session:

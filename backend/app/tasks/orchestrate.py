@@ -1,4 +1,10 @@
-"""Dependency-aware, restart-safe orchestration for the media pipeline."""
+"""Dependency-aware, restart-safe orchestration for every project source.
+
+The media and repository pipelines deliberately share the durable job runner,
+but not their dependency graph.  In particular, repository source is never
+adapted into a pretend transcript: GitHub projects start from a pinned snapshot
+and line-addressed evidence inventory.
+"""
 from __future__ import annotations
 
 import json
@@ -16,7 +22,7 @@ from .common import TERMINAL_JOB_STATES, set_job, transition_job
 
 log = logging.getLogger("synapse.pipeline")
 
-STEPS: list[tuple[str, str]] = [
+MEDIA_STEPS: list[tuple[str, str]] = [
     ("ingest", "Ingest media"),
     ("download", "Download & keep media"),
     ("transcribe", "Transcript"),
@@ -31,10 +37,34 @@ STEPS: list[tuple[str, str]] = [
     ("trim", "Trim audio"),
     ("mindmap", "Mind map"),
 ]
-STEP_NAMES = {s for s, _ in STEPS}
-STEP_LABELS = dict(STEPS)
 
-HARD_DEPS: dict[str, set[str]] = {
+REPOSITORY_STEPS: list[tuple[str, str]] = [
+    ("repo_snapshot", "Snapshot & scan repository"),
+    ("repo_inventory", "Repository inventory"),
+    ("summarize", "Repository overview"),
+    ("repo_usage", "Setup & usage guide"),
+    ("repo_architecture", "Architecture & code map"),
+    ("repo_expertise", "Required knowledge"),
+    ("repo_environment", "Dependencies & environment"),
+    ("deepdive_claude", "Deep dive (perspective A)"),
+    ("deepdive_gemini", "Deep dive (perspective B)"),
+    ("merge", "Merge deep dives"),
+    ("quickref", "Quick-references"),
+    ("podcast_script", "Podcast script"),
+    ("tts", "Podcast audio"),
+    ("mindmap", "Mind map"),
+]
+
+# Legacy exports are a union registry.  Existing API/tests import these names;
+# execution always uses the source-specific helpers below so shared steps such
+# as ``summarize`` cannot accidentally acquire both media and repo dependencies.
+STEPS: list[tuple[str, str]] = MEDIA_STEPS + [
+    item for item in REPOSITORY_STEPS if item[0] not in {s for s, _ in MEDIA_STEPS}
+]
+STEP_NAMES = {s for s, _ in STEPS}
+STEP_LABELS = {**dict(MEDIA_STEPS), **dict(REPOSITORY_STEPS)}
+
+MEDIA_HARD_DEPS: dict[str, set[str]] = {
     "ingest": set(),
     "download": set(),
     "transcribe": {"ingest"},
@@ -50,19 +80,66 @@ HARD_DEPS: dict[str, set[str]] = {
     "mindmap": {"merge"},
 }
 
-RUN_DEPS: dict[str, set[str]] = {
-    **HARD_DEPS,
+MEDIA_RUN_DEPS: dict[str, set[str]] = {
+    **MEDIA_HARD_DEPS,
     "summarize": {"correct"},
     "deepdive_claude": {"correct"},
     "deepdive_gemini": {"correct"},
 }
 
+_REPO_GUIDES = {"summarize", "repo_usage", "repo_architecture",
+                "repo_expertise", "repo_environment"}
+REPOSITORY_HARD_DEPS: dict[str, set[str]] = {
+    "repo_snapshot": set(),
+    "repo_inventory": {"repo_snapshot"},
+    "summarize": {"repo_inventory"},
+    "repo_usage": {"repo_inventory"},
+    "repo_architecture": {"repo_inventory"},
+    "repo_expertise": {"repo_inventory"},
+    "repo_environment": {"repo_inventory"},
+    "deepdive_claude": set(_REPO_GUIDES),
+    "deepdive_gemini": set(_REPO_GUIDES),
+    "merge": {"deepdive_claude", "deepdive_gemini"},
+    "quickref": {"merge"},
+    "podcast_script": {"merge"},
+    "tts": {"podcast_script"},
+    "mindmap": {"merge"},
+}
+REPOSITORY_RUN_DEPS = REPOSITORY_HARD_DEPS
+
+# Compatibility graphs: media semantics for shared steps, repository-only
+# entries for the new steps.  Call deps_for(project) for actual execution.
+HARD_DEPS: dict[str, set[str]] = {
+    **MEDIA_HARD_DEPS,
+    "repo_snapshot": set(),
+    "repo_inventory": {"repo_snapshot"},
+    "repo_usage": {"repo_inventory"},
+    "repo_architecture": {"repo_inventory"},
+    "repo_expertise": {"repo_inventory"},
+    "repo_environment": {"repo_inventory"},
+}
+RUN_DEPS: dict[str, set[str]] = {
+    **MEDIA_RUN_DEPS,
+    "repo_snapshot": set(),
+    "repo_inventory": {"repo_snapshot"},
+    "repo_usage": {"repo_inventory"},
+    "repo_architecture": {"repo_inventory"},
+    "repo_expertise": {"repo_inventory"},
+    "repo_environment": {"repo_inventory"},
+}
+
 STEP_OUTPUT: dict[str, str | None] = {
+    "repo_snapshot": None,
+    "repo_inventory": "repo_inventory",
     "ingest": None,
     "download": "source_video",
     "transcribe": "transcript",
     "correct": "corrected",
     "summarize": "summary",
+    "repo_usage": "repo_usage",
+    "repo_architecture": "repo_architecture",
+    "repo_expertise": "repo_expertise",
+    "repo_environment": "repo_environment",
     "deepdive_claude": "deepdive_claude",
     "deepdive_gemini": "deepdive_gemini",
     "merge": "deepdive_merged",
@@ -77,7 +154,7 @@ BUILTIN_PROFILES: dict[str, dict] = {
     "full": {
         "label": "Full production",
         "description": "Every applicable artifact, including media, podcast audio and trim.",
-        "steps": [s for s, _ in STEPS],
+        "steps": [s for s, _ in MEDIA_STEPS],
     },
     "research": {
         "label": "Research library",
@@ -100,14 +177,51 @@ BUILTIN_PROFILES: dict[str, dict] = {
             "deepdive_gemini", "merge", "podcast_script", "tts", "trim",
         ],
     },
+    "repository": {
+        "label": "Repository deep study",
+        "description": "Pinned static repository analysis, guides, deep dives and learning media.",
+        "steps": [s for s, _ in REPOSITORY_STEPS],
+    },
 }
 
 
-def pipeline_profiles() -> dict[str, dict]:
+def is_repository_project(project: Project) -> bool:
+    return project.source_type == "github"
+
+
+def step_specs(project: Project | None = None) -> list[tuple[str, str]]:
+    if project is not None and is_repository_project(project):
+        return list(REPOSITORY_STEPS)
+    # The unscoped endpoint is the legacy media catalog. Repository callers
+    # always have a project and receive their source-specific graph above.
+    return list(MEDIA_STEPS)
+
+
+def steps_for(project: Project) -> list[tuple[str, str]]:
+    """Stable alias used by API callers that need ordered display metadata."""
+    return step_specs(project)
+
+
+def step_names(project: Project | None = None) -> set[str]:
+    return {name for name, _label in step_specs(project)}
+
+
+def step_output(step: str) -> str | None:
+    return STEP_OUTPUT.get(step)
+
+
+def deps_for(project: Project, *, run: bool = False) -> dict[str, set[str]]:
+    if is_repository_project(project):
+        return REPOSITORY_RUN_DEPS if run else REPOSITORY_HARD_DEPS
+    return MEDIA_RUN_DEPS if run else MEDIA_HARD_DEPS
+
+
+def pipeline_profiles(project: Project | None = None) -> dict[str, dict]:
     custom = get_setting("pipeline.profiles") or {}
     clean: dict[str, dict] = {}
+    allowed = step_names(project)
     for key, profile in custom.items():
-        steps = [s for s in profile.get("steps", []) if s in STEP_NAMES]
+        steps = [s for s in profile.get("steps", []) if s in allowed]
         if key and steps:
             clean[key] = {
                 "label": profile.get("label") or key,
@@ -115,11 +229,27 @@ def pipeline_profiles() -> dict[str, dict]:
                 "steps": steps,
                 "custom": True,
             }
-    return {**BUILTIN_PROFILES, **clean}
+    if project is None:
+        builtins = BUILTIN_PROFILES
+    elif is_repository_project(project):
+        repository = dict(BUILTIN_PROFILES["repository"])
+        builtins = {
+            "full": {
+                **repository,
+                "label": "Full repository study",
+                "description": "Every static repository artifact, including learning media.",
+            },
+            "repository": repository,
+        }
+    else:
+        builtins = {key: value for key, value in BUILTIN_PROFILES.items()
+                    if key != "repository"}
+    return {**builtins, **clean}
 
 
 def applicable_steps(project: Project) -> list[str]:
-    return [s for s, _ in STEPS if s != "download" or project.source_type == "url"]
+    return [s for s, _ in step_specs(project)
+            if s != "download" or project.source_type == "url"]
 
 
 def _artifact_for_step(session, project_id: int, step: str) -> Artifact | None:
@@ -159,6 +289,21 @@ def step_done(session, project: Project, step: str,
             return path.is_file() and path.stat().st_size > 0
         except (FileNotFoundError, OSError):
             return False
+    if step == "repo_snapshot":
+        try:
+            from ..repository import (current_repository_snapshot,
+                                      repository_scan_config_hash,
+                                      repository_source_for_project)
+
+            source = repository_source_for_project(session, project.id)
+            snapshot = current_repository_snapshot(session, project.id)
+            return bool(
+                source and snapshot and snapshot.status == "ready"
+                and not source.pending_sha
+                and snapshot.scan_config_hash == repository_scan_config_hash(source)
+            )
+        except (ImportError, AttributeError, ValueError):
+            return False
     if step == "quickref":
         job = session.exec(
             select(Job).where(Job.project_id == project.id, Job.task == "quickref",
@@ -170,7 +315,8 @@ def step_done(session, project: Project, step: str,
 
 def missing_deps(session, project: Project, step: str,
                  artifact_types: set[str] | None = None) -> list[str]:
-    return [STEP_LABELS[d] for d in sorted(HARD_DEPS[step])
+    labels = dict(steps_for(project))
+    return [labels[d] for d in sorted(deps_for(project)[step])
             if not step_done(session, project, d, artifact_types)]
 
 
@@ -224,11 +370,14 @@ def _job_options(job: Job) -> dict:
 def _selected_steps(project: Project, options: dict) -> set[str]:
     applicable = set(applicable_steps(project))
     if options.get("steps") is not None:
-        selected = {s for s in options["steps"] if s in STEP_NAMES}
+        selected = {s for s in options["steps"] if s in applicable}
     else:
-        profile = pipeline_profiles().get(options.get("profile") or "full", BUILTIN_PROFILES["full"])
+        profiles = pipeline_profiles(project)
+        default_profile = "repository" if is_repository_project(project) else "full"
+        profile = profiles.get(options.get("profile") or default_profile,
+                               profiles[default_profile])
         selected = set(profile["steps"])
-    return dependency_closure(selected) & applicable
+    return dependency_closure(selected, deps_for(project, run=True)) & applicable
 
 
 def maybe_start_next_run_all() -> None:
@@ -346,7 +495,7 @@ def cancel_children(parent_job_id: int, reason: str = "parent run canceled") -> 
         return len(children)
 
 
-@celery.task(name="run_all")
+@celery.task(name="run_all", soft_time_limit=25 * 3600, time_limit=26 * 3600)
 def run_all(job_id: int, project_id: int):
     """Run the selected profile, dispatching steps as dependencies complete."""
     jobs: dict[str, int] = {}
@@ -361,6 +510,7 @@ def run_all(job_id: int, project_id: int):
                 return
             options = _job_options(parent)
             selected = _selected_steps(project, options)
+            run_deps = deps_for(project, run=True)
             force_steps = {s for s in options.get("force_steps", []) if s in selected}
             todo = [s for s in applicable_steps(project) if s in selected and (
                 s in force_steps or not step_done(session, project, s) or step_stale(session, project, s)
@@ -382,7 +532,9 @@ def run_all(job_id: int, project_id: int):
         running = set(adopted)
         done: set[str] = set()
         failed: set[str] = set()
-        deadline = time.monotonic() + float(options.get("timeout_seconds") or 6 * 3600)
+        default_timeout = 24 * 3600 if project.source_type == "github" else 6 * 3600
+        deadline = time.monotonic() + float(
+            options.get("timeout_seconds") or default_timeout)
 
         while (pending or running) and time.monotonic() < deadline:
             with get_session() as session:
@@ -394,7 +546,7 @@ def run_all(job_id: int, project_id: int):
 
             ready = [s for s in list(pending)
                      if all(dep_satisfied(s, dep, done, pending, running, failed)
-                            for dep in RUN_DEPS[s])]
+                            for dep in run_deps[s])]
             for step in ready:
                 pending.discard(step)
                 child, error = _dispatch_step(job_id, project_id, step)
@@ -402,7 +554,7 @@ def run_all(job_id: int, project_id: int):
                     jobs[step] = child.id
                 if error or not child:
                     failed.add(step)
-                    skipped = transitive_dependents(step, RUN_DEPS) & pending
+                    skipped = transitive_dependents(step, run_deps) & pending
                     pending.difference_update(skipped)
                     failed.update(skipped)
                     _skip_steps(job_id, project_id, skipped,
@@ -424,7 +576,7 @@ def run_all(job_id: int, project_id: int):
                     elif child.status in ("error", "canceled"):
                         running.discard(step)
                         failed.add(step)
-                        skipped = transitive_dependents(step, RUN_DEPS) & pending
+                        skipped = transitive_dependents(step, run_deps) & pending
                         pending.difference_update(skipped)
                         failed.update(skipped)
                         _skip_steps(job_id, project_id, skipped,
