@@ -442,7 +442,8 @@ def _ollama(system: str, user: str, model: str, max_tokens: int,
 
 def _openai_compat(system: str, user: str, model: str, max_tokens: int,
                    temperature: float | None, json_format: bool = False) -> str:
-    """Any OpenAI-compatible local server: LM Studio, llama.cpp, vLLM, …"""
+    """Any OpenAI-compatible server: LM Studio, llama.cpp, vLLM, … — or
+    OpenAI itself (OPENAI_COMPAT_BASE_URL=https://api.openai.com/v1)."""
     from openai import OpenAI
 
     cfg = _local_cfg()
@@ -453,24 +454,36 @@ def _openai_compat(system: str, user: str, model: str, max_tokens: int,
             "(e.g. http://host.docker.internal:1234/v1 for LM Studio)")
     client = OpenAI(base_url=base, api_key=settings.openai_compat_api_key or "local",
                     timeout=float(cfg["timeout_seconds"]), max_retries=0)
-    kw = {} if temperature is None else {"temperature": temperature}
+    kw: dict = {"max_tokens": max_tokens}
+    if temperature is not None:
+        kw["temperature"] = temperature
     if json_format and cfg.get("json_mode", True):
         kw["response_format"] = {"type": "json_object"}
     messages = [
         {"role": "system", "content": system},
         {"role": "user", "content": user},
     ]
-    try:
-        resp = client.chat.completions.create(
-            model=model, max_tokens=max_tokens, messages=messages, **kw)
-    except Exception as exc:
-        # not every server implements response_format; drop it and retry once
-        if "response_format" in kw and getattr(exc, "status_code", None) == 400:
-            log.warning("%s rejected response_format (%s); retrying without", base, exc)
-            kw.pop("response_format")
+    # Two per-call fallbacks, each dropped at most once on a 400: OpenAI's
+    # reasoning models take max_completion_tokens instead of max_tokens, and
+    # not every local server implements response_format.
+    for _ in range(3):
+        try:
             resp = client.chat.completions.create(
-                model=model, max_tokens=max_tokens, messages=messages, **kw)
-        else:
+                model=model, messages=messages, **kw)
+            break
+        except Exception as exc:
+            if getattr(exc, "status_code", None) == 400:
+                if ("max_tokens" in kw
+                        and "max_completion_tokens" in str(exc)):
+                    log.warning("%s wants max_completion_tokens (%s); retrying",
+                                base, exc)
+                    kw["max_completion_tokens"] = kw.pop("max_tokens")
+                    continue
+                if "response_format" in kw:
+                    log.warning("%s rejected response_format (%s); retrying without",
+                                base, exc)
+                    kw.pop("response_format")
+                    continue
             raise
     if resp.usage:
         _usage.set((resp.usage.prompt_tokens or 0, resp.usage.completion_tokens or 0))

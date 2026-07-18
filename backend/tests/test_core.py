@@ -505,6 +505,53 @@ def test_openai_compat_response_format_fallback(monkeypatch):
     assert "response_format" not in calls[1]
 
 
+def test_openai_compat_max_completion_tokens_fallback(monkeypatch):
+    """OpenAI's reasoning models reject max_tokens in favor of
+    max_completion_tokens; both that and the response_format fallback may
+    fire on the same call."""
+    import types
+
+    import openai
+
+    from app import llm
+
+    calls = []
+
+    class FakeCompletions:
+        @staticmethod
+        def create(**kwargs):
+            calls.append(kwargs)
+            if "max_tokens" in kwargs:
+                exc = RuntimeError(
+                    "Unsupported parameter: 'max_tokens' is not supported with "
+                    "this model. Use 'max_completion_tokens' instead.")
+                exc.status_code = 400
+                raise exc
+            if "response_format" in kwargs:
+                exc = RuntimeError("response_format is not supported")
+                exc.status_code = 400
+                raise exc
+            message = types.SimpleNamespace(content='{"ok": 1}')
+            return types.SimpleNamespace(
+                choices=[types.SimpleNamespace(message=message)],
+                usage=types.SimpleNamespace(prompt_tokens=5, completion_tokens=2),
+            )
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            self.chat = types.SimpleNamespace(completions=FakeCompletions())
+
+    monkeypatch.setattr(llm.settings, "openai_compat_base_url",
+                        "https://api.openai.com/v1")
+    monkeypatch.setattr(llm, "advanced", lambda group: dict(LOCAL_CFG))
+    monkeypatch.setattr(openai, "OpenAI", FakeClient)
+    out = llm._openai_compat("s", "u", "gpt-5-mini", 64, None, json_format=True)
+    assert out == '{"ok": 1}'
+    assert "max_tokens" in calls[0]
+    assert calls[1]["max_completion_tokens"] == 64 and "max_tokens" not in calls[1]
+    assert "response_format" not in calls[2]
+
+
 def test_complete_retries_empty_responses(monkeypatch):
     from app import llm
 
