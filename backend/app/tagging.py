@@ -63,7 +63,8 @@ def sanitize_tags(names: list[str]) -> list[str]:
     return out
 
 
-def tag_text(session: Session, title: str, doc_type: str, body: str) -> list[str]:
+def tag_text(session: Session, title: str, doc_type: str, body: str, *,
+             local_only: bool = False) -> list[str]:
     """One LLM tagging call over a document; returns tag names (not applied)."""
     rules = advanced("pipeline")
     max_tags = int(rules.get("max_tags", 8))
@@ -76,7 +77,10 @@ def tag_text(session: Session, title: str, doc_type: str, body: str) -> list[str
     else:
         system += "\nYou MUST use existing vocabulary tags only — never invent new ones."
 
-    vocab = session.exec(select(Tag.name)).all()
+    vocabulary_query = select(Tag.name)
+    if not local_only:
+        vocabulary_query = vocabulary_query.where(Tag.restricted == False)  # noqa: E712
+    vocab = session.exec(vocabulary_query).all()
     doc = body[:12000]
     result = llm.complete_json(
         "tag",
@@ -86,6 +90,7 @@ def tag_text(session: Session, title: str, doc_type: str, body: str) -> list[str
         'Reply as {"tags": ["...", ...]}',
         # cap output so a looping local model can't run away generating tags
         max_tokens=512,
+        local_only=local_only,
     )
     raw = [n for n in result.get("tags", []) if isinstance(n, str)]
     known = set(vocab)
@@ -111,6 +116,11 @@ def tag_text(session: Session, title: str, doc_type: str, body: str) -> list[str
 def tag_artifact(session: Session, artifact: Artifact, body: str) -> list[str]:
     """Tag one artifact from its own content (used for quick-ref docs, whose
     content is their own; project artifacts share a project-level tag set)."""
-    names = tag_text(session, artifact.title, artifact.type, body)
+    names = tag_text(
+        session, artifact.title, artifact.type, body,
+        local_only=bool(
+            getattr(artifact, "restricted", False)
+            or library.artifact_is_repository_derived(session, artifact)),
+    )
     library.apply_tags(session, artifact, names)
     return names

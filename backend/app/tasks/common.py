@@ -101,12 +101,29 @@ def pipeline_task(fn):
                          fn.__name__, job_id)
                 return None
         try:
+            local_only_policy: bool | None = None
+            with get_session() as policy_session:
+                policy_project = policy_session.get(Project, project_id)
+            if (policy_project and policy_project.source_type == "github"
+                    and fn.__name__ != "repo_snapshot"):
+                from ..repository import repository_processing_policy
+
+                # Repository analysis is deliberately local-only in v1 for
+                # public and private sources alike. Visibility refresh still
+                # escalates durable privacy, but no timing race can expose a
+                # repository excerpt to a cloud model.
+                repository_processing_policy(project_id)
+                local_only_policy = True
             context_token = current_job_id.set(job_id)
             try:
-                result = fn(job_id, project_id, *args, **kwargs)
+                from .. import llm
+
+                with llm.project_scope(
+                        project_id, local_only=local_only_policy):
+                    result = fn(job_id, project_id, *args, **kwargs)
             finally:
                 current_job_id.reset(context_token)
-            if fn.__name__ in {"ingest", "quickref"}:
+            if fn.__name__ in {"ingest", "repo_snapshot", "quickref"}:
                 try:
                     from ..provenance import record_nonartifact_step
 
@@ -180,7 +197,18 @@ def auto_tag(project_id: int | None, artifact_id: int) -> None:
 
     with get_session() as session:
         art = session.get(Artifact, artifact_id)
-    if art and art.type.startswith("quickref_"):
-        tag_task.delay(artifact_id)
-    elif project_id:
-        tag_project.delay(project_id)
+        project = session.get(Project, project_id) if project_id else None
+    if (project and project.source_type == "github"
+            and (not art or art.type != "deepdive_merged")):
+        # One canonical tag pass after the merged guide is enough to propagate
+        # across repository artifacts; per-guide/per-quickref tasks would
+        # otherwise contend with the long local analysis run.
+        return
+    try:
+        if art and art.type.startswith("quickref_"):
+            tag_task.delay(artifact_id)
+        elif project_id:
+            tag_project.delay(project_id)
+    except Exception:
+        log.warning("could not queue automatic tagging for artifact %s",
+                    artifact_id, exc_info=True)

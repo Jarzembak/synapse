@@ -16,11 +16,14 @@ mode) is tuned from Settings → Advanced → Local models (`advanced("local")`)
 """
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import re
 import time
+from contextlib import contextmanager
 from contextvars import ContextVar
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -31,7 +34,145 @@ log = logging.getLogger("synapse.llm")
 
 MAX_TOKENS = 16384
 LOCAL_PROVIDERS = {"ollama", "openai_compat"}
+# Repository evidence prompts are sized for the 64k window the bundled Ollama
+# service allocates (OLLAMA_CONTEXT_LENGTH), and repository generation may run
+# CPU-only; restricted calls must not inherit the smaller general-purpose
+# context window or timeout tuned for transcript chunks.
+REPOSITORY_NUM_CTX = 65536
+REPOSITORY_TIMEOUT_SECONDS = 1800.0
 _usage: ContextVar[tuple[int, int]] = ContextVar("llm_usage", default=(0, 0))
+_project_scope: ContextVar[tuple[int | None, bool | None]] = ContextVar(
+    "llm_project_scope", default=(None, None))
+
+
+@contextmanager
+def project_scope(project_id: int | None, *, local_only: bool | None = None):
+    """Attach project privacy to calls that do not have a persisted Job.
+
+    Normal pipeline calls are discoverable through ``current_job_id``.  Small
+    follow-on tasks such as auto-tagging carry only an artifact/project id, so
+    they use this explicit scope to keep the same local-only boundary.
+    """
+    token = _project_scope.set((project_id, local_only))
+    try:
+        yield
+    finally:
+        _project_scope.reset(token)
+
+
+def _repository_local_only() -> bool:
+    """Return the active project's policy, failing closed for incomplete repos."""
+    scoped_project_id, scoped_policy = _project_scope.get()
+    if scoped_policy is not None:
+        return bool(scoped_policy)
+    project_id = scoped_project_id
+    try:
+        if project_id is None:
+            from .context import current_job_id
+            from .db import get_session
+            from .models import Job
+
+            job_id = current_job_id.get()
+            if not job_id:
+                return False
+            with get_session() as session:
+                job = session.get(Job, job_id)
+                project_id = job.project_id if job else None
+        if project_id is None:
+            return False
+
+        from .db import get_session
+        from .models import Project
+
+        with get_session() as session:
+            project = session.get(Project, project_id)
+            if not project or project.source_type != "github":
+                return False
+            from sqlmodel import select
+
+            from .models import RepositorySource
+
+            source = session.exec(
+                select(RepositorySource).where(RepositorySource.project_id == project_id)
+            ).first()
+            # A GitHub project whose policy row is missing or unreadable must
+            # not become cloud-eligible by accident.
+            if source is None:
+                return True
+            private = bool(getattr(source, "is_private",
+                                   getattr(source, "private", False)))
+            return private or bool(getattr(source, "local_only", False))
+    except ImportError:
+        # During an old-schema startup there cannot yet be a valid GitHub
+        # project.  A scoped repository id is nevertheless treated as private.
+        return project_id is not None
+
+
+def _local_model() -> str:
+    configured = get_setting("repository.local_model", "qwen3:8b") or "qwen3:8b"
+    if isinstance(configured, dict):
+        provider = configured.get("provider", "ollama")
+        model = configured.get("model", "")
+        if provider != "ollama":
+            raise RuntimeError("repository.local_model must use the ollama provider")
+    else:
+        model = str(configured or "")
+    try:
+        return validate_local_ollama_model(model)
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
+
+
+def validate_local_ollama_model(value: str) -> str:
+    """Reject model identifiers that can invoke Ollama cloud offload."""
+    model = str(value or "").strip()
+    if (not model or len(model) > 200 or any(ord(char) < 32 for char in model)
+            or any(char.isspace() for char in model)
+            or "://" in model or "\\" in model
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/:@-]*", model)):
+        raise ValueError("model must name a valid local Ollama model")
+    if "cloud" in re.split(r"[._/:@-]+", model.casefold()):
+        raise ValueError("local-only processing cannot use an Ollama cloud model")
+    return model
+
+
+def require_local_ollama_endpoint() -> None:
+    """Fail closed if private data would be sent to a remote Ollama server."""
+    try:
+        parsed = urlsplit(settings.ollama_base_url)
+        host = (parsed.hostname or "").rstrip(".").lower()
+        parsed.port
+    except ValueError as exc:
+        raise RuntimeError("OLLAMA_BASE_URL is invalid for local-only processing") from exc
+    allowed_names = {"localhost", "ollama", "host.docker.internal"}
+    try:
+        loopback = ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        loopback = False
+    if (parsed.scheme not in {"http", "https"} or not (host in allowed_names or loopback)
+            or parsed.username or parsed.password or parsed.query or parsed.fragment):
+        raise RuntimeError(
+            "repository processing requires OLLAMA_BASE_URL to use the "
+            "local Ollama service, localhost, or a loopback address"
+        )
+
+
+def _enforce_local_provider(function: str, provider: str, model: str,
+                            *, local_only: bool = False) -> tuple[str, str]:
+    # ASR is unrelated to static repository projects. Repository TTS is pinned
+    # here as well as at execution so effective provenance and actual synthesis
+    # agree even when the global model matrix selects Gemini.
+    if function == "asr":
+        return provider, model
+    restricted = bool(local_only or _repository_local_only())
+    if function == "tts":
+        return ("piper", "en_US-ryan-medium") if restricted else (provider, model)
+    if restricted:
+        require_local_ollama_endpoint()
+        return "ollama", _local_model()
+    if provider == "ollama":
+        return provider, model
+    return provider, model
 
 
 class LLMHTTPError(RuntimeError):
@@ -88,9 +229,10 @@ def _is_transient(exc: Exception) -> bool:
 def resolve_model(function: str) -> tuple[str, str]:
     override = get_setting(f"model.{function}")
     if override:
-        return override["provider"], override["model"]
+        provider, model = override["provider"], override["model"]
+        return _enforce_local_provider(function, provider, model)
     d = FUNCTION_DEFAULTS[function]
-    return d["provider"], d["model"]
+    return _enforce_local_provider(function, d["provider"], d["model"])
 
 
 def resolve_params(function: str) -> tuple[float | None, int]:
@@ -110,9 +252,13 @@ def complete(
     provider: str | None = None,
     model: str | None = None,
     json_format: bool = False,
+    local_only: bool = False,
 ) -> str:
+    restricted = bool(local_only or _repository_local_only())
     if provider is None or model is None:
         provider, model = resolve_model(function)
+    provider, model = _enforce_local_provider(
+        function, provider, model, local_only=restricted)
     temperature, cfg_max = resolve_params(function)
     if max_tokens is None:
         max_tokens = cfg_max
@@ -129,7 +275,7 @@ def complete(
             try:
                 if provider == "ollama":
                     output = _ollama(system, user, model, max_tokens, temperature,
-                                     json_format)
+                                     json_format, restricted=restricted)
                 elif provider == "openai_compat":
                     output = _openai_compat(system, user, model, max_tokens,
                                             temperature, json_format)
@@ -218,12 +364,20 @@ def _local_cfg() -> dict:
 
 
 def _ollama(system: str, user: str, model: str, max_tokens: int,
-            temperature: float | None, json_format: bool = False) -> str:
+            temperature: float | None, json_format: bool = False,
+            *, restricted: bool = False) -> str:
     """Ollama's native /api/chat. The native API (unlike its OpenAI-compat
     shim) accepts per-call options — critically num_ctx, without which long
     transcript chunks are silently truncated at the server's default window."""
     cfg = _local_cfg()
     options: dict = {"num_predict": max_tokens, "num_ctx": int(cfg["num_ctx"])}
+    timeout_seconds = float(cfg["timeout_seconds"])
+    if restricted:
+        # Repository (local-only) calls: per-request options override the
+        # server's OLLAMA_CONTEXT_LENGTH, so floor them at the window and
+        # timeout the repository evidence budgets were sized for.
+        options["num_ctx"] = max(options["num_ctx"], REPOSITORY_NUM_CTX)
+        timeout_seconds = max(timeout_seconds, REPOSITORY_TIMEOUT_SECONDS)
     if temperature is not None:
         options["temperature"] = temperature
     payload: dict = {
@@ -246,21 +400,42 @@ def _ollama(system: str, user: str, model: str, max_tokens: int,
         except (TypeError, ValueError):
             payload["keep_alive"] = keep_alive
     think = cfg.get("think", "auto")
-    if think in ("on", "off"):
+    if restricted:
+        # Repository (local-only) steps: Qwen3 enables thinking by default,
+        # but deterministic repository JSON and cited guides need the bounded
+        # completion budget for visible output, not hidden reasoning tokens.
+        payload["think"] = False
+    elif think in ("on", "off"):
         payload["think"] = think == "on"
     if json_format and cfg.get("json_mode", True):
         payload["format"] = "json"
-    response = httpx.post(
-        f"{settings.ollama_base_url}/api/chat", json=payload,
-        timeout=httpx.Timeout(float(cfg["timeout_seconds"]), connect=10),
-    )
-    if response.status_code >= 400:
-        try:
-            detail = response.json().get("error") or response.text
-        except ValueError:
-            detail = response.text
-        raise LLMHTTPError(f"ollama returned {response.status_code}: {detail[:500]}",
-                           response.status_code)
+    # Ollama is a local transport boundary. Never let HTTP(S)_PROXY redirect
+    # private prompts through an outbound proxy even when the URL hostname is
+    # local-looking (for example `ollama` in Docker Compose).
+    for _ in range(2):
+        response = httpx.post(
+            f"{settings.ollama_base_url}/api/chat", json=payload,
+            timeout=httpx.Timeout(timeout_seconds, connect=10),
+            trust_env=False,
+        )
+        if response.status_code >= 400:
+            try:
+                detail = response.json().get("error") or response.text
+            except ValueError:
+                detail = response.text
+            # models without the thinking capability reject the flag outright;
+            # drop it and retry once (mirrors the response_format fallback in
+            # _openai_compat)
+            if (response.status_code == 400 and "think" in payload
+                    and "think" in str(detail).lower()):
+                log.warning("%s rejected the think flag (%s); retrying without",
+                            model, str(detail)[:200])
+                payload.pop("think")
+                continue
+            raise LLMHTTPError(
+                f"ollama returned {response.status_code}: {detail[:500]}",
+                response.status_code)
+        break
     data = response.json()
     _usage.set((data.get("prompt_eval_count") or 0, data.get("eval_count") or 0))
     # thinking arrives in message.thinking when supported; <think> tags in
@@ -270,7 +445,10 @@ def _ollama(system: str, user: str, model: str, max_tokens: int,
 
 def _openai_compat(system: str, user: str, model: str, max_tokens: int,
                    temperature: float | None, json_format: bool = False) -> str:
-    """Any OpenAI-compatible local server: LM Studio, llama.cpp, vLLM, …"""
+    """Any OpenAI-compatible server that isn't OpenAI itself: LM Studio,
+    llama.cpp, vLLM, … (OpenAI's own API is the separate "openai" provider).
+    The max_completion_tokens fallback below stays useful here regardless —
+    OpenAI-fronting proxies and newer compat servers want it too."""
     from openai import OpenAI
 
     cfg = _local_cfg()
@@ -281,24 +459,36 @@ def _openai_compat(system: str, user: str, model: str, max_tokens: int,
             "(e.g. http://host.docker.internal:1234/v1 for LM Studio)")
     client = OpenAI(base_url=base, api_key=settings.openai_compat_api_key or "local",
                     timeout=float(cfg["timeout_seconds"]), max_retries=0)
-    kw = {} if temperature is None else {"temperature": temperature}
+    kw: dict = {"max_tokens": max_tokens}
+    if temperature is not None:
+        kw["temperature"] = temperature
     if json_format and cfg.get("json_mode", True):
         kw["response_format"] = {"type": "json_object"}
     messages = [
         {"role": "system", "content": system},
         {"role": "user", "content": user},
     ]
-    try:
-        resp = client.chat.completions.create(
-            model=model, max_tokens=max_tokens, messages=messages, **kw)
-    except Exception as exc:
-        # not every server implements response_format; drop it and retry once
-        if "response_format" in kw and getattr(exc, "status_code", None) == 400:
-            log.warning("%s rejected response_format (%s); retrying without", base, exc)
-            kw.pop("response_format")
+    # Two per-call fallbacks, each dropped at most once on a 400: OpenAI's
+    # reasoning models take max_completion_tokens instead of max_tokens, and
+    # not every local server implements response_format.
+    for _ in range(3):
+        try:
             resp = client.chat.completions.create(
-                model=model, max_tokens=max_tokens, messages=messages, **kw)
-        else:
+                model=model, messages=messages, **kw)
+            break
+        except Exception as exc:
+            if getattr(exc, "status_code", None) == 400:
+                if ("max_tokens" in kw
+                        and "max_completion_tokens" in str(exc)):
+                    log.warning("%s wants max_completion_tokens (%s); retrying",
+                                base, exc)
+                    kw["max_completion_tokens"] = kw.pop("max_tokens")
+                    continue
+                if "response_format" in kw:
+                    log.warning("%s rejected response_format (%s); retrying without",
+                                base, exc)
+                    kw.pop("response_format")
+                    continue
             raise
     if resp.usage:
         _usage.set((resp.usage.prompt_tokens or 0, resp.usage.completion_tokens or 0))

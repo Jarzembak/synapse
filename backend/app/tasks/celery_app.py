@@ -6,7 +6,9 @@ from ..logging_setup import setup_logging
 
 setup_logging()
 
-from ..config import settings  # noqa: E402
+from ..config import settings, validate_storage_roots  # noqa: E402
+
+validate_storage_roots()
 
 celery = Celery("vst", broker=settings.redis_url, backend=settings.redis_url)
 celery.conf.task_track_started = True
@@ -19,6 +21,10 @@ celery.conf.beat_schedule = {
         "task": "scheduled_backup_check",
         "schedule": 3600.0,
     },
+    "repository-cloud-privacy-purge": {
+        "task": "cloud_privacy_purge_sweep",
+        "schedule": 3600.0,
+    },
 }
 
 from ..db import init_db  # noqa: E402
@@ -27,8 +33,8 @@ init_db()  # worker may start before the api; both are idempotent
 
 # Import task modules so the worker registers them.
 from . import (  # noqa: E402,F401
-    ingest, transcribe, generate, quickref, audio, cloud, orchestrate, backup,
-    recovery, search, localmodels,
+    ingest, transcribe, generate, repository, quickref, audio, cloud,
+    orchestrate, backup, recovery, search, localmodels,
 )
 
 from celery.signals import worker_ready  # noqa: E402
@@ -70,6 +76,12 @@ def _reset_orphaned_jobs(**_kwargs):
                 job.updated = utcnow()
                 session.add(job)
             session.commit()
+        from ..repository import cleanup_repository_staging
+
+        cleanup_repository_staging()
+        from .cloud import enqueue_pending_privacy_purges
+
+        enqueue_pending_privacy_purges()
         if stale or ghosts:
             logging.getLogger("synapse.pipeline").warning(
                 "reset %d running and %d undispatched job(s) on worker start",

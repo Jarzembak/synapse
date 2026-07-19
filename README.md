@@ -11,6 +11,11 @@ Everything accumulates in one browsable, taggable library with exact and
 semantic search, source-grounded Q&A, timestamp playback links, and an optional
 push to your own cloud storage instead of living as scattered files.
 
+It also accepts public or private GitHub repositories and produces a pinned,
+file-and-line-cited codebase study: overview, setup guide, architecture map,
+required knowledge, dependencies, deep dives, quick-references, podcast, mind
+map, and repository-grounded Q&A.
+
 Vibe coded by Fable and Sol and inspired by Jeff McJunkin's methodology.
 
 It supports both local models — the bundled Ollama (CPU-friendly by default)
@@ -55,6 +60,7 @@ GPU details means the GPU stack, an error means CPU.
 - [How it works](#how-it-works)
 - [Quick start](#quick-start)
 - [Using the app](#using-the-app)
+- [GitHub repository analysis](#github-repository-analysis)
 - [Themes](#themes)
 - [Advanced settings](#advanced-settings)
 - [Cloud storage](#cloud-storage)
@@ -159,7 +165,7 @@ docker compose up --build
 First-time setup, in another terminal, once the containers are up:
 
 ```bash
-# pull the default local model (used for correction, tagging, and trim-span detection)
+# pull the default local model (also required for repository analysis)
 docker compose exec ollama ollama pull qwen3:8b
 # optional: enable meaning-based Hybrid search in Settings, then pull its model
 docker compose exec ollama ollama pull nomic-embed-text
@@ -269,6 +275,85 @@ backup schedule/retention/media policy, desktop completion notifications, the
 correction glossary, download resolution, tag vocabulary, quick-ref categories,
 and an **Advanced** section covering prompts, generation parameters,
 audio/pipeline/ASR/compute tuning, and cloud storage — see below.
+
+## GitHub repository analysis
+
+Choose **Projects -> GitHub repository** to turn a GitHub.com codebase into a
+source-grounded learning project. Synapse resolves the selected branch, tag, or
+commit to an immutable commit SHA, downloads that exact archive in the worker,
+and performs static analysis only. It never runs repository hooks, installs
+packages, initializes submodules, downloads Git LFS objects, builds, tests, or
+executes repository code.
+
+The repository pipeline creates:
+
+- a deterministic inventory and coverage report;
+- a plain-language repository overview;
+- setup and usage instructions based on commands actually found in the repo;
+- an architecture and code map;
+- a required-knowledge guide and suggested learning order;
+- a dependency and environment guide;
+- two independent deep dives, a merged study guide, quick-references, a podcast
+  script and local audio, and a repository-aware mind map.
+
+Repository claims cite exact file and line ranges at the analyzed commit. The
+retained snapshot also feeds project-filtered Library search and **Ask this
+repository**, so answers can link directly to the code that supports them.
+
+### Local-only processing and private repositories
+
+Open **Settings -> GitHub access** and enter a fine-grained personal access
+token limited to the repositories you choose with read-only **Contents**
+permission. The token is encrypted in Synapse's settings store, masked after it
+is saved, and never written to a project, artifact, command, URL, or log.
+
+All repository analysis is hard-restricted to local processing in this first
+release, whether the GitHub repository is public or private. Every chat-model
+step is forced through the configured repository Ollama model, podcast audio is
+forced through local Piper TTS, and every repository-derived artifact is
+excluded from cloud sync. Repository excerpts never leave the host. For that guarantee,
+`OLLAMA_BASE_URL` must resolve to the bundled `ollama` service, localhost, or a
+loopback address; Synapse refuses repository processing against a remote Ollama
+endpoint and bypasses environment HTTP proxies for those requests. Compose
+requests a 65,536-token Ollama context allocation; each model may cap that at
+its native context window (the default `qwen3:8b` is lower), while Synapse's
+bounded hierarchical prompts fit within the supported default. The daemon also sets
+`OLLAMA_NO_CLOUD=1`, and repository model names containing a `cloud` token are
+rejected so a loopback request cannot be transparently offloaded.
+If you supply your own loopback Ollama daemon, launch it with
+`OLLAMA_NO_CLOUD=1`; that server-side setting is mandatory for the same boundary.
+
+Plan capacity as well as software: the default model download is roughly 5 GB
+before runtime and context-cache overhead, CPU-only full-repository generation
+can take hours, and each retained commit may use up to the configured 512 MB
+compressed / 1 GB expanded snapshot limits. A compatible GPU is optional but
+substantially improves local analysis; adequate RAM and disk are required.
+The **System → Startup checks** panel reports whether the configured repository
+model is installed; once a repository project exists, that check is required.
+
+Repository origin is sticky even if a project is later deleted or a derived
+quick-reference is merged. This prevents a later full cloud sync from
+reclassifying retained repository material as public. Because exact source
+excerpts and derived guides are stored locally, `BACKUP_ENCRYPTION_KEY` is
+required before Synapse will create a backup while any repository analysis
+exists.
+Raw repository snapshots are excluded from backups by default and have a
+separate opt-in setting; enabling that opt-in always requires encrypted backups,
+because source trees can contain undiscovered credentials.
+
+### Scope and updates
+
+The import screen supports a whole repository, one folder, or explicit include
+and exclude paths. Generated, vendored, cached, binary, secret-prone, minified,
+and oversized files are catalogued or excluded under configurable limits;
+manifests are parsed for dependency evidence, while lockfiles are catalogued
+and exposed as bounded supporting evidence. The coverage report
+always says what was omitted instead of silently truncating analysis.
+
+A project follows the branch or ref you selected but never updates silently.
+Use **Check for updates** to compare its pinned commit with GitHub, then
+**Update analysis** to queue a new snapshot and rebuild affected artifacts.
+Unchanged evidence summaries are reused by content/configuration hash.
 
 ## Themes
 
@@ -439,14 +524,18 @@ configured interval is due; scheduling is disabled by default. Retention
 defaults to the five newest archives. Configure the policy in **Settings →
 Backups**, then create, verify, or download snapshots under **System → Backups**.
 Verification checks the archive CRC and runs SQLite's own integrity check on
-the contained database snapshot.
+the contained database snapshot. Backups wait until processing jobs finish, copy
+files into a stable staging area, and validate that nothing changed before the
+database snapshot is taken.
 
 Set `BACKUP_ENCRYPTION_KEY` in `.env` before creating backups if the archive
 should be encrypted. Use a long, random value, store it in a password manager,
 and keep it for as long as any encrypted archive exists—there is no recovery
-path if it is lost. Leaving it blank creates ordinary, unencrypted ZIP files.
+path if it is lost. Leaving it blank creates ordinary, unencrypted ZIP files,
+unless repository analysis exists; in that case Synapse refuses to create an
+unencrypted backup because SQLite contains repository evidence and derived guides.
 
-`SETTINGS_ENCRYPTION_KEY` protects saved cloud credentials. If it is blank,
+`SETTINGS_ENCRYPTION_KEY` protects saved cloud and GitHub credentials. If it is blank,
 Synapse generates `data/db/.settings.key` instead. For a portable disaster
 recovery setup, set and retain the environment value; otherwise secure a
 separate copy of `.settings.key`, because the database inside a Synapse backup
@@ -512,8 +601,8 @@ above keep the downloads searchable and playable from the Library UI. Back up
 Every LLM-driven step has an independent provider/model setting in
 **Settings → Model matrix**. Providers:
 
-- **ollama** — local, via the bundled `ollama` container (or point `OLLAMA_BASE_URL` in `.env` at a bigger box on your network — see below). Default for correction, trim-span detection, and tagging (`qwen3:8b`).
-- **openai_compat** — any OpenAI-compatible server you run yourself, i.e. compatible engines that *aren't* OpenAI: LM Studio, llama.cpp server, vLLM, LocalAI, Jan, and the like. Set `OPENAI_COMPAT_BASE_URL` in `.env` (include the `/v1` suffix — e.g. LM Studio on the Docker host is `http://host.docker.internal:1234/v1`), plus `OPENAI_COMPAT_API_KEY` if your server enforces one. Any chat step — and semantic-search embeddings, via the provider dropdown under **Settings → Library intelligence** — can be assigned to it. (For OpenAI's own API, use the `openai` provider below instead.)
+- **ollama** — local, via the bundled `ollama` container (or point `OLLAMA_BASE_URL` in `.env` at a bigger box on your network — see below; repository analysis requires the bundled service or a loopback endpoint in v1). Default for correction, trim-span detection, and tagging (`qwen3:8b`).
+- **openai_compat** — any OpenAI-compatible server you run yourself, i.e. compatible engines that *aren't* OpenAI: LM Studio, llama.cpp server, vLLM, LocalAI, Jan, and the like. Set `OPENAI_COMPAT_BASE_URL` in `.env` (include the `/v1` suffix — e.g. LM Studio on the Docker host is `http://host.docker.internal:1234/v1`), plus `OPENAI_COMPAT_API_KEY` if your server enforces one. Any chat step — and semantic-search embeddings, via the provider dropdown under **Settings → Library intelligence** — can be assigned to it. (For OpenAI's own API, use the `openai` provider below instead.) Repository analysis never uses this provider; its steps are pinned to local Ollama.
 - **anthropic** — Claude API. Default for summary, the Claude deep dive, the merge, quick-references, the podcast script, and the mind map (all `claude-sonnet-5`; swap in `claude-opus-4-8` for more depth on any of these, or `claude-haiku-4-5` to cut cost on summary/quick-refs).
 - **gemini** — Gemini API. Default for the Gemini deep dive (`gemini-3.5-flash`); can also be assigned to ASR (native audio transcription) or TTS (native multi-speaker speech) if you'd rather not run those locally.
 - **openai** — OpenAI's own API (`OPENAI_API_KEY` in `.env`). A frontier provider like the two above: assign any chat step to it and pick from OpenAI's live model catalog in the dropdown — e.g. as a third deep-dive perspective, or in place of a provider you don't have a key for.
@@ -639,13 +728,15 @@ extension) before running **Ingest**, **Download & keep media**, or
 
 **Bigger local models on other hardware:** if you have a GPU box elsewhere on
 your network already running Ollama, set `OLLAMA_BASE_URL` in `.env` to its
-address (e.g. `http://10.0.0.5:11434`) instead of the bundled container. Every
-step assigned to the `ollama` provider then runs there — no code changes,
-just point Settings at bigger model names (e.g. `qwen3:30b-a3b-instruct`)
-once they're pulled on that box. If that box runs LM Studio, llama.cpp,
-vLLM, or another OpenAI-compatible server instead of Ollama, set
-`OPENAI_COMPAT_BASE_URL` to it and assign steps to the `openai_compat`
-provider — same effect.
+address (e.g. `http://10.0.0.5:11434`) instead of the bundled container for
+media and ordinary library workflows. Every step assigned to the `ollama`
+provider then runs there — no code changes, just point Settings at bigger
+model names (e.g. `qwen3:30b-a3b-instruct`) once they're pulled on that box.
+If that box runs LM Studio, llama.cpp, vLLM, or another OpenAI-compatible
+server instead of Ollama, set `OPENAI_COMPAT_BASE_URL` to it and assign steps
+to the `openai_compat` provider — same effect. Repository analysis
+intentionally rejects LAN/remote Ollama endpoints in v1 and requires the
+bundled service or a loopback endpoint.
 
 **Local NVIDIA GPU:** if the machine running Docker has an NVIDIA GPU, start
 the stack with the GPU overlay instead:

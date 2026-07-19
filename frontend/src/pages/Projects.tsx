@@ -1,6 +1,6 @@
 import { FormEvent, useEffect, useRef, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
-import { api, fmtDate, fmtDateTime, PipelineStatus, Project } from "../api";
+import { api, fmtDate, fmtDateTime, isRepositoryProject, PipelineStatus, Project } from "../api";
 import { useEventSource } from "../useEventSource";
 
 // derived pipeline status → chip label + the CSS class it borrows from .jobstatus
@@ -133,9 +133,12 @@ export default function Projects() {
   }
 
   async function remove(p: Project) {
+    const repository = isRepositoryProject(p);
     const ok = confirm(
       `Delete "${p.title}"?\n\n` +
-      "This permanently deletes all of its artifacts and any downloaded media. " +
+      (repository
+        ? "This permanently deletes all of its artifacts and retained repository snapshots. "
+        : "This permanently deletes all of its artifacts and any downloaded media. ") +
       "Quick-reference docs it contributed to will remain.\n\nThis cannot be undone."
     );
     if (!ok) return;
@@ -150,6 +153,21 @@ export default function Projects() {
   return (
     <div className="projects">
       <h2>New project</h2>
+      <div className="source-type-cards" aria-label="Choose a project source">
+        <section className="card source-type-card">
+          <span className="source-badge media">Media</span>
+          <h3>Video or audio</h3>
+          <p>Transcribe a URL, uploaded recording, or local media file.</p>
+          <a href="#new-media-project">Use media source</a>
+        </section>
+        <section className="card source-type-card featured">
+          <span className="source-badge repository">GitHub</span>
+          <h3>Code repository</h3>
+          <p>Build a cited, plain-language guide to a public or private repository.</p>
+          <Link className="button-link" to="/projects/new/repository">Import GitHub repository</Link>
+        </section>
+      </div>
+      <h3 id="new-media-project">New media project</h3>
       <form onSubmit={create} className="newproject">
         <label className="sr-only" htmlFor="source-kind">Source type</label>
         <select id="source-kind" value={sourceType}
@@ -219,8 +237,15 @@ export default function Projects() {
         <tbody>
           {projects.map((p) => (
             <tr key={p.id}>
-              <td><Link to={`/projects/${p.id}`}>{p.title}</Link></td>
-              <td className="mono" title={p.source}>{p.source.slice(0, 60)}</td>
+              <td>
+                <Link to={`/projects/${p.id}`}>{p.title}</Link>{" "}
+                <span className={`source-badge ${isRepositoryProject(p) ? "repository" : "media"}`}>
+                  {isRepositoryProject(p) ? "GitHub" : "Media"}
+                </span>
+              </td>
+              <td className="mono" title={p.repository?.full_name ?? p.source}>
+                {(p.repository?.full_name ?? p.source).slice(0, 60)}
+              </td>
               <td><StatusCell p={p} /></td>
               <td className="muted" title={p.progress?.last_activity
                 ? fmtDateTime(p.progress.last_activity) : ""}>

@@ -4,15 +4,19 @@ import json
 import os
 import shutil
 import tempfile
+import uuid
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Request, UploadFile
 from pydantic import BaseModel, Field
 from sqlalchemy.exc import IntegrityError
-from sqlmodel import select
+from sqlmodel import select, text
 
 from ..db import get_session
-from ..models import Artifact, Job, Project
+from ..models import (
+    Artifact, Job, Project, RepositoryChunk, RepositoryFile,
+    RepositorySnapshot, RepositorySource,
+)
 from .. import library
 from ..config import settings
 from ..security import validate_source_url
@@ -21,16 +25,17 @@ from ..tasks.celery_app import celery
 from ..tasks.ingest import cookies_path
 
 from ..tasks.orchestrate import (  # noqa: E402
-    STEPS, STEP_LABELS, STEP_NAMES, STEP_OUTPUT, applicable_steps,
-    missing_deps, pipeline_profiles, step_done, step_stale, transitive_dependents,
-    RUN_DEPS,
+    applicable_steps, deps_for, missing_deps, pipeline_profiles, step_done,
+    step_names, step_output, step_specs, step_stale, steps_for,
+    transitive_dependents,
 )
 
 router = APIRouter(prefix="/api/projects", tags=["projects"])
 
 
-def _step_label(task: str) -> str:
-    return "Run all steps" if task == "run_all" else STEP_LABELS.get(task, task)
+def _step_label(task: str, project: Project | None = None) -> str:
+    labels = dict(steps_for(project) if project else step_specs())
+    return "Run all steps" if task == "run_all" else labels.get(task, task)
 
 
 def _list_step_done(step: str, artifact_types: set[str], done_tasks: set[str]) -> bool:
@@ -43,9 +48,8 @@ def _list_step_done(step: str, artifact_types: set[str], done_tasks: set[str]) -
     can't exist without ingested audio), and `quickref` by a succeeded job."""
     if step == "ingest":
         return "ingest" in done_tasks or "transcript" in artifact_types
-    if step == "quickref":
-        return "quickref" in done_tasks
-    return STEP_OUTPUT[step] in artifact_types
+    output = step_output(step)
+    return output in artifact_types if output else step in done_tasks
 
 
 def _project_progress(project: Project, artifact_types: set[str],
@@ -71,9 +75,9 @@ def _project_progress(project: Project, artifact_types: set[str],
         run = next((j for j in active if j.status == "running"), active[0])
         # name a concrete step rather than the run-all wrapper when possible
         step = next((j for j in active
-                     if j.status == "running" and j.task in STEP_NAMES), None) or run
+                     if j.status == "running" and j.task in step_names(project)), None) or run
         status = "running"
-        detail = _step_label(step.task)
+        detail = _step_label(step.task, project)
     elif latest is not None and (
             latest.status == "canceled"
             or (latest.status == "error" and "cancel" in (latest.error or "").lower())):
@@ -83,10 +87,11 @@ def _project_progress(project: Project, artifact_types: set[str],
     elif latest is not None and latest.status == "error":
         status = "failed"
         # name the most recent errored step that isn't since completed
+        project_steps = step_names(project)
         errored = next((j for j in reversed(jobs)
-                        if j.status == "error" and j.task in STEP_NAMES
+                        if j.status == "error" and j.task in project_steps
                         and not _list_step_done(j.task, artifact_types, done_tasks)), None)
-        detail = _step_label(errored.task) if errored else None
+        detail = _step_label(errored.task, project) if errored else None
     elif total and done >= total:
         status = "complete"
     elif done > 0:
@@ -274,7 +279,7 @@ def list_projects():
 
 @router.get("/steps")
 def list_steps():
-    return [{"name": name, "label": label} for name, label in STEPS]
+    return [{"name": name, "label": label} for name, label in step_specs()]
 
 
 @router.get("/{project_id}")
@@ -298,7 +303,7 @@ def get_project(project_id: int):
         applicable = set(applicable_steps(project))
         steps = []
         remaining = 0
-        for name, label in STEPS:
+        for name, label in steps_for(project):
             job = latest.get(name)
             missing = missing_deps(session, project, name, artifact_types)
             done = step_done(session, project, name, artifact_types)
@@ -315,14 +320,8 @@ def get_project(project_id: int):
                 "done": done,
                 "stale": stale,
                 "not_applicable": not_applicable,
-                "artifact": next((a for a in artifacts if a.type == name or
-                                  (name == "download" and a.type == "source_video") or
-                                  (name == "transcribe" and a.type == "transcript") or
-                                  (name == "correct" and a.type == "corrected") or
-                                  (name == "summarize" and a.type == "summary") or
-                                  (name == "merge" and a.type == "deepdive_merged") or
-                                  (name == "tts" and a.type == "podcast_audio") or
-                                  (name == "trim" and a.type == "trimmed_audio")), None),
+                "artifact": next(
+                    (a for a in artifacts if a.type == step_output(name)), None),
             })
         run_all_job = next(
             (j for j in jobs if j.task == "run_all" and j.status in ("queued", "running")),
@@ -337,18 +336,22 @@ def get_project(project_id: int):
             "run_all_active": run_all_job is not None,
             "run_all_state": run_all_job.status if run_all_job else None,
             "any_active": any_active,
-            "profiles": pipeline_profiles(),
+            "profiles": pipeline_profiles(project),
         }
 
 
 @router.post("/{project_id}/run/{step}")
 def run_step(project_id: int, step: str):
-    if step not in STEP_NAMES:
-        raise HTTPException(400, f"unknown step {step!r}")
     with get_session() as session:
+        # Hold SQLite's writer lease from validation through Job insertion.
+        # Different repository steps must not both pass the active-job check
+        # before either request has inserted its row.
+        session.exec(text("BEGIN IMMEDIATE"))
         project = session.get(Project, project_id)
         if not project:
             raise HTTPException(404)
+        if step not in step_names(project):
+            raise HTTPException(400, f"unknown or inapplicable step {step!r}")
         if project.deleting:
             raise HTTPException(409, "project is being deleted")
         if step not in applicable_steps(project):
@@ -359,6 +362,34 @@ def run_step(project_id: int, step: str):
         ).first()
         if running:
             raise HTTPException(409, f"{step} is already {running.status}")
+        if project.source_type == "github":
+            active_repository_job = session.exec(select(Job).where(
+                Job.project_id == project_id,
+                Job.status.in_(("queued", "running")),
+            )).first()
+            if active_repository_job:
+                raise HTTPException(
+                    409, "wait for the active repository run to finish before "
+                    "starting another step")
+            source = session.exec(select(RepositorySource).where(
+                RepositorySource.project_id == project_id
+            )).first()
+            if step != "repo_snapshot" and source and source.pending_sha:
+                raise HTTPException(
+                    409, "the selected repository update must be snapshotted and "
+                    "scanned before downstream steps can run")
+            if step != "repo_snapshot" and not step_done(
+                    session, project, "repo_snapshot"):
+                raise HTTPException(
+                    409, "run Snapshot & scan repository before downstream steps")
+            stale_upstream = [
+                dependency for dependency in deps_for(project)[step]
+                if step_stale(session, project, dependency)
+            ]
+            if stale_upstream:
+                raise HTTPException(
+                    409, "rerun stale prerequisite step(s) first: "
+                    + ", ".join(sorted(stale_upstream)))
         missing = missing_deps(session, project, step)
         if missing:
             raise HTTPException(409, f"{step} requires: {', '.join(missing)}")
@@ -401,6 +432,7 @@ def run_all(project_id: int, req: RunAllRequest | None = None):
     from ..tasks.orchestrate import maybe_start_next_run_all
 
     with get_session() as session:
+        session.exec(text("BEGIN IMMEDIATE"))
         project = session.get(Project, project_id)
         if not project:
             raise HTTPException(404)
@@ -412,14 +444,29 @@ def run_all(project_id: int, req: RunAllRequest | None = None):
         ).first()
         if existing:
             raise HTTPException(409, f"run-all is already {existing.status} for this project")
+        if project.source_type == "github":
+            active_repository_job = session.exec(select(Job).where(
+                Job.project_id == project_id,
+                Job.status.in_(("queued", "running")),
+            )).first()
+            if active_repository_job:
+                raise HTTPException(
+                    409, "wait for the active repository step to finish before "
+                    "starting a full repository run")
         options = (req or RunAllRequest()).model_dump()
-        profiles = pipeline_profiles()
+        profiles = pipeline_profiles(project)
         if options.get("steps") is not None and not options["steps"]:
             raise HTTPException(400, "steps cannot be empty when explicitly provided")
         if options.get("steps") is None and options["profile"] not in profiles:
             raise HTTPException(400, f"unknown pipeline profile {options['profile']!r}")
+        if options.get("steps") is None:
+            # Freeze the named profile now. A run-all can wait behind another
+            # project for hours; editing/deleting a global custom profile must
+            # not change the already-confirmed work when this job eventually
+            # starts.
+            options["steps"] = list(profiles[options["profile"]]["steps"])
         for key in ("steps", "force_steps"):
-            unknown = set(options.get(key) or []) - STEP_NAMES
+            unknown = set(options.get(key) or []) - step_names(project)
             if unknown:
                 raise HTTPException(400, f"unknown step(s): {', '.join(sorted(unknown))}")
         job = Job(project_id=project_id, task="run_all", status="queued",
@@ -440,9 +487,13 @@ def run_all(project_id: int, req: RunAllRequest | None = None):
 @router.post("/{project_id}/rerun/{step}")
 def rerun_affected(project_id: int, step: str):
     """Force one step and every downstream consumer into one run attempt."""
-    if step not in STEP_NAMES:
-        raise HTTPException(400, f"unknown step {step!r}")
-    affected = {step} | transitive_dependents(step, RUN_DEPS)
+    with get_session() as session:
+        project = session.get(Project, project_id)
+        if not project:
+            raise HTTPException(404)
+        if step not in step_names(project):
+            raise HTTPException(400, f"unknown or inapplicable step {step!r}")
+        affected = {step} | transitive_dependents(step, deps_for(project, run=True))
     return run_all(project_id, RunAllRequest(
         profile="affected", steps=sorted(affected), force_steps=sorted(affected)))
 
@@ -519,18 +570,46 @@ def delete_project(project_id: int):
         ).first()
         if active:
             raise HTTPException(409, "cancel active jobs before deleting this project")
+        repository_source = session.exec(
+            select(RepositorySource).where(
+                RepositorySource.project_id == project_id)
+        ).first()
+        if repository_source and repository_source.cloud_purge_pending:
+            raise HTTPException(
+                409,
+                "a cloud privacy purge is still pending; keep the project until "
+                "Synapse confirms formerly public remote copies were removed",
+            )
+        repository_storage_key = (
+            str(repository_source.id) if repository_source else None)
+        if repository_source:
+            try:
+                from ..repository import cleanup_repository_staging
+
+                cleanup_repository_staging(repository_source.id)
+            except Exception as exc:
+                raise HTTPException(
+                    500, f"could not clean repository staging before deletion: {exc}")
         project.deleting = True
         session.add(project)
         session.commit()
         slug = project.slug
 
-    paths = [settings.library_dir / "projects" / slug, settings.media_dir / slug]
+    paths = [
+        settings.library_dir / "projects" / slug,
+        settings.library_dir / ".history" / "projects" / slug,
+        settings.media_dir / slug,
+        *( [settings.repository_dir / repository_storage_key]
+           if repository_storage_key else [] ),
+    ]
     staged: list[tuple] = []
+    deletion_token = uuid.uuid4().hex
     try:
         for path in paths:
             if not path.exists():
                 continue
-            trash = path.parent / ".trash" / f"{slug}.delete-{project_id}"
+            trash = (path.parent / ".trash" /
+                     f"{slug}.delete-{project_id}-{deletion_token}")
             trash.parent.mkdir(parents=True, exist_ok=True)
             if trash.exists():
                 shutil.rmtree(trash)
@@ -590,6 +669,39 @@ def delete_project(project_id: int):
             session.exec(text(
                 "DELETE FROM quickrefsource WHERE project_id=:id"
             ).bindparams(id=project_id))
+            repository_source = session.exec(
+                select(RepositorySource).where(
+                    RepositorySource.project_id == project_id)
+            ).first()
+            if repository_source:
+                snapshots = session.exec(
+                    select(RepositorySnapshot).where(
+                        RepositorySnapshot.source_id == repository_source.id)
+                ).all()
+                snapshot_ids = [snapshot.id for snapshot in snapshots]
+                files = session.exec(
+                    select(RepositoryFile).where(
+                        RepositoryFile.snapshot_id.in_(snapshot_ids))
+                ).all() if snapshot_ids else []
+                file_ids = [file.id for file in files]
+                chunks = session.exec(
+                    select(RepositoryChunk).where(
+                        RepositoryChunk.file_id.in_(file_ids))
+                ).all() if file_ids else []
+                for chunk in chunks:
+                    session.exec(text(
+                        "DELETE FROM repository_chunk_fts WHERE chunk_id=:id"
+                    ).bindparams(id=chunk.id))
+                    session.delete(chunk)
+                session.flush()
+                for file in files:
+                    session.delete(file)
+                session.flush()
+                for snapshot in snapshots:
+                    session.delete(snapshot)
+                session.flush()
+                session.delete(repository_source)
+                session.flush()
             session.delete(project)
             session.commit()
     except Exception:
@@ -604,10 +716,22 @@ def delete_project(project_id: int):
                 session.commit()
         raise
 
+    cleanup_failures: list[str] = []
     for _original, trash in staged:
-        shutil.rmtree(trash, ignore_errors=True)
+        try:
+            shutil.rmtree(trash)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            cleanup_failures.append(f"{trash}: {exc}")
     from ..settings_store import delete_settings_prefix, set_setting
 
     set_setting(f"projtags.{project_id}", None)
     delete_settings_prefix(f"step_signature.{project_id}.")
+    if cleanup_failures:
+        raise HTTPException(
+            500,
+            "project records were deleted, but secure file cleanup is pending and "
+            "will be retried at startup: " + "; ".join(cleanup_failures)[:1000],
+        )
     return {"ok": True}

@@ -6,6 +6,8 @@ import {
   fmtDate,
   Project,
   TYPE_LABELS,
+  isRepositoryProject,
+  shortSha,
   typeLabel,
 } from "../api";
 
@@ -31,8 +33,8 @@ interface QueryResponse {
 }
 
 interface HybridResult {
-  chunk_id: number;
-  artifact_id: number;
+  chunk_id: number | string;
+  artifact_id: number | null;
   artifact_title: string;
   artifact_type: string;
   project_id: number | null;
@@ -43,6 +45,17 @@ interface HybridResult {
   excerpt: string;
   tags: string[];
   score: number;
+  source_kind?: "artifact" | "repository" | "repository_file";
+  path?: string | null;
+  repository_path?: string | null;
+  file_path?: string | null;
+  start_line?: number | null;
+  end_line?: number | null;
+  commit_sha?: string | null;
+  immutable_url?: string | null;
+  permalink?: string | null;
+  source_url?: string | null;
+  restricted?: boolean;
 }
 
 interface HybridResponse {
@@ -129,6 +142,11 @@ function GroundedAnswer({ answer, sources }: { answer: string; sources: AskSourc
 }
 
 function SourceMeta({ source }: { source: HybridResult }) {
+  const repositoryPath = source.repository_path ?? source.file_path ?? source.path;
+  const repositoryUrl = source.immutable_url ?? source.permalink ?? source.source_url;
+  const lineLabel = source.start_line
+    ? `:${source.start_line}${source.end_line && source.end_line !== source.start_line ? `–${source.end_line}` : ""}`
+    : "";
   return (
     <span className="source-meta">
       {source.project_id ? (
@@ -138,8 +156,27 @@ function SourceMeta({ source }: { source: HybridResult }) {
       ) : (
         <span>Shared library</span>
       )}
-      <span aria-hidden="true"> / </span>
-      <Link to={`/artifacts/${source.artifact_id}`}>{source.artifact_title}</Link>
+      {source.artifact_id && (
+        <>
+          <span aria-hidden="true"> / </span>
+          <Link to={`/artifacts/${source.artifact_id}`}>{source.artifact_title}</Link>
+        </>
+      )}
+      {repositoryPath && (
+        <>
+          <span aria-hidden="true"> / </span>
+          {repositoryUrl ? (
+            <a className="repository-source-link" href={repositoryUrl} target="_blank" rel="noreferrer"
+              title="Open the file at the analyzed commit">
+              <code>{repositoryPath}{lineLabel}</code>
+            </a>
+          ) : (
+            <code>{repositoryPath}{lineLabel}</code>
+          )}
+          {source.commit_sha && <span className="source-badge commit">{shortSha(source.commit_sha)}</span>}
+          {source.restricted && <span className="source-badge private">Local only</span>}
+        </>
+      )}
       {source.start_time && source.media_artifact_id ? (
         <Link
           className="citation-time play-citation"
@@ -220,6 +257,8 @@ export default function Library() {
   const resolvedProjectId = projectId ??
     projects.find((project) => project.slug === projectSlug)?.id ?? null;
   const unresolvedProject = Boolean(projectSlug && !resolvedProjectId && !metadataLoading);
+  const selectedProject = projects.find((project) => project.id === resolvedProjectId) ?? null;
+  const askingRepository = isRepositoryProject(selectedProject);
 
   function updateUrl(
     updates: Record<string, string | number | null>,
@@ -829,13 +868,16 @@ export default function Library() {
         </section>
       </div>
 
-      <section className="ask-panel" aria-labelledby="ask-library-title">
+      <section className="ask-panel" id="ask" aria-labelledby="ask-library-title">
         <div className="ask-intro">
           <p className="eyebrow">Grounded Q&amp;A</p>
-          <h3 id="ask-library-title">Ask your library</h3>
+          <h3 id="ask-library-title">
+            {askingRepository ? "Ask this repository" : "Ask your library"}
+          </h3>
           <p className="meta">
-            Answers use the selected project, artifact types, and tags. Every answer
-            keeps its supporting excerpts visible below it.
+            {askingRepository
+              ? `Answers are limited to ${selectedProject?.title} and cite its generated guides or immutable source files.`
+              : "Answers use the selected project, artifact types, and tags. Every answer keeps its supporting excerpts visible below it."}
           </p>
           {title && <p className="hint">The title-only filter applies to Exact results, not Q&amp;A.</p>}
         </div>
@@ -846,7 +888,9 @@ export default function Library() {
             id="ask-question"
             rows={3}
             value={askQuestion}
-            placeholder="What does my library say about...?"
+            placeholder={askingRepository
+              ? "How does this repository work?"
+              : "What does my library say about...?"}
             onChange={(event) => setAskQuestion(event.target.value)}
           />
           <div className="ask-actions">

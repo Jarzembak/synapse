@@ -8,6 +8,7 @@ services:
       - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://ollama:11434}
       - LIBRARY_DIR=/data/library
       - MEDIA_DIR=/data/media
+      - REPOSITORY_DIR=/data/repositories
       - DB_PATH=/data/db/vst.sqlite3
       - BACKUP_DIR=/data/backups
       - LOG_DIR=/data/logs
@@ -16,6 +17,7 @@ services:
     volumes:
       - ./data/library:/data/library
       - ./data/media:/data/media
+      - ./data/repositories:/data/repositories
       - ./data/db:/data/db
       - ./data/backups:/data/backups
       - ./data/logs:/data/logs
@@ -46,6 +48,7 @@ services:
       - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://ollama:11434}
       - LIBRARY_DIR=/data/library
       - MEDIA_DIR=/data/media
+      - REPOSITORY_DIR=/data/repositories
       - DB_PATH=/data/db/vst.sqlite3
       - BACKUP_DIR=/data/backups
       - LOG_DIR=/data/logs
@@ -54,6 +57,7 @@ services:
     volumes:
       - ./data/library:/data/library
       - ./data/media:/data/media
+      - ./data/repositories:/data/repositories
       - ./data/db:/data/db
       - ./data/backups:/data/backups
       - ./data/logs:/data/logs
@@ -110,6 +114,11 @@ services:
 
   ollama:
     image: ollama/ollama:latest@sha256:509fdf54e23bd50d87af646cb51c0a7a203d6a83cc4d6695b3b08c5be1c62c0a
+    environment:
+      - OLLAMA_CONTEXT_LENGTH=${OLLAMA_CONTEXT_LENGTH:-65536}
+      # Repository-local is a hard data boundary; never permit Ollama's
+      # transparent cloud-model offload through the loopback daemon.
+      - OLLAMA_NO_CLOUD=1
     volumes:
       - ollama-models:/root/.ollama
     healthcheck:

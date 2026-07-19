@@ -53,10 +53,58 @@ def _migrate(conn) -> None:
     for name in ("input_hash", "config_hash"):
         _add_column(conn, "artifact", name, "VARCHAR NOT NULL DEFAULT ''")
     _add_column(conn, "artifact", "provenance", "VARCHAR NOT NULL DEFAULT '{}'")
+    _add_column(conn, "artifact", "restricted", "BOOLEAN NOT NULL DEFAULT 0")
+    _add_column(conn, "artifact", "repository_derived", "BOOLEAN NOT NULL DEFAULT 0")
+    _add_column(conn, "tag", "restricted", "BOOLEAN NOT NULL DEFAULT 0")
     _add_column(conn, "job", "parent_job_id", "INTEGER")
     _add_column(conn, "job", "options", "VARCHAR NOT NULL DEFAULT '{}'")
     for name in ("started", "finished", "heartbeat"):
         _add_column(conn, "job", name, "DATETIME")
+    # Development builds may already have an early repository schema.  Keep
+    # these additive migrations idempotent so those databases remain usable.
+    if _columns(conn, "repositorysource"):
+        _add_column(conn, "repositorysource", "local_only", "BOOLEAN NOT NULL DEFAULT 1")
+        conn.exec_driver_sql("UPDATE repositorysource SET local_only=1")
+        _add_column(conn, "repositorysource", "pending_sha", "VARCHAR NOT NULL DEFAULT ''")
+        _add_column(conn, "repositorysource", "current_snapshot_id", "INTEGER")
+        _add_column(conn, "repositorysource", "description", "VARCHAR NOT NULL DEFAULT ''")
+        _add_column(conn, "repositorysource", "include_paths", "VARCHAR NOT NULL DEFAULT '[]'")
+        _add_column(conn, "repositorysource", "exclude_paths", "VARCHAR NOT NULL DEFAULT '[]'")
+        _add_column(conn, "repositorysource", "coverage_preview", "VARCHAR NOT NULL DEFAULT '{}'")
+        _add_column(conn, "repositorysource", "cloud_purge_pending",
+                    "BOOLEAN NOT NULL DEFAULT 0")
+    if _columns(conn, "repositorysnapshot"):
+        _add_column(conn, "repositorysnapshot", "archive_bytes", "INTEGER NOT NULL DEFAULT 0")
+        _add_column(conn, "repositorysnapshot", "facts", "VARCHAR NOT NULL DEFAULT '{}'")
+        _add_column(conn, "repositorysnapshot", "secret_finding_count", "INTEGER NOT NULL DEFAULT 0")
+        _add_column(conn, "repositorysnapshot", "scanner_version", "VARCHAR NOT NULL DEFAULT '1'")
+        _add_column(conn, "repositorysnapshot", "scan_config_hash", "VARCHAR NOT NULL DEFAULT ''")
+        _add_column(conn, "repositorysnapshot", "omitted_links", "VARCHAR NOT NULL DEFAULT '[]'")
+    if _columns(conn, "repositoryfile"):
+        _add_column(conn, "repositoryfile", "symlink", "BOOLEAN NOT NULL DEFAULT 0")
+    if _columns(conn, "repositorychunk"):
+        _add_column(conn, "repositorychunk", "content_hash", "VARCHAR NOT NULL DEFAULT ''")
+        _add_column(conn, "repositorychunk", "summary_text", "VARCHAR NOT NULL DEFAULT ''")
+        _add_column(conn, "repositorychunk", "summary_json", "VARCHAR NOT NULL DEFAULT '{}'")
+        _add_column(conn, "repositorychunk", "summary_config_hash", "VARCHAR NOT NULL DEFAULT ''")
+
+    # Backfill the durable origin marker while contributor/project lineage is
+    # still available. This closes the upgrade case where deleting a GitHub
+    # project later detaches a shared quick-reference from its source rows.
+    if _columns(conn, "artifact") and "repository_derived" in _columns(conn, "artifact"):
+        if _columns(conn, "project"):
+            conn.exec_driver_sql(
+                "UPDATE artifact SET repository_derived=1 WHERE project_id IN "
+                "(SELECT id FROM project WHERE source_type='github')"
+            )
+        if (_columns(conn, "quickref") and _columns(conn, "quickrefsource")
+                and _columns(conn, "project")):
+            conn.exec_driver_sql(
+                "UPDATE artifact SET repository_derived=1 WHERE path IN ("
+                "SELECT q.path FROM quickref q JOIN quickrefsource qs "
+                "ON qs.quickref_id=q.id JOIN project p ON p.id=qs.project_id "
+                "WHERE p.source_type='github')"
+            )
 
     indexes = [
         "CREATE UNIQUE INDEX IF NOT EXISTS uq_artifact_path_type ON artifact(path, type)",
@@ -70,6 +118,26 @@ def _migrate(conn) -> None:
         "CREATE INDEX IF NOT EXISTS ix_job_status_updated ON job(status, updated)",
         "CREATE INDEX IF NOT EXISTS ix_llmcall_created_function "
         "ON llmcall(created, function)",
+        "CREATE INDEX IF NOT EXISTS ix_artifact_restricted ON artifact(restricted)",
+        "CREATE INDEX IF NOT EXISTS ix_artifact_repository_derived "
+        "ON artifact(repository_derived)",
+        "CREATE INDEX IF NOT EXISTS ix_tag_restricted ON tag(restricted)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_repository_source_project "
+        "ON repositorysource(project_id)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_repository_snapshot_source_sha "
+        "ON repositorysnapshot(source_id, resolved_sha)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_repository_file_snapshot_path "
+        "ON repositoryfile(snapshot_id, path)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_repository_chunk_file_position "
+        "ON repositorychunk(file_id, chunk_index)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_repository_chunk_evidence "
+        "ON repositorychunk(evidence_id)",
+        "CREATE INDEX IF NOT EXISTS ix_repository_file_snapshot_excluded "
+        "ON repositoryfile(snapshot_id, excluded)",
+        "CREATE INDEX IF NOT EXISTS ix_repository_chunk_body_hash "
+        "ON repositorychunk(body_hash)",
+        "CREATE INDEX IF NOT EXISTS ix_repository_source_cloud_purge "
+        "ON repositorysource(cloud_purge_pending)",
     ]
     for ddl in indexes:
         try:
@@ -83,6 +151,9 @@ def _migrate(conn) -> None:
     ).scalar()
     if current < 1:
         conn.exec_driver_sql("INSERT INTO schema_version(version) VALUES (1)")
+        current = 1
+    if current < 2:
+        conn.exec_driver_sql("INSERT INTO schema_version(version) VALUES (2)")
 
 
 def init_db() -> None:
@@ -102,6 +173,13 @@ def init_db() -> None:
             text(
                 "CREATE VIRTUAL TABLE IF NOT EXISTS chunk_fts "
                 "USING fts5(body, chunk_id UNINDEXED, artifact_id UNINDEXED)"
+            )
+        )
+        conn.execute(
+            text(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS repository_chunk_fts "
+                "USING fts5(body, chunk_id UNINDEXED, file_id UNINDEXED, "
+                "snapshot_id UNINDEXED, project_id UNINDEXED)"
             )
         )
 
