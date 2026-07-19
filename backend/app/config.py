@@ -18,10 +18,13 @@ class Settings(BaseSettings):
 
     redis_url: str = "redis://localhost:6379/0"
     ollama_base_url: str = "http://localhost:11434"
-    # Any OpenAI-compatible server (LM Studio, llama.cpp, vLLM, LocalAI, …).
-    # Include the /v1 suffix, e.g. http://host.docker.internal:1234/v1.
+    # Any OpenAI-compatible server that ISN'T OpenAI itself (LM Studio,
+    # llama.cpp, vLLM, LocalAI, …). Include the /v1 suffix, e.g.
+    # http://host.docker.internal:1234/v1. For OpenAI's own API, use
+    # OPENAI_API_KEY and the "openai" provider instead.
     openai_compat_base_url: str = ""
     openai_compat_api_key: str = ""
+    openai_api_key: str = ""
     anthropic_api_key: str = ""
     gemini_api_key: str = ""
     elevenlabs_api_key: str = ""
@@ -39,8 +42,9 @@ class Settings(BaseSettings):
 
 settings = Settings()
 
-# Providers: "ollama" (local, native API), "openai_compat" (any local
-# OpenAI-compatible server), "anthropic", "gemini".
+# Providers: "ollama" (native API), "openai_compat" (any OpenAI-compatible
+# server that isn't OpenAI itself), and the frontier APIs "anthropic",
+# "gemini", "openai".
 # The value here is the *shipping default*; the Settings table can override it.
 FUNCTION_DEFAULTS: dict[str, dict[str, str]] = {
     "correct":        {"provider": "ollama",    "model": "qwen3:8b"},

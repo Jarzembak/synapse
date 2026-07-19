@@ -541,3 +541,106 @@ def test_extract_json_top_level_array_not_truncated():
 
     assert _extract_json('[{"a": 1}, {"b": 2}]') == [{"a": 1}, {"b": 2}]
     assert _extract_json('Here: [{"a": 1}, {"b": 2}] done') == [{"a": 1}, {"b": 2}]
+
+
+def test_bisync_args():
+    from app.tasks.cloud import _bisync_args
+
+    args = _bisync_args("/data/library", "synapse:b/synapse/library", "/data/db/bisync-state", resync=False)
+    assert args[0] == "bisync"
+    assert args[1] == "/data/library" and args[2] == "synapse:b/synapse/library"
+    for flag in ("--workdir", "--resilient", "--recover", "--max-lock", "--conflict-resolve"):
+        assert flag in args
+    assert args[args.index("--conflict-resolve") + 1] == "newer"
+    assert "--resync" not in args
+    assert "--resync" in _bisync_args("a", "b", "c", resync=True)
+
+
+def test_openai_provider_requires_key_and_uses_current_params(monkeypatch):
+    import types
+
+    import openai
+
+    from app import llm
+
+    monkeypatch.setattr(llm.settings, "openai_api_key", "")
+    with pytest.raises(RuntimeError, match="OPENAI_API_KEY"):
+        llm._openai("s", "u", "gpt-5", 64, None)
+
+    calls = []
+
+    class FakeCompletions:
+        @staticmethod
+        def create(**kwargs):
+            calls.append(kwargs)
+            message = types.SimpleNamespace(content='{"ok": 1}')
+            return types.SimpleNamespace(
+                choices=[types.SimpleNamespace(message=message)],
+                usage=types.SimpleNamespace(prompt_tokens=5, completion_tokens=2),
+            )
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            self.chat = types.SimpleNamespace(completions=FakeCompletions())
+
+    monkeypatch.setattr(llm.settings, "openai_api_key", "oa-test")
+    monkeypatch.setattr(openai, "OpenAI", FakeClient)
+    out = llm._openai("s", "u", "gpt-5", 64, None, json_format=True)
+    assert out == '{"ok": 1}'
+    # OpenAI's current API shape: max_completion_tokens, never max_tokens
+    assert calls[0]["max_completion_tokens"] == 64
+    assert "max_tokens" not in calls[0]
+    assert calls[0]["response_format"] == {"type": "json_object"}
+    assert "temperature" not in calls[0]
+
+
+def test_openai_temperature_fallback_and_reasoning_exhaustion(monkeypatch):
+    import types
+
+    import openai
+
+    from app import llm
+
+    calls = []
+
+    def make_client(content='{"ok": 1}', finish_reason="stop",
+                    reject_temperature=False):
+        class FakeCompletions:
+            @staticmethod
+            def create(**kwargs):
+                calls.append(kwargs)
+                if reject_temperature and "temperature" in kwargs:
+                    exc = RuntimeError(
+                        "Unsupported value: 'temperature' does not support 0.3 "
+                        "with this model. Only the default (1) value is supported.")
+                    exc.status_code = 400
+                    raise exc
+                message = types.SimpleNamespace(content=content)
+                return types.SimpleNamespace(
+                    choices=[types.SimpleNamespace(message=message,
+                                                   finish_reason=finish_reason)],
+                    usage=None,
+                )
+
+        class FakeClient:
+            def __init__(self, **_kwargs):
+                self.chat = types.SimpleNamespace(completions=FakeCompletions())
+
+        return FakeClient
+
+    monkeypatch.setattr(llm.settings, "openai_api_key", "oa-test")
+
+    # a reasoning model rejecting temperature -> dropped and retried once
+    monkeypatch.setattr(openai, "OpenAI", make_client(reject_temperature=True))
+    out = llm._openai("s", "u", "gpt-5", 64, 0.3)
+    assert out == '{"ok": 1}'
+    assert "temperature" in calls[0] and "temperature" not in calls[1]
+
+    # budget consumed by hidden reasoning -> actionable error, not a retryable
+    # empty response
+    calls.clear()
+    monkeypatch.setattr(openai, "OpenAI",
+                        make_client(content="", finish_reason="length"))
+    with pytest.raises(RuntimeError, match="max tokens") as err:
+        llm._openai("s", "u", "gpt-5", 64, None)
+    assert not llm._is_transient(err.value)

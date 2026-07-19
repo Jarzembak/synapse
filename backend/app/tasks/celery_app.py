@@ -27,7 +27,8 @@ init_db()  # worker may start before the api; both are idempotent
 
 # Import task modules so the worker registers them.
 from . import (  # noqa: E402,F401
-    ingest, transcribe, generate, quickref, audio, cloud, orchestrate, backup, recovery, search,
+    ingest, transcribe, generate, quickref, audio, cloud, orchestrate, backup,
+    recovery, search, localmodels,
 )
 
 from celery.signals import worker_ready  # noqa: E402

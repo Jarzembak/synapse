@@ -3,8 +3,8 @@
 complete(function, ...) looks up the (provider, model) configured for that
 pipeline function — Settings-table override first, config.py default second —
 and dispatches to a local provider (Ollama's native API, or any
-OpenAI-compatible server such as LM Studio / llama.cpp / vLLM), Anthropic,
-or Gemini.
+OpenAI-compatible server that isn't OpenAI itself, such as LM Studio /
+llama.cpp / vLLM) or a frontier API (Anthropic, Gemini, OpenAI).
 
 complete_json() is the structured variant: local providers get native JSON
 enforcement (Ollama `format`, OpenAI-compatible `response_format`), and the
@@ -133,6 +133,9 @@ def complete(
                 elif provider == "openai_compat":
                     output = _openai_compat(system, user, model, max_tokens,
                                             temperature, json_format)
+                elif provider == "openai":
+                    output = _openai(system, user, model, max_tokens, temperature,
+                                     json_format)
                 elif provider == "anthropic":
                     output = _anthropic(system, user, model, max_tokens, temperature)
                 elif provider == "gemini":
@@ -300,6 +303,56 @@ def _openai_compat(system: str, user: str, model: str, max_tokens: int,
     if resp.usage:
         _usage.set((resp.usage.prompt_tokens or 0, resp.usage.completion_tokens or 0))
     return _strip_think(resp.choices[0].message.content or "")
+
+
+def _openai(system: str, user: str, model: str, max_tokens: int,
+            temperature: float | None, json_format: bool = False) -> str:
+    """OpenAI's own API — a frontier provider like anthropic/gemini, distinct
+    from openai_compat (which targets compatible servers that aren't OpenAI)."""
+    from openai import OpenAI
+
+    if not settings.openai_api_key:
+        raise RuntimeError("the openai provider needs OPENAI_API_KEY in .env")
+    client = OpenAI(api_key=settings.openai_api_key, timeout=180, max_retries=2)
+    kw = {} if temperature is None else {"temperature": temperature}
+    if json_format:
+        kw["response_format"] = {"type": "json_object"}
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+    # max_tokens is deprecated on current OpenAI models (reasoning models
+    # reject it outright); local servers behind openai_compat still expect
+    # it, which is why the two providers differ here
+    try:
+        resp = client.chat.completions.create(
+            model=model, max_completion_tokens=max_tokens, messages=messages, **kw)
+    except Exception as exc:
+        # reasoning models (gpt-5*, o*) 400 on any non-default temperature; a
+        # Settings override tuned for another provider shouldn't brick the step
+        if "temperature" in kw and getattr(exc, "status_code", None) == 400 \
+                and "temperature" in str(exc).lower():
+            log.warning("%s rejected temperature=%s; retrying without",
+                        model, kw["temperature"])
+            kw.pop("temperature")
+            resp = client.chat.completions.create(
+                model=model, max_completion_tokens=max_tokens, messages=messages,
+                **kw)
+        else:
+            raise
+    if resp.usage:
+        _usage.set((resp.usage.prompt_tokens or 0, resp.usage.completion_tokens or 0))
+    choice = resp.choices[0]
+    content = choice.message.content or ""
+    if not content.strip() and getattr(choice, "finish_reason", "") == "length":
+        # the whole budget went to hidden reasoning tokens — deterministic, so
+        # raising here (non-transient) beats the empty-response retry loop
+        # re-billing the same reasoning three times
+        raise RuntimeError(
+            f"{model} spent the entire token budget on reasoning and returned "
+            "no visible output — raise this function's max tokens under "
+            "Settings → Advanced → Generation parameters")
+    return content
 
 
 def _anthropic(system: str, user: str, model: str, max_tokens: int,

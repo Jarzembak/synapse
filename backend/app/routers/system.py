@@ -196,6 +196,8 @@ def _preflight() -> dict:
         "configured" if settings.anthropic_api_key else "not configured", required=False)
     add("Gemini key", bool(settings.gemini_api_key),
         "configured" if settings.gemini_api_key else "not configured", required=False)
+    add("OpenAI key", bool(settings.openai_api_key),
+        "configured" if settings.openai_api_key else "not configured", required=False)
     try:
         disk = shutil.disk_usage(settings.library_dir)
         free_gb = disk.free / (1024 ** 3)

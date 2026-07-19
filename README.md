@@ -15,12 +15,42 @@ Vibe coded by Fable and Sol and inspired by Jeff McJunkin's methodology.
 
 It supports both local models — the bundled Ollama (CPU-friendly by default)
 or any OpenAI-compatible server you already run, like LM Studio, llama.cpp,
-or vLLM — and frontier APIs (Claude, Gemini), configurable **per pipeline
-step**, so you can run cheaply on local hardware and reserve API spend for
-the steps that need it.
+or vLLM — and frontier APIs (Claude, Gemini, OpenAI), configurable **per
+pipeline step**, so you can run cheaply on local hardware and reserve API
+spend for the steps that need it.
 Nearly every behavior — the prompts each step sends its model, generation
 temperature, audio pacing, tagging rules — is tunable from **Settings → Advanced**
 without touching code.
+
+## Starting the stack — quick reference
+
+First-time setup lives in [Quick start](#quick-start). Day to day:
+
+| To run… | Use |
+|---|---|
+| CPU-only (default) | `docker compose up -d` (add `--build` after code changes) |
+| With an NVIDIA GPU | `docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build` |
+
+**Make GPU mode the default** so a plain `docker compose up` — and anything
+else that runs one — includes the overlay, by adding to `.env`:
+
+```bash
+# Windows (Docker Desktop) — note the semicolon separator:
+COMPOSE_FILE=docker-compose.yml;docker-compose.gpu.yml
+COMPOSE_PATH_SEPARATOR=;
+# Linux/macOS use a colon instead:
+# COMPOSE_FILE=docker-compose.yml:docker-compose.gpu.yml
+```
+
+**Docker Desktop's ▶ button doesn't choose a mode** — it restarts the
+containers exactly as they were last *created*. Overlays are applied when a
+`docker compose … up` command runs, so to switch between CPU and GPU stacks,
+re-run the appropriate command above (Compose recreates only what changed);
+after that, the ▶ button keeps starting that mode. To check which mode is
+live, from the project directory: `docker compose exec ollama nvidia-smi` —
+GPU details means the GPU stack, an error means CPU.
+
+---
 
 - [How it works](#how-it-works)
 - [Quick start](#quick-start)
@@ -134,6 +164,11 @@ docker compose exec ollama ollama pull qwen3:8b
 # optional: enable meaning-based Hybrid search in Settings, then pull its model
 docker compose exec ollama ollama pull nomic-embed-text
 ```
+
+(No terminal required for this step if you prefer the browser: once the app
+is up, **Settings → Model matrix → "Install an Ollama model"** does the same
+thing as a background job — see
+[Where Ollama models come from](#where-ollama-models-come-from).)
 
 Open **http://localhost:8080**.
 
@@ -303,10 +338,37 @@ artifacts that existed before you configured cloud storage, or for a periodic
 full resync. Clicking it again while one is already in flight returns the
 same in-progress sync rather than starting a second, overlapping one. On
 Google Drive specifically — the one backend of the five that allows multiple
-files with the same name in a folder — a full sync finishes with a dedupe
+files with the same name in a folder — a full sync includes a dedupe
 pass that folds any same-name duplicates back down to the newest copy, so
 the remote self-heals rather than accumulating dupes from any past race.
-There's no scheduled/bidirectional sync — Synapse only ever pushes up.
+There's no scheduled sync — auto-upload-per-artifact and the manual button
+are the only triggers.
+
+**Sync direction:** by default everything is **one-way, local → cloud** —
+Synapse pushes and never touches your local files. Optionally, **Settings →
+Advanced → Cloud storage → Sync direction** switches "Sync everything now"
+to **two-way** for the library (built on `rclone bisync`): edit or add a
+Markdown document in the cloud copy — say, from Obsidian on another machine
+syncing against the same folder — and the next sync pulls it down, then
+rebuilds the index from the vault (and, when semantic search is enabled,
+re-embeds it) so the change shows up in the app. Know what you're opting into:
+
+- **Deletions propagate both ways.** Removing a document from the cloud copy
+  removes it locally on the next sync (and vice versa). As a safety stop, a
+  run that would delete more than half of either side aborts.
+- **Conflicting edits keep the newer version**; the older survives renamed
+  with a `.conflict` suffix rather than being lost.
+- The **first two-way run establishes a baseline** that merges both sides:
+  files unique to either side are copied to the other, nothing is deleted,
+  and where the *same* document differs on both sides the newer copy wins —
+  but during this baseline pass (only) the older copy is overwritten rather
+  than kept as a `.conflict` file, and on storage that doesn't track
+  modification times the local copy wins. Normal newer-wins-with-`.conflict`
+  behavior applies from the second run onward. A new baseline is also
+  established automatically whenever you change the provider, its
+  credentials, or the remote base folder.
+- **Archived media stays one-way** (push) in both modes, as does per-artifact
+  auto-upload — two-way applies only to the "Sync everything now" library pass.
 
 ### Setup, step by step
 
@@ -451,20 +513,67 @@ Every LLM-driven step has an independent provider/model setting in
 **Settings → Model matrix**. Providers:
 
 - **ollama** — local, via the bundled `ollama` container (or point `OLLAMA_BASE_URL` in `.env` at a bigger box on your network — see below). Default for correction, trim-span detection, and tagging (`qwen3:8b`).
-- **openai_compat** — any OpenAI-compatible server you run yourself: LM Studio, llama.cpp server, vLLM, LocalAI, Jan, and the like. Set `OPENAI_COMPAT_BASE_URL` in `.env` (include the `/v1` suffix — e.g. LM Studio on the Docker host is `http://host.docker.internal:1234/v1`), plus `OPENAI_COMPAT_API_KEY` if your server enforces one. Any chat step — and semantic-search embeddings, via the provider dropdown under **Settings → Library intelligence** — can be assigned to it.
+- **openai_compat** — any OpenAI-compatible server you run yourself, i.e. compatible engines that *aren't* OpenAI: LM Studio, llama.cpp server, vLLM, LocalAI, Jan, and the like. Set `OPENAI_COMPAT_BASE_URL` in `.env` (include the `/v1` suffix — e.g. LM Studio on the Docker host is `http://host.docker.internal:1234/v1`), plus `OPENAI_COMPAT_API_KEY` if your server enforces one. Any chat step — and semantic-search embeddings, via the provider dropdown under **Settings → Library intelligence** — can be assigned to it. (For OpenAI's own API, use the `openai` provider below instead.)
 - **anthropic** — Claude API. Default for summary, the Claude deep dive, the merge, quick-references, the podcast script, and the mind map (all `claude-sonnet-5`; swap in `claude-opus-4-8` for more depth on any of these, or `claude-haiku-4-5` to cut cost on summary/quick-refs).
 - **gemini** — Gemini API. Default for the Gemini deep dive (`gemini-3.5-flash`); can also be assigned to ASR (native audio transcription) or TTS (native multi-speaker speech) if you'd rather not run those locally.
+- **openai** — OpenAI's own API (`OPENAI_API_KEY` in `.env`). A frontier provider like the two above: assign any chat step to it and pick from OpenAI's live model catalog in the dropdown — e.g. as a third deep-dive perspective, or in place of a provider you don't have a key for.
 
-The model fields for the two local providers suggest what's actually
-installed on each server (Ollama's model list, or the server's `/models`
-endpoint), so you can pick instead of typing. Changing a dropdown takes
-effect on the *next run* of that step — nothing needs restarting. There's no
-requirement to use both frontier providers; if you only have an Anthropic
-key, for example, reassign the Gemini deep-dive step to
-`anthropic`/`claude-sonnet-5` (you'll get two Claude passes merged into one
-instead of a Claude+Gemini cross-check — still useful, just not the default
-two-perspective design) or to a local provider if you'd rather keep it fully
-local.
+Changing a dropdown takes effect on the *next run* of that step — nothing
+needs restarting. There's no requirement to use both frontier providers; if
+you only have an Anthropic key, for example, reassign the Gemini deep-dive
+step to `anthropic`/`claude-sonnet-5` (you'll get two Claude passes merged
+into one instead of a Claude+Gemini cross-check — still useful, just not the
+default two-perspective design) or to a local provider if you'd rather keep
+it fully local.
+
+### Local vs remote vs cloud — the mental model
+
+A provider names a *kind of server*, not a location:
+
+| Provider | Talks to | Which can run… |
+|---|---|---|
+| `ollama` | an Ollama server | in the bundled container (default), **or** on any other machine via `OLLAMA_BASE_URL` |
+| `openai_compat` | an OpenAI-compatible server that **isn't** OpenAI — LM Studio, llama.cpp, vLLM, LocalAI, Jan | on this same machine (`http://host.docker.internal:PORT/v1`), **or** on any other machine via `OPENAI_COMPAT_BASE_URL` |
+| `anthropic` / `gemini` / `openai` | that vendor's cloud API | Anthropic's / Google's / OpenAI's servers |
+
+Neither local provider is "local-only" or "remote-only" — the difference is
+just which URL you point it at. Pick `ollama` when the serving software is
+Ollama; pick `openai_compat` for everything else that speaks the OpenAI API
+except OpenAI itself, wherever it runs; pick `openai` for OpenAI's actual
+cloud service (it authenticates with `OPENAI_API_KEY` and speaks the current
+OpenAI request shape — reasoning models included — which self-hosted
+compatibility servers don't always accept).
+
+### Where Ollama models come from
+
+Ollama models must be **downloaded before a pipeline step can use them** —
+assigning a model that isn't installed fails at run time with a "not found"
+error. Models come from Ollama's public registry: browse
+[ollama.com/library](https://ollama.com/library) for names, sizes, and
+variants. Names take the form `name:tag` (e.g. `qwen3:8b`); omitting the tag
+means `latest`. Three ways to install one:
+
+1. **Settings → Model matrix → "Install an Ollama model"** — runs as a
+   background job with live download progress in **Jobs** (recommended; no
+   terminal needed).
+2. From a terminal: `docker compose exec ollama ollama pull qwen3:8b`.
+3. On a remote Ollama box: run `ollama pull qwen3:8b` there.
+
+Models land on whichever server `OLLAMA_BASE_URL` points at. Servers behind
+`openai_compat` manage their own models with their own tooling (LM Studio's
+model manager, vLLM's `--model` flag, …) — Synapse simply lists whatever the
+server reports.
+
+### Model dropdowns
+
+Every model field in the matrix is a dropdown of what the selected provider
+*actually offers right now*: installed models for `ollama` and
+`openai_compat`, and the vendor's live model list for `anthropic`, `gemini`,
+and `openai` (fetched with your API key; OpenAI's list is filtered to
+chat-capable models). Choose **custom…** to type a name the list doesn't
+show (a not-yet-pulled Ollama model, a brand-new API model). The ⟳ refresh
+link under the matrix re-queries every provider — useful right after
+installing a model.
 
 ### Local model tuning
 
@@ -691,13 +800,12 @@ WARNING so it doesn't drown out the app's own log lines.
   moving the whole image to CUDA 13 and re-validating faster-whisper against
   it. The **System** tab's GPU card is the way to confirm what's actually
   running where on your hardware.
-- Cloud sync only pushes — there's no pull/bidirectional sync, and no
-  scheduled sync (auto-upload-per-artifact or the manual "sync now" button
-  are the only triggers). The backend image's rclone package (Debian's
-  packaged v1.60) covers all five supported providers but is a few years
-  behind upstream; if Google/Microsoft ever change their token format in a
-  way it can't parse, switching the Dockerfile to rclone's official install
-  script would pull the latest release.
+- Cloud sync has no scheduler — auto-upload-per-artifact and the manual
+  "sync now" button are the only triggers. Two-way sync covers the library
+  only; archived media is always push. The backend image pins a current
+  rclone release (verified by checksum in the Dockerfile) rather than
+  Debian's years-old package, so provider token-format changes are a
+  version-bump away.
 - Job leasing/restart recovery currently assumes the single worker service
   defined by `docker-compose.yml`. Running multiple independent worker
   services would need a distributed lease/leader design for the serialized

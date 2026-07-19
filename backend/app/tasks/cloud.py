@@ -8,19 +8,30 @@ Advanced → Cloud storage) are stored in the Settings table:
     cloud.config       provider-specific dict (see FIELDS below)
     cloud.remote_base  path prefix inside the remote (default "synapse")
     cloud.auto         bool — upload each artifact right after it's written
+    cloud.mode         "push" (one-way, local → cloud) | "bisync" (two-way)
+    cloud.bisync_state remote dest the bisync baseline was established against
     cloud.last_sync    result of the most recent sync (status endpoint)
+
+Two-way mode syncs the *library* (the Markdown vault) in both directions with
+`rclone bisync`; archived media stays push-only in both modes (large binaries,
+no story for editing them remotely). After a two-way pass the SQLite index is
+rebuilt from the vault so pulled/deleted documents show up in the app.
 
 For the OAuth providers the user pastes the token JSON produced by running
 `rclone authorize "drive"` (etc.) on any machine with a browser.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
 import subprocess
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
+
+from celery import chain as celery_chain
 
 log = logging.getLogger("synapse.cloud")
 
@@ -143,6 +154,138 @@ def _record(status: str, detail: str) -> None:
     })
 
 
+def sync_mode() -> str:
+    return get_setting("cloud.mode") or "push"
+
+
+def _bisync_args(src: str, dest: str, workdir: str, resync: bool) -> list[str]:
+    """Two-way sync flags, per rclone's own set-and-forget recommendation:
+    resilient/recover keep an interrupted run restartable, max-lock lets a
+    crashed run's lock expire, conflict-resolve keeps the newer side and
+    renames the loser with a .conflict suffix instead of losing it. bisync's
+    built-in --max-delete safety (default 50%) aborts a run that would mass-
+    delete either side."""
+    args = ["bisync", src, dest,
+            "--workdir", workdir,
+            "--resilient", "--recover", "--max-lock", "2m",
+            "--conflict-resolve", "newer"]
+    if resync:
+        # Establish the baseline. --resync-mode newer matters: the default
+        # (path1) would unconditionally overwrite differing cloud files with
+        # the local copy — exactly wrong for "I've been editing the cloud copy
+        # from another machine, now let's link them". conflict-resolve does
+        # NOT apply during a resync, so the mode is the only protection.
+        # (rclone falls back to local-wins on backends without modtimes.)
+        args += ["--resync", "--resync-mode", "newer"]
+    return args
+
+
+def _bisync_fingerprint(dest: str) -> str:
+    """A baseline is only valid against the exact remote it was built for.
+    The dest string alone can't tell providers apart (the rclone remote is
+    always named [synapse]; only s3 embeds the bucket), so fingerprint the
+    whole effective remote identity — provider, its config (endpoints,
+    accounts, tokens), and the destination path. Hashed so tokens never sit
+    in a plaintext settings row."""
+    raw = json.dumps({
+        "dest": dest,
+        "provider": get_setting("cloud.provider") or "",
+        "config": get_setting("cloud.config") or {},
+    }, sort_keys=True)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _sync_all_bisync(job_id: int) -> None:
+    dest = _dest("library")
+    workdir = settings.db_path.parent / "bisync-state"
+    workdir.mkdir(parents=True, exist_ok=True)
+    fingerprint = _bisync_fingerprint(dest)
+    resync = get_setting("cloud.bisync_state") != fingerprint
+
+    # bisync (unlike copy) requires both base directories to exist — a
+    # never-pushed remote would otherwise fail the very first two-way run
+    _rclone(["mkdir", dest])
+
+    # Google Drive allows same-name duplicates, which confuse a two-way
+    # baseline — fold them down BEFORE bisync looks at the remote.
+    if get_setting("cloud.provider") == "drive":
+        with get_session() as session:
+            set_job(session, job_id, status="running", progress="de-duplicating remote")
+        _rclone(["dedupe", "--dedupe-mode", "newest", dest])
+
+    with get_session() as session:
+        set_job(session, job_id, status="running",
+                progress="two-way library sync" + (" (baseline)" if resync else ""))
+    try:
+        _rclone(_bisync_args(str(settings.library_dir), dest, str(workdir), resync))
+    except RuntimeError as e:
+        # bisync's lockout state ("Must run --resync to recover") means its
+        # listings can't be trusted. Clear the marker so the next explicit
+        # "Sync everything now" click re-baselines (newer side wins, nothing
+        # deleted), and tell the operator that's what will happen.
+        if "must run --resync" in str(e).lower():
+            set_setting("cloud.bisync_state", None)
+            raise RuntimeError(
+                f"{e}\ntwo-way sync needs a fresh baseline — the next "
+                "'Sync everything now' will re-establish it (the newer copy "
+                "of each file wins during a baseline; nothing is deleted)")
+        raise
+    set_setting("cloud.bisync_state", fingerprint)
+
+    # media stays one-way in both modes
+    with get_session() as session:
+        set_job(session, job_id, status="running", progress="uploading archived media")
+    _rclone(["copy", str(settings.media_dir), _dest("media"),
+             "--include", "/*/source_video.*", "--include", "/*/source_audio.*"])
+    if get_setting("cloud.provider") == "drive":
+        _rclone(["dedupe", "--dedupe-mode", "newest", _dest("media")])
+
+    # a two-way pass may have pulled/changed/deleted vault files — rebuild the
+    # SQLite index from the Markdown (prune rows whose files are gone), then
+    # re-embed for semantic search (the rebuild recreates chunks without
+    # embeddings, so skipping this would silently kill Hybrid search)
+    with get_session() as session:
+        set_job(session, job_id, status="running", progress="reindexing pulled changes")
+        rebuild = Job(project_id=None, task="rebuild_library")
+        session.add(rebuild)
+        session.commit()
+        session.refresh(rebuild)
+        rebuild_id = rebuild.id
+        search_id = None
+        if get_setting("search.semantic_enabled", False):
+            search_job = Job(project_id=None, task="rebuild_search")
+            session.add(search_job)
+            session.commit()
+            session.refresh(search_job)
+            search_id = search_job.id
+    try:
+        rebuild_sig = celery.signature(
+            "rebuild_library", args=[rebuild_id, True], immutable=True)
+        if search_id is not None:
+            # chain: embeddings must rebuild AFTER the vault reindex finishes
+            result = celery_chain(
+                rebuild_sig,
+                celery.signature("rebuild_search", args=[search_id], immutable=True),
+            ).apply_async()
+        else:
+            result = rebuild_sig.apply_async()
+        with get_session() as session:
+            row = session.get(Job, rebuild_id)
+            row.celery_id = getattr(getattr(result, "parent", None), "id", "") \
+                or getattr(result, "id", "") or ""
+            session.add(row)
+            session.commit()
+    except Exception:
+        with get_session() as session:
+            for orphan_id in filter(None, (rebuild_id, search_id)):
+                row = session.get(Job, orphan_id)
+                row.status = "error"
+                row.error = "could not dispatch vault reindex after two-way sync"
+                session.add(row)
+            session.commit()
+        log.warning("could not enqueue reindex after bisync", exc_info=True)
+
+
 @celery.task(name="cloud_sync_paths")
 def sync_paths(paths: list[str]):
     """Upload individual artifact files (library-relative or 'media:' paths)."""
@@ -184,7 +327,20 @@ def sync_paths(paths: list[str]):
 
 @celery.task(name="cloud_sync_all")
 def sync_all(job_id: int):
-    """Full backfill: entire library + archived source media."""
+    """Full sync: two-way library bisync or one-way push, per cloud.mode;
+    archived source media is pushed one-way either way."""
+    if sync_mode() == "bisync":
+        try:
+            _sync_all_bisync(job_id)
+            _record("ok", "two-way sync complete")
+            with get_session() as session:
+                set_job(session, job_id, status="done", progress="complete")
+            return
+        except Exception as e:
+            _record("error", str(e)[:500])
+            with get_session() as session:
+                set_job(session, job_id, status="error", error=str(e)[:2000])
+            raise
     with get_session() as session:
         set_job(session, job_id, status="running", progress="uploading library")
     try:

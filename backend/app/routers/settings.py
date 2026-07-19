@@ -15,7 +15,7 @@ from ..tasks.prompts import DEFAULTS as PROMPT_DEFAULTS, PROMPT_LABELS
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 
-PROVIDERS = ["ollama", "openai_compat", "anthropic", "gemini"]
+PROVIDERS = ["ollama", "openai_compat", "anthropic", "gemini", "openai"]
 FUNCTION_PROVIDERS = {
     **{name: PROVIDERS for name in FUNCTION_DEFAULTS},
     "asr": ["faster-whisper", "gemini"],
@@ -40,10 +40,12 @@ def get_models():
     }
 
 
-@router.get("/local-models")
-def local_models():
-    """Installed models on each local server, for the model-matrix dropdowns.
-    Best-effort: an unreachable server reports ok=False rather than erroring."""
+@router.get("/provider-models")
+def provider_models():
+    """The models each provider actually offers, for the model-matrix
+    dropdowns: installed models for the local servers, the vendor's model list
+    for the cloud APIs. Best-effort: an unreachable or unconfigured provider
+    reports ok=False rather than erroring the whole endpoint."""
     out: dict[str, dict] = {}
     try:
         response = httpx.get(f"{settings.ollama_base_url}/api/tags", timeout=3)
@@ -58,6 +60,13 @@ def local_models():
     if not base:
         out["openai_compat"] = {"configured": False, "ok": False, "models": [],
                                 "detail": "OPENAI_COMPAT_BASE_URL is not set"}
+    elif "api.openai.com" in base:
+        out["openai_compat"] = {
+            "configured": True, "ok": False, "models": [],
+            "detail": "OPENAI_COMPAT_BASE_URL points at OpenAI itself — use "
+                      "the 'openai' provider (OPENAI_API_KEY) for that; "
+                      "openai_compat is for compatible servers you run",
+        }
     else:
         try:
             headers = {}
@@ -72,7 +81,117 @@ def local_models():
         except Exception as exc:
             out["openai_compat"] = {"configured": True, "ok": False, "models": [],
                                     "detail": str(exc)[:300]}
+    if not settings.anthropic_api_key:
+        out["anthropic"] = {"configured": False, "ok": False, "models": [],
+                            "detail": "ANTHROPIC_API_KEY is not set"}
+    else:
+        try:
+            import anthropic
+
+            client = anthropic.Anthropic(api_key=settings.anthropic_api_key,
+                                         timeout=5, max_retries=0)
+            # API order is newest-first — keep it, that's the right dropdown order
+            out["anthropic"] = {"configured": True, "ok": True,
+                                "models": [m.id for m in client.models.list()],
+                                "detail": ""}
+        except Exception as exc:
+            out["anthropic"] = {"configured": True, "ok": False, "models": [],
+                                "detail": str(exc)[:300]}
+    if not settings.openai_api_key:
+        out["openai"] = {"configured": False, "ok": False, "models": [],
+                         "detail": "OPENAI_API_KEY is not set"}
+    else:
+        try:
+            from openai import OpenAI
+
+            client = OpenAI(api_key=settings.openai_api_key, timeout=5,
+                            max_retries=0)
+            # OpenAI's list mixes chat models with embeddings/audio/image
+            # models and offers no capability field — filter the obvious
+            # non-chat families plus the Responses-API-only ones (codex,
+            # *-pro, deep-research, computer-use) and legacy completions-only
+            # models, none of which work on chat.completions; order newest
+            # first via `created`. "custom…" remains the escape hatch.
+            non_chat = ("embedding", "whisper", "tts", "dall-e", "audio",
+                        "realtime", "transcribe", "moderation", "image",
+                        "codex", "sora", "computer-use", "deep-research",
+                        "-pro", "instruct", "davinci", "babbage")
+            rows = [(getattr(m, "created", 0) or 0, m.id)
+                    for m in client.models.list()
+                    if m.id and not any(part in m.id for part in non_chat)]
+            out["openai"] = {"configured": True, "ok": True,
+                             "models": [name for _, name in
+                                        sorted(rows, reverse=True)],
+                             "detail": ""}
+        except Exception as exc:
+            out["openai"] = {"configured": True, "ok": False, "models": [],
+                             "detail": str(exc)[:300]}
+    if not settings.gemini_api_key:
+        out["gemini"] = {"configured": False, "ok": False, "models": [],
+                         "detail": "GEMINI_API_KEY is not set"}
+    else:
+        try:
+            from google import genai
+
+            client = genai.Client(api_key=settings.gemini_api_key,
+                                  http_options={"timeout": 8000})
+            names = []
+            for m in client.models.list():
+                name = (getattr(m, "name", "") or "").removeprefix("models/")
+                actions = getattr(m, "supported_actions", None)
+                if name and (not actions or "generateContent" in actions):
+                    names.append(name)
+            out["gemini"] = {"configured": True, "ok": True, "models": names,
+                             "detail": ""}
+        except Exception as exc:
+            out["gemini"] = {"configured": True, "ok": False, "models": [],
+                             "detail": str(exc)[:300]}
     return out
+
+
+class OllamaPull(BaseModel):
+    model: str
+
+
+@router.post("/ollama/pull")
+def ollama_pull(req: OllamaPull):
+    """Queue an `ollama pull` as a background job (progress shows in Jobs).
+    Models come from Ollama's registry (ollama.com/library) and must be
+    installed before a pipeline step can use them."""
+    model = req.model.strip()
+    if not model:
+        raise HTTPException(400, "model name required (e.g. qwen3:8b)")
+    from ..tasks.celery_app import celery
+
+    with get_session() as session:
+        active = session.exec(
+            select(Job).where(Job.task == "ollama_pull",
+                              Job.status.in_(("queued", "running")))
+        ).all()
+        for existing in active:
+            # progress is "<model>" at enqueue, "<model>: <status>" while
+            # running — match on ": " so "qwen3" doesn't collide with a
+            # running "qwen3:8b" pull (":" is also Ollama's tag separator)
+            progress = existing.progress or ""
+            if progress == model or progress.startswith(model + ": "):
+                return existing.model_dump()
+        job = Job(project_id=None, task="ollama_pull", progress=model)
+        session.add(job)
+        session.commit()
+        session.refresh(job)
+        try:
+            async_result = celery.send_task("ollama_pull", args=[job.id, model])
+            job.celery_id = async_result.id
+        except Exception as e:
+            job.status = "error"
+            job.error = f"could not dispatch: {e}"[:2000]
+            session.add(job)
+            session.commit()
+            raise HTTPException(503, f"could not queue pull: {e}")
+        session.add(job)
+        session.commit()
+        session.refresh(job)
+        return job.model_dump()
 
 
 class ModelOverride(BaseModel):
@@ -409,6 +528,7 @@ def get_cloud():
         "config": masked,
         "remote_base": get_setting("cloud.remote_base") or "synapse",
         "auto": bool(get_setting("cloud.auto")),
+        "mode": get_setting("cloud.mode") or "push",
         "last_sync": get_setting("cloud.last_sync"),
     }
 
@@ -418,6 +538,7 @@ class CloudConfig(BaseModel):
     config: dict[str, str] = {}
     remote_base: str = "synapse"
     auto: bool = False
+    mode: str = "push"
 
 
 @router.put("/cloud")
@@ -426,6 +547,8 @@ def set_cloud(req: CloudConfig):
 
     if req.provider and req.provider not in FIELDS:
         raise HTTPException(400, f"unknown provider {req.provider!r}")
+    if req.mode not in ("push", "bisync"):
+        raise HTTPException(400, "mode must be 'push' or 'bisync'")
     existing = get_setting("cloud.config") or {}
     merged = dict(existing) if req.provider == get_setting("cloud.provider") else {}
     for field, secret in FIELDS.get(req.provider, {}).items():
@@ -437,6 +560,7 @@ def set_cloud(req: CloudConfig):
     set_setting("cloud.config", merged or None)
     set_setting("cloud.remote_base", req.remote_base)
     set_setting("cloud.auto", req.auto)
+    set_setting("cloud.mode", req.mode if req.mode != "push" else None)
     return {"ok": True}
 
 

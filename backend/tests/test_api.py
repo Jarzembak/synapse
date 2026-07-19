@@ -1294,23 +1294,34 @@ def test_model_override(client):
 
 
 def test_openai_compat_provider_for_chat_functions_only(client):
-    assert "openai_compat" in client.get("/api/settings/models").json()["providers"]
+    providers = client.get("/api/settings/models").json()["providers"]
+    assert "openai_compat" in providers
+    assert "openai" in providers
     r = client.put("/api/settings/models/merge",
                    json={"provider": "openai_compat", "model": "qwen2.5-7b-instruct"})
     assert r.status_code == 200
+    assert client.put("/api/settings/models/summarize",
+                      json={"provider": "openai", "model": "gpt-5"}).status_code == 200
+    client.put("/api/settings/models/summarize",
+               json={"provider": "anthropic", "model": "claude-sonnet-5"})  # restore
     assert client.put("/api/settings/models/tts",
                       json={"provider": "openai_compat", "model": "x"}).status_code == 400
+    assert client.put("/api/settings/models/tts",
+                      json={"provider": "openai", "model": "x"}).status_code == 400
     assert client.put("/api/settings/models/asr",
                       json={"provider": "openai_compat", "model": "x"}).status_code == 400
     client.put("/api/settings/models/merge",
                json={"provider": "anthropic", "model": "claude-sonnet-5"})  # restore
 
 
-def test_local_models_endpoint(client, monkeypatch):
+def test_provider_models_endpoint(client, monkeypatch):
     from app.config import settings as app_settings
     from app.routers import settings as settings_router
 
     monkeypatch.setattr(app_settings, "openai_compat_base_url", "")
+    monkeypatch.setattr(app_settings, "anthropic_api_key", "")
+    monkeypatch.setattr(app_settings, "gemini_api_key", "")
+    monkeypatch.setattr(app_settings, "openai_api_key", "")
 
     class FakeResponse:
         @staticmethod
@@ -1324,15 +1335,16 @@ def test_local_models_endpoint(client, monkeypatch):
 
     monkeypatch.setattr(settings_router.httpx, "get",
                         lambda url, **kw: FakeResponse())
-    out = client.get("/api/settings/local-models").json()
+    out = client.get("/api/settings/provider-models").json()
     assert out["ollama"]["ok"] is True
     assert out["ollama"]["models"] == ["nomic-embed-text:latest", "qwen3:8b"]
-    # openai_compat is unconfigured by default: reported, not an error
-    assert out["openai_compat"]["configured"] is False
-    assert out["openai_compat"]["models"] == []
+    # unconfigured providers are reported, not errors
+    for provider in ("openai_compat", "anthropic", "gemini", "openai"):
+        assert out[provider]["configured"] is False
+        assert out[provider]["models"] == []
 
 
-def test_local_models_endpoint_openai_compat(client, monkeypatch):
+def test_provider_models_endpoint_openai_compat(client, monkeypatch):
     from app.config import settings as app_settings
     from app.routers import settings as settings_router
 
@@ -1351,9 +1363,87 @@ def test_local_models_endpoint_openai_compat(client, monkeypatch):
 
     monkeypatch.setattr(settings_router.httpx, "get", fake_get)
     monkeypatch.setattr(app_settings, "openai_compat_base_url", "http://box:1234/v1")
-    out = client.get("/api/settings/local-models").json()
+    # never let this test reach the real cloud APIs when the developer's
+    # environment happens to have keys configured
+    monkeypatch.setattr(app_settings, "anthropic_api_key", "")
+    monkeypatch.setattr(app_settings, "gemini_api_key", "")
+    monkeypatch.setattr(app_settings, "openai_api_key", "")
+    out = client.get("/api/settings/provider-models").json()
     assert out["openai_compat"]["ok"] is True
     assert out["openai_compat"]["models"] == ["gemma-3-12b", "qwen2.5-7b-instruct"]
+
+    # pointing the compat provider at OpenAI itself is flagged, not listed
+    monkeypatch.setattr(app_settings, "openai_compat_base_url",
+                        "https://api.openai.com/v1")
+    out = client.get("/api/settings/provider-models").json()
+    assert out["openai_compat"]["ok"] is False
+    assert "openai" in out["openai_compat"]["detail"]
+
+
+def test_provider_models_endpoint_cloud_apis(client, monkeypatch):
+    import types
+
+    import anthropic
+    from google import genai
+
+    from app.config import settings as app_settings
+    from app.routers import settings as settings_router
+
+    class FailResponse:
+        @staticmethod
+        def raise_for_status():
+            raise RuntimeError("down")
+
+    monkeypatch.setattr(settings_router.httpx, "get", lambda url, **kw: FailResponse())
+    monkeypatch.setattr(app_settings, "anthropic_api_key", "sk-test")
+    monkeypatch.setattr(app_settings, "gemini_api_key", "g-test")
+    monkeypatch.setattr(app_settings, "openai_api_key", "oa-test")
+
+    class FakeAnthropic:
+        def __init__(self, **_kwargs):
+            self.models = types.SimpleNamespace(list=lambda: [
+                types.SimpleNamespace(id="claude-sonnet-5"),
+                types.SimpleNamespace(id="claude-haiku-4-5"),
+            ])
+
+    class FakeGenai:
+        def __init__(self, **_kwargs):
+            self.models = types.SimpleNamespace(list=lambda: [
+                types.SimpleNamespace(name="models/gemini-3.5-flash",
+                                      supported_actions=["generateContent"]),
+                types.SimpleNamespace(name="models/embedding-001",
+                                      supported_actions=["embedContent"]),
+            ])
+
+    import openai as openai_sdk
+
+    class FakeOpenAI:
+        def __init__(self, **_kwargs):
+            self.models = types.SimpleNamespace(list=lambda: [
+                types.SimpleNamespace(id="gpt-4o-mini", created=100),
+                types.SimpleNamespace(id="gpt-5", created=300),
+                types.SimpleNamespace(id="text-embedding-3-small", created=400),
+                types.SimpleNamespace(id="whisper-1", created=50),
+                types.SimpleNamespace(id="o4-mini", created=200),
+                # Responses-API-only / non-chat families must be filtered out
+                types.SimpleNamespace(id="gpt-5-codex", created=500),
+                types.SimpleNamespace(id="sora-2", created=600),
+                types.SimpleNamespace(id="o3-pro", created=250),
+                types.SimpleNamespace(id="computer-use-preview", created=150),
+            ])
+
+    monkeypatch.setattr(anthropic, "Anthropic", FakeAnthropic)
+    monkeypatch.setattr(genai, "Client", FakeGenai)
+    monkeypatch.setattr(openai_sdk, "OpenAI", FakeOpenAI)
+    out = client.get("/api/settings/provider-models").json()
+    # API order preserved (newest first) for anthropic
+    assert out["anthropic"]["models"] == ["claude-sonnet-5", "claude-haiku-4-5"]
+    # gemini filtered to generateContent-capable, models/ prefix stripped
+    assert out["gemini"]["models"] == ["gemini-3.5-flash"]
+    # openai: non-chat families filtered out, newest (created) first
+    assert out["openai"]["models"] == ["gpt-5", "o4-mini", "gpt-4o-mini"]
+    # a down local server is reported per-provider without failing the endpoint
+    assert out["ollama"]["ok"] is False
 
 
 def test_search_settings_embedding_provider(client):
@@ -1394,3 +1484,351 @@ def test_advanced_local_group_validation(client):
     assert client.put("/api/settings/advanced/local",
                       json={"values": {"json_mode": "yes"}}).status_code == 422
     client.put("/api/settings/advanced/local", json={"values": {}})  # restore
+
+
+def test_ollama_pull_endpoint(client, monkeypatch):
+    import types
+
+    from app.tasks import celery_app
+
+    sent = []
+    monkeypatch.setattr(
+        celery_app.celery, "send_task",
+        lambda name, args=None: sent.append((name, args)) or types.SimpleNamespace(id="cid-1"))
+
+    assert client.post("/api/settings/ollama/pull",
+                       json={"model": "   "}).status_code == 400
+
+    first = client.post("/api/settings/ollama/pull", json={"model": "qwen3:8b"}).json()
+    assert first["task"] == "ollama_pull"
+    assert first["progress"] == "qwen3:8b"
+    assert sent == [("ollama_pull", [first["id"], "qwen3:8b"])]
+
+    # same model while queued -> dedupe to the existing job, no second dispatch
+    again = client.post("/api/settings/ollama/pull", json={"model": "qwen3:8b"}).json()
+    assert again["id"] == first["id"]
+    assert len(sent) == 1
+
+    # a DIFFERENT tag of the same family is a different pull
+    other = client.post("/api/settings/ollama/pull", json={"model": "qwen3"}).json()
+    assert other["id"] != first["id"]
+    assert len(sent) == 2
+
+    # cleanup so later tests see no active pulls
+    from app.db import get_session
+    from app.models import Job
+    with get_session() as session:
+        for job_id in (first["id"], other["id"]):
+            job = session.get(Job, job_id)
+            job.status = "done"
+            session.add(job)
+        session.commit()
+
+
+def test_cloud_mode_roundtrip_and_validation(client):
+    r = client.put("/api/settings/cloud", json={
+        "provider": "s3",
+        "config": {"endpoint": "https://s3.local", "bucket": "b",
+                   "access_key_id": "k", "secret_access_key": "s"},
+        "remote_base": "synapse", "auto": False, "mode": "bisync"})
+    assert r.status_code == 200
+    assert client.get("/api/settings/cloud").json()["mode"] == "bisync"
+    assert client.put("/api/settings/cloud", json={
+        "provider": "s3", "config": {}, "remote_base": "synapse",
+        "auto": False, "mode": "sideways"}).status_code == 400
+    client.put("/api/settings/cloud", json={
+        "provider": "", "config": {}, "remote_base": "synapse",
+        "auto": False, "mode": "push"})  # restore
+
+
+def _mock_reindex_dispatch(monkeypatch, cloud, dispatched: list):
+    """Capture the rebuild_library / rebuild_search dispatch (signature +
+    chain + apply_async) without a broker."""
+    import types
+
+    class FakeSig:
+        def __init__(self, name, args):
+            self.name, self.args = name, args
+
+        def apply_async(self):
+            dispatched.append((self.name, self.args))
+            return types.SimpleNamespace(id="cid", parent=None)
+
+    monkeypatch.setattr(
+        cloud.celery, "signature",
+        lambda name, args=None, immutable=True: FakeSig(name, args))
+
+    def fake_chain(*sigs):
+        def apply_async():
+            for sig in sigs:
+                dispatched.append((sig.name, sig.args))
+            return types.SimpleNamespace(
+                id="cid-last", parent=types.SimpleNamespace(id="cid-first"))
+        return types.SimpleNamespace(apply_async=apply_async)
+
+    monkeypatch.setattr(cloud, "celery_chain", fake_chain)
+
+
+def _finish_reindex_jobs():
+    """Mocked dispatch never runs the reindex jobs — finalize the rows so
+    they can't leak 'queued' state into later tests."""
+    from sqlmodel import select
+
+    from app.db import get_session
+    from app.models import Job
+    with get_session() as session:
+        rows = session.exec(select(Job).where(
+            Job.task.in_(("rebuild_library", "rebuild_search")),
+            Job.status == "queued")).all()
+        for row in rows:
+            row.status = "done"
+            session.add(row)
+        session.commit()
+
+
+def _cloud_bisync_setup(client, monkeypatch, cloud, bucket="b"):
+    from app.settings_store import set_setting
+
+    client.put("/api/settings/cloud", json={
+        "provider": "s3",
+        "config": {"endpoint": "https://s3.local", "bucket": bucket,
+                   "access_key_id": "k", "secret_access_key": "s"},
+        "remote_base": "synapse", "auto": False, "mode": "bisync"})
+    set_setting("cloud.bisync_state", None)
+
+
+def _run_cloud_sync(cloud):
+    from app.db import get_session
+    from app.models import Job
+
+    with get_session() as session:
+        job = Job(project_id=None, task="cloud_sync_all")
+        session.add(job)
+        session.commit()
+        session.refresh(job)
+        job_id = job.id
+    cloud.sync_all(job_id)
+    return job_id
+
+
+def _restore_cloud(client):
+    from app.settings_store import set_setting
+
+    client.put("/api/settings/cloud", json={
+        "provider": "", "config": {}, "remote_base": "synapse",
+        "auto": False, "mode": "push"})
+    set_setting("cloud.bisync_state", None)
+    _finish_reindex_jobs()
+
+
+def test_cloud_sync_all_bisync_mode(client, monkeypatch):
+    from app.db import get_session
+    from app.models import Job
+    from app.settings_store import get_setting
+    from app.tasks import cloud
+
+    calls: list[list[str]] = []
+    monkeypatch.setattr(cloud, "_rclone", lambda args: calls.append(list(args)))
+    dispatched: list = []
+    _mock_reindex_dispatch(monkeypatch, cloud, dispatched)
+    _cloud_bisync_setup(client, monkeypatch, cloud)
+
+    # first run: mkdir, then bisync with a newer-wins baseline, then media push
+    job_id = _run_cloud_sync(cloud)
+    assert calls[0][0] == "mkdir"                       # remote base must exist
+    bisync_calls = [c for c in calls if c[0] == "bisync"]
+    assert len(bisync_calls) == 1
+    assert "--resync" in bisync_calls[0]
+    assert bisync_calls[0][bisync_calls[0].index("--resync-mode") + 1] == "newer"
+    assert "--conflict-resolve" in bisync_calls[0]
+    assert any(c[0] == "copy" for c in calls)           # media stays push
+    marker = get_setting("cloud.bisync_state")
+    assert marker                                        # baseline recorded
+    # vault reindex enqueued with prune enabled (semantic off -> no chain)
+    assert dispatched == [("rebuild_library", [dispatched[0][1][0], True])]
+    with get_session() as session:
+        assert session.get(Job, job_id).status == "done"
+
+    # second run: baseline exists -> no --resync
+    calls.clear()
+    dispatched.clear()
+    _run_cloud_sync(cloud)
+    bisync_calls = [c for c in calls if c[0] == "bisync"]
+    assert len(bisync_calls) == 1 and "--resync" not in bisync_calls[0]
+
+    # changing the remote's identity (same dest string, different config)
+    # must force a fresh baseline
+    calls.clear()
+    _cloud_bisync_setup(client, monkeypatch, cloud, bucket="b")  # same dest...
+    from app.settings_store import set_setting
+    set_setting("cloud.bisync_state", marker)            # ...baseline restored
+    client.put("/api/settings/cloud", json={
+        "provider": "s3",
+        "config": {"endpoint": "https://other.example", "bucket": "b",
+                   "access_key_id": "k2", "secret_access_key": "s2"},
+        "remote_base": "synapse", "auto": False, "mode": "bisync"})
+    _run_cloud_sync(cloud)
+    bisync_calls = [c for c in calls if c[0] == "bisync"]
+    assert "--resync" in bisync_calls[0]
+
+    _restore_cloud(client)
+
+
+def test_cloud_sync_all_bisync_failure_paths(client, monkeypatch):
+    from app.db import get_session
+    from app.models import Job
+    from app.settings_store import get_setting, set_setting
+    from app.tasks import cloud
+
+    dispatched: list = []
+    _mock_reindex_dispatch(monkeypatch, cloud, dispatched)
+    _cloud_bisync_setup(client, monkeypatch, cloud)
+
+    # a successful run first, so a baseline marker exists
+    monkeypatch.setattr(cloud, "_rclone", lambda args: None)
+    _run_cloud_sync(cloud)
+    marker = get_setting("cloud.bisync_state")
+    assert marker
+
+    # generic failure: job errors, marker is NOT advanced or cleared
+    def fail_generic(args):
+        if args[0] == "bisync":
+            raise RuntimeError("connection reset by peer")
+    monkeypatch.setattr(cloud, "_rclone", fail_generic)
+    import pytest as _pytest
+    with _pytest.raises(RuntimeError):
+        _run_cloud_sync(cloud)
+    assert get_setting("cloud.bisync_state") == marker
+    assert get_setting("cloud.last_sync")["status"] == "error"
+
+    # lockout failure: marker cleared so the next run re-baselines, and the
+    # recorded error tells the operator what will happen
+    def fail_lockout(args):
+        if args[0] == "bisync":
+            raise RuntimeError("Bisync aborted. Must run --resync to recover.")
+    monkeypatch.setattr(cloud, "_rclone", fail_lockout)
+    with _pytest.raises(RuntimeError):
+        _run_cloud_sync(cloud)
+    assert get_setting("cloud.bisync_state") is None
+    assert "baseline" in get_setting("cloud.last_sync")["detail"]
+
+    _restore_cloud(client)
+
+
+def test_cloud_sync_all_push_mode(client, monkeypatch):
+    from app.db import get_session
+    from app.models import Job
+    from app.tasks import cloud
+
+    calls: list[list[str]] = []
+    monkeypatch.setattr(cloud, "_rclone", lambda args: calls.append(list(args)))
+    client.put("/api/settings/cloud", json={
+        "provider": "s3",
+        "config": {"endpoint": "https://s3.local", "bucket": "b",
+                   "access_key_id": "k", "secret_access_key": "s"},
+        "remote_base": "synapse", "auto": False, "mode": "push"})
+
+    job_id = _run_cloud_sync(cloud)
+    assert [c[0] for c in calls] == ["copy", "copy"]     # library, then media
+    assert "--include" in calls[1]                       # media stays filtered
+    assert not any(c[0] in ("bisync", "mkdir") for c in calls)
+    with get_session() as session:
+        assert session.get(Job, job_id).status == "done"
+    _restore_cloud(client)
+
+
+def test_ollama_pull_dedupes_against_running_job(client, monkeypatch):
+    import types
+
+    from app.db import get_session
+    from app.models import Job
+    from app.tasks import celery_app
+    from app.tasks.common import set_job
+
+    monkeypatch.setattr(celery_app.celery, "send_task",
+                        lambda name, args=None: types.SimpleNamespace(id="cid"))
+    first = client.post("/api/settings/ollama/pull", json={"model": "qwen3:8b"}).json()
+    # simulate the worker rewriting progress mid-download
+    with get_session() as session:
+        set_job(session, first["id"], status="running",
+                progress="qwen3:8b: pulling manifest 40%")
+    again = client.post("/api/settings/ollama/pull", json={"model": "qwen3:8b"}).json()
+    assert again["id"] == first["id"]
+    with get_session() as session:
+        job = session.get(Job, first["id"])
+        job.status = "done"
+        session.add(job)
+        session.commit()
+
+
+def test_ollama_pull_task_success_error_and_cancel(client, monkeypatch):
+    import types
+
+    from app.db import get_session
+    from app.models import Job
+    from app.tasks import localmodels
+
+    def make_job(status="queued"):
+        with get_session() as session:
+            job = Job(project_id=None, task="ollama_pull", status=status,
+                      progress="qwen3:8b")
+            session.add(job)
+            session.commit()
+            session.refresh(job)
+            return job.id
+
+    def fake_stream(lines, status_code=200):
+        response = types.SimpleNamespace(
+            status_code=status_code,
+            iter_lines=lambda: iter(lines),
+            read=lambda: None,
+            json=lambda: {"error": "boom"},
+            text="boom",
+        )
+
+        class Ctx:  # dunders resolve on the type, so a real class is needed
+            def __enter__(self):
+                return response
+
+            def __exit__(self, *args):
+                return False
+
+        return Ctx()
+
+    streamed = []
+    monkeypatch.setattr(
+        localmodels.httpx, "stream",
+        lambda *a, **k: streamed.append(1) or fake_stream([
+            '{"status": "pulling manifest"}',
+            '{"status": "downloading", "total": 100, "completed": 50}',
+            '{"status": "success"}',
+        ]))
+
+    # success: NDJSON consumed, job lands done with the installed marker
+    job_id = make_job()
+    localmodels.ollama_pull(job_id, "qwen3:8b")
+    with get_session() as session:
+        job = session.get(Job, job_id)
+        assert job.status == "done"
+        assert job.progress == "qwen3:8b: installed"
+
+    # an error line in the stream fails the job with Ollama's message
+    monkeypatch.setattr(
+        localmodels.httpx, "stream",
+        lambda *a, **k: fake_stream(['{"error": "pull model manifest: not found"}']))
+    job_id = make_job()
+    import pytest as _pytest
+    with _pytest.raises(RuntimeError, match="not found"):
+        localmodels.ollama_pull(job_id, "qwen3:8b")
+    with get_session() as session:
+        assert session.get(Job, job_id).status == "error"
+
+    # canceled before pickup: the CAS fails and nothing is downloaded
+    streamed.clear()
+    monkeypatch.setattr(localmodels.httpx, "stream",
+                        lambda *a, **k: streamed.append(1) or fake_stream([]))
+    job_id = make_job(status="canceled")
+    localmodels.ollama_pull(job_id, "qwen3:8b")
+    assert streamed == []
+    with get_session() as session:
+        assert session.get(Job, job_id).status == "canceled"
