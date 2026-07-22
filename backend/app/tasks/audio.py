@@ -324,6 +324,8 @@ def tts(job_id: int, project_id: int):
         script_artifact = session.exec(
             select(Artifact).where(
                 Artifact.project_id == project_id,
+                Artifact.paper_series_id == None,  # noqa: E711
+                Artifact.paper_part_id == None,  # noqa: E711
                 Artifact.type == "podcast_script",
             )
         ).first()

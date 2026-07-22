@@ -41,7 +41,13 @@ ARTIFACT_TYPES = [
     "deepdive_merged", "podcast_script", "podcast_audio", "trimmed_audio",
     "mindmap", "quickref_tool", "quickref_technique", "quickref_concept",
     "quickref_technology",  # plus quickref_<key> per custom category
-    "source_video", "source_audio",
+    "source_video", "source_audio", "source_paper", "paper_extraction_report",
+    "paper_coverage", "paper_argument_map", "paper_mindmap",
+    "paper_quick_references",
+    "paper_overview", "paper_methods", "paper_evidence", "paper_prerequisites",
+    "paper_critique", "paper_deepdive_explanatory",
+    "paper_deepdive_methodology", "paper_study_guide",
+    "paper_part_guide", "paper_part_script", "paper_part_audio",
 ]
 
 
@@ -53,7 +59,9 @@ _MARKDOWN_IMAGE_RE = re.compile(
     r"!\[(?P<alt>[^\]\r\n]*)\]\s*\([^\)\r\n]*\)", re.IGNORECASE)
 _MARKDOWN_IMAGE_REF_RE = re.compile(
     r"!\[(?P<alt>[^\]\r\n]*)\]\s*\[[^\]\r\n]*\]", re.IGNORECASE)
-_EVIDENCE_COMMENT_RE = re.compile(r"(<!--E:[A-Za-z0-9_-]+-->)")
+_EVIDENCE_COMMENT_RE = re.compile(
+    r"(<!--(?:(?:E|P):[A-Za-z0-9_.:-]+|"
+    r"SEGMENT_EVIDENCE:[A-Za-z0-9_.:,-]+)-->)")
 _FENCE_OPEN_RE = re.compile(
     r"^(?P<indent> {0,3})(?P<fence>`{3,}|~{3,})[^\r\n]*(?P<ending>\r?\n)?$")
 
@@ -112,7 +120,20 @@ def project_is_restricted(session: Session, project_id: int | None) -> bool:
     if project_id is None:
         return False
     project = session.get(Project, project_id)
-    if not project or project.source_type != "github":
+    if not project:
+        return False
+    if project.source_type == "paper":
+        try:
+            from .models import PaperSource
+
+            source = session.exec(select(PaperSource).where(
+                PaperSource.project_id == project_id
+            )).first()
+            # A paper without its policy row is incomplete and must fail closed.
+            return source is None or bool(source.local_only)
+        except Exception:
+            return True
+    if project.source_type != "github":
         return False
     try:
         from .repository import repository_source_for_project
@@ -127,6 +148,13 @@ def project_is_restricted(session: Session, project_id: int | None) -> bool:
 def artifact_is_restricted(session: Session, artifact: Artifact) -> bool:
     return bool(getattr(artifact, "restricted", False) or
                 project_is_restricted(session, artifact.project_id))
+
+
+def artifact_is_cloud_excluded(session: Session, artifact: Artifact) -> bool:
+    """Whether an artifact must never be copied to configured cloud storage."""
+    return bool(getattr(artifact, "cloud_sync_excluded", False)
+                or artifact_is_restricted(session, artifact)
+                or artifact_is_repository_derived(session, artifact))
 
 
 def artifact_is_repository_derived(session: Session, artifact: Artifact) -> bool:
@@ -442,6 +470,12 @@ def write_artifact(
     model: str | None = None,
     extra_meta: dict | None = None,
     tags: list[str] | None = None,
+    paper_series_id: int | None = None,
+    paper_part_id: int | None = None,
+    cloud_sync_excluded: bool = False,
+    input_hash_override: str | None = None,
+    config_hash_override: str | None = None,
+    provenance_override: dict | None = None,
 ) -> Artifact:
     """Create or update an artifact: markdown on disk + DB row + FTS index."""
     from .context import current_job_id
@@ -489,6 +523,8 @@ def write_artifact(
                     project_restricted = llm._repository_local_only()
             except Exception:
                 project_restricted = True
+        elif project.source_type == "paper":
+            project_restricted = project_is_restricted(session, project_id)
     if rel_path is None:
         rel_path = f"projects/{project_slug}/{type}.md"
 
@@ -503,6 +539,14 @@ def write_artifact(
     artifact.provider = provider or artifact.provider
     artifact.model = model or artifact.model
     artifact.media_path = media_rel or artifact.media_path
+    if hasattr(artifact, "paper_series_id"):
+        artifact.paper_series_id = paper_series_id
+    if hasattr(artifact, "paper_part_id"):
+        artifact.paper_part_id = paper_part_id
+    if hasattr(artifact, "cloud_sync_excluded"):
+        artifact.cloud_sync_excluded = bool(
+            getattr(artifact, "cloud_sync_excluded", False)
+            or cloud_sync_excluded or type == "source_paper")
     artifact.repository_derived = bool(
         getattr(artifact, "repository_derived", False)
         or project_repository_derived)
@@ -524,6 +568,12 @@ def write_artifact(
 
         input_hash, config_hash, provenance = capture_for_artifact(
             session, project_id, type)
+        if input_hash_override is not None:
+            input_hash = input_hash_override
+        if config_hash_override is not None:
+            config_hash = config_hash_override
+        if provenance_override is not None:
+            provenance = provenance_override
         artifact.input_hash = input_hash
         artifact.config_hash = config_hash
         artifact.provenance = json.dumps(provenance, sort_keys=True)
@@ -546,6 +596,10 @@ def write_artifact(
             "restricted": getattr(artifact, "restricted", False) or None,
             "repository_derived": (
                 getattr(artifact, "repository_derived", False) or None),
+            "cloud_sync_excluded": (
+                getattr(artifact, "cloud_sync_excluded", False) or None),
+            "paper_series_id": getattr(artifact, "paper_series_id", None),
+            "paper_part_id": getattr(artifact, "paper_part_id", None),
             "tags": tags or current_tags(session, artifact.id),
         }
         if media_rel:
@@ -594,14 +648,16 @@ def _queue_cloud_sync(artifact: Artifact) -> None:
 
     from .settings_store import get_setting
 
-    if getattr(artifact, "restricted", False) or not get_setting("cloud.auto"):
+    if (getattr(artifact, "restricted", False)
+            or getattr(artifact, "cloud_sync_excluded", False)
+            or not get_setting("cloud.auto")):
         return
     try:
         from .db import get_session
 
         with get_session() as session:
             stored = session.get(Artifact, artifact.id) if artifact.id else None
-            if stored is None or artifact_is_repository_derived(session, stored):
+            if stored is None or artifact_is_cloud_excluded(session, stored):
                 return
         # lazy import — library.py is used by the API, which must not pull the
         # whole celery task tree at module import time

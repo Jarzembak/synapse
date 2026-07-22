@@ -6,7 +6,9 @@ from pydantic import BaseModel
 from sqlmodel import select
 
 from ..db import get_session
-from ..models import Artifact, Project, Tag, ArtifactTag
+from ..models import (
+    Artifact, ArtifactTag, PaperSeries, PaperSeriesPart, Project, Tag,
+)
 from .. import library
 
 router = APIRouter(prefix="/api", tags=["artifacts"])
@@ -15,6 +17,7 @@ MIME_BY_EXT = {
     ".mp4": "video/mp4", ".webm": "video/webm", ".mkv": "video/x-matroska",
     ".m4a": "audio/mp4", ".mp3": "audio/mpeg", ".wav": "audio/wav",
     ".flac": "audio/flac", ".ogg": "audio/ogg", ".opus": "audio/opus",
+    ".pdf": "application/pdf",
 }
 
 
@@ -35,12 +38,16 @@ def get_artifact(artifact_id: int):
         except FileNotFoundError:
             raise HTTPException(410, "artifact file missing from library")
         project = session.get(Project, art.project_id) if art.project_id else None
+        series = session.get(PaperSeries, art.paper_series_id) if art.paper_series_id else None
+        part = session.get(PaperSeriesPart, art.paper_part_id) if art.paper_part_id else None
         return {
             "artifact": art,
             "meta": meta,
             "body": body,
             "tags": library.current_tags(session, art.id),
             "project": project,
+            "paper_series": series,
+            "paper_part": part,
         }
 
 
@@ -64,6 +71,9 @@ def search_library(
     type: str = "",
     tag: str = "",
     project_id: int | None = None,
+    paper_series_id: int | None = None,
+    paper_part_id: int | None = None,
+    audience: str = "",
     sort: str = "updated",   # updated | created | title | type
     order: str = "desc",
     limit: int = 200,
@@ -79,6 +89,15 @@ def search_library(
             stmt = stmt.where(Artifact.type.in_(type.split(",")))
         if project_id is not None:
             stmt = stmt.where(Artifact.project_id == project_id)
+        if paper_series_id is not None:
+            stmt = stmt.where(Artifact.paper_series_id == paper_series_id)
+        if paper_part_id is not None:
+            stmt = stmt.where(Artifact.paper_part_id == paper_part_id)
+        if audience:
+            series_ids = session.exec(select(PaperSeries.id).where(
+                PaperSeries.audience == audience
+            )).all()
+            stmt = stmt.where(Artifact.paper_series_id.in_(series_ids))
         if tag:
             # distinct(): an artifact carrying several of the requested tags
             # would otherwise be returned once per matching tag.

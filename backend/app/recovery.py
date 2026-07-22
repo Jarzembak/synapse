@@ -14,8 +14,10 @@ from . import library
 from .config import settings
 from .db import get_session
 from .models import (
-    Artifact, ArtifactTag, Project, QuickRef, QuickRefSource, RepositoryChunk,
-    RepositoryFile, RepositorySnapshot, RepositorySource, Tag,
+    Artifact, ArtifactTag, Job, PaperChunk, PaperChunkEmbedding,
+    PaperMemoryRevision, PaperPartEvidence, PaperSeries, PaperSeriesPart,
+    PaperSource, PaperSynthesisCache, Project, QuickRef, QuickRefSource,
+    RepositoryChunk, RepositoryFile, RepositorySnapshot, RepositorySource, Tag,
 )
 from .settings_store import get_setting
 
@@ -101,6 +103,81 @@ def health_report(session: Session) -> dict:
     repository_fts_count = session.exec(
         text("SELECT COUNT(*) FROM repository_chunk_fts")
     ).one()[0]
+    paper_chunk_count = len(session.exec(select(PaperChunk.id)).all())
+    paper_fts_count = session.exec(
+        text("SELECT COUNT(*) FROM paper_chunk_fts")
+    ).one()[0]
+    paper_sources = session.exec(select(PaperSource)).all()
+    paper_source_ids = {source.id for source in paper_sources}
+    paper_sources_by_id = {source.id: source for source in paper_sources}
+    paper_chunks = session.exec(select(PaperChunk)).all()
+    paper_chunk_ids = {chunk.id for chunk in paper_chunks}
+    paper_series = session.exec(select(PaperSeries)).all()
+    paper_series_ids = {series.id for series in paper_series}
+    paper_series_by_id = {series.id: series for series in paper_series}
+    paper_parts = session.exec(select(PaperSeriesPart)).all()
+    paper_part_ids = {part.id for part in paper_parts}
+    paper_parts_by_id = {part.id: part for part in paper_parts}
+    paper_memories = session.exec(select(PaperMemoryRevision)).all()
+    paper_memory_ids = {memory.id for memory in paper_memories}
+    paper_project_ids = {
+        project.id for project in projects if project.source_type == "paper"
+    }
+    paper_source_project_ids = {source.project_id for source in paper_sources}
+    paper_orphans = (
+        [f"project-source:{project_id}" for project_id in paper_project_ids
+         if project_id not in paper_source_project_ids]
+        + [f"source:{source.id}" for source in paper_sources
+           if source.project_id not in project_ids]
+        + [f"chunk:{chunk.id}" for chunk in paper_chunks
+           if chunk.source_id not in paper_source_ids]
+        + [f"embedding:{embedding.chunk_id}:{embedding.model}"
+           for embedding in session.exec(select(PaperChunkEmbedding)).all()
+           if embedding.chunk_id not in paper_chunk_ids]
+        + [f"cache:{cache.id}" for cache in session.exec(
+            select(PaperSynthesisCache)).all()
+           if (cache.source_id not in paper_source_ids
+               or cache.project_id not in paper_project_ids
+               or (cache.source_id in paper_sources_by_id
+                   and paper_sources_by_id[cache.source_id].project_id
+                   != cache.project_id))]
+        + [f"series:{series.id}" for series in paper_series
+           if series.project_id not in paper_project_ids]
+        + [f"part:{part.id}" for part in paper_parts
+           if part.series_id not in paper_series_ids]
+        + [f"assignment:{assignment.part_id}:{assignment.chunk_id}"
+           for assignment in session.exec(select(PaperPartEvidence)).all()
+           if (assignment.part_id not in paper_part_ids
+               or assignment.chunk_id not in paper_chunk_ids)]
+        + [f"memory:{memory.id}" for memory in paper_memories
+           if (memory.series_id not in paper_series_ids
+               or memory.part_id not in paper_part_ids
+               or (memory.part_id in paper_parts_by_id
+                   and paper_parts_by_id[memory.part_id].series_id
+                   != memory.series_id)
+               or (memory.parent_revision_id is not None
+                   and memory.parent_revision_id not in paper_memory_ids))]
+        + [f"artifact-series:{artifact.id}" for artifact in artifacts
+           if (artifact.paper_series_id is not None
+               and artifact.paper_series_id not in paper_series_ids)]
+        + [f"artifact-part:{artifact.id}" for artifact in artifacts
+           if (artifact.paper_part_id is not None
+               and artifact.paper_part_id not in paper_part_ids)]
+        + [f"artifact-scope:{artifact.id}" for artifact in artifacts
+           if (artifact.paper_series_id in paper_series_by_id
+               and (artifact.project_id
+                    != paper_series_by_id[artifact.paper_series_id].project_id
+                    or (artifact.paper_part_id in paper_parts_by_id
+                        and paper_parts_by_id[artifact.paper_part_id].series_id
+                        != artifact.paper_series_id)))]
+        + [f"job-series:{job.id}" for job in session.exec(select(Job)).all()
+           if (job.paper_series_id is not None
+               and job.paper_series_id not in paper_series_ids)]
+        + [f"job-part:{job.id}" for job in session.exec(select(Job)).all()
+           if job.paper_part_id is not None and job.paper_part_id not in paper_part_ids]
+        + [f"source-file:{source.id}" for source in paper_sources
+           if not (settings.library_dir / source.relative_path).is_file()]
+    )
     repository_sources = session.exec(select(RepositorySource)).all()
     repository_snapshots = session.exec(select(RepositorySnapshot)).all()
     repository_files = session.exec(select(RepositoryFile)).all()
@@ -151,6 +228,8 @@ def health_report(session: Session) -> dict:
             or fts_count != len(artifacts)
             or repository_fts_count != repository_chunk_count
             or repository_orphans
+            or paper_fts_count != paper_chunk_count
+            or paper_orphans
             or any(artifact.project_id and artifact.project_id not in project_ids
                    for artifact in artifacts)
         ),
@@ -164,6 +243,10 @@ def health_report(session: Session) -> dict:
         "repository_fts_rows": repository_fts_count,
         "repository_fts_consistent": repository_fts_count == repository_chunk_count,
         "repository_orphans": sorted(repository_orphans),
+        "paper_chunks": paper_chunk_count,
+        "paper_fts_rows": paper_fts_count,
+        "paper_fts_consistent": paper_fts_count == paper_chunk_count,
+        "paper_orphans": sorted(paper_orphans),
         "missing_files": sorted(set(paths) - files),
         "unindexed_files": sorted(files - set(paths)),
         "duplicate_paths": sorted(duplicates),
@@ -277,6 +360,45 @@ def _repository_source_for_doc(session: Session, project: Project | None,
     return source
 
 
+def _paper_source_for_doc(session: Session, project: Project | None,
+                          meta: dict, artifact_type: str) -> PaperSource | None:
+    if not project or project.source_type != "paper":
+        return None
+    existing = session.exec(select(PaperSource).where(
+        PaperSource.project_id == project.id
+    )).first()
+    if existing:
+        return existing
+    media = str(meta.get("media") or "")
+    if artifact_type != "source_paper" or not media or media.startswith("media:"):
+        return None
+    source_path = settings.library_dir / media
+    if not source_path.is_file():
+        return None
+    import hashlib
+
+    digest = hashlib.sha256()
+    with source_path.open("rb") as handle:
+        while block := handle.read(1024 * 1024):
+            digest.update(block)
+    source = PaperSource(
+        project_id=project.id,
+        original_filename=str(meta.get("original_filename") or source_path.name),
+        source_hash=str(meta.get("source_hash") or digest.hexdigest()),
+        relative_path=media,
+        size_bytes=source_path.stat().st_size,
+        ocr_languages=json.dumps(meta.get("ocr_languages") or ["eng"]),
+        # Vault-only recovery cannot prove that cloud processing was approved;
+        # retain the paper locally until it is explicitly re-imported.
+        local_only=True,
+        privacy_locked=True,
+        status="pending",
+    )
+    session.add(source)
+    session.flush()
+    return source
+
+
 def rebuild_repository_fts(session: Session, *, on_progress=None) -> int:
     """Rebuild the disposable repository-code FTS mirror from durable rows."""
     session.exec(text("DELETE FROM repository_chunk_fts"))
@@ -310,6 +432,31 @@ def rebuild_repository_fts(session: Session, *, on_progress=None) -> int:
     return indexed
 
 
+def rebuild_paper_fts(session: Session, *, on_progress=None) -> int:
+    """Rebuild the disposable page-grounded paper FTS mirror."""
+    session.exec(text("DELETE FROM paper_chunk_fts"))
+    sources = {source.id: source for source in session.exec(select(PaperSource)).all()}
+    chunks = session.exec(select(PaperChunk).order_by(PaperChunk.id)).all()
+    indexed = 0
+    for position, chunk in enumerate(chunks, 1):
+        source = sources.get(chunk.source_id)
+        if not source:
+            continue
+        session.exec(text(
+            "INSERT INTO paper_chunk_fts"
+            "(body, chunk_id, source_id, project_id, page_number, evidence_id) "
+            "VALUES (:body, :chunk_id, :source_id, :project_id, :page, :evidence_id)"
+        ).bindparams(
+            body=chunk.body, chunk_id=chunk.id, source_id=source.id,
+            project_id=source.project_id, page=chunk.page_number,
+            evidence_id=chunk.evidence_id,
+        ))
+        indexed += 1
+        if on_progress and position % 250 == 0:
+            on_progress(f"reindexed paper evidence {position}/{len(chunks)}")
+    return indexed
+
+
 def rebuild_from_vault(session: Session, *, prune_missing: bool = False,
                        on_progress=None) -> dict:
     files = vault_files()
@@ -326,6 +473,7 @@ def rebuild_from_vault(session: Session, *, prune_missing: bool = False,
             continue
         project = _project_for_doc(session, rel, meta)
         _repository_source_for_doc(session, project, meta)
+        _paper_source_for_doc(session, project, meta, artifact_type)
         artifact = session.exec(
             select(Artifact).where(Artifact.path == rel, Artifact.type == artifact_type)
         ).first()
@@ -343,6 +491,11 @@ def rebuild_from_vault(session: Session, *, prune_missing: bool = False,
             meta.get("repository_derived")
             or (project is not None and project.source_type == "github")
             or getattr(artifact, "repository_derived", False))
+        if hasattr(artifact, "cloud_sync_excluded"):
+            artifact.cloud_sync_excluded = bool(
+                meta.get("cloud_sync_excluded")
+                or artifact_type == "source_paper"
+                or getattr(artifact, "cloud_sync_excluded", False))
         if hasattr(artifact, "restricted"):
             artifact.restricted = bool(
                 meta.get("restricted")
@@ -463,6 +616,7 @@ def rebuild_from_vault(session: Session, *, prune_missing: bool = False,
                 ).bindparams(id=artifact.id))
                 session.delete(artifact)
     rebuild_repository_fts(session, on_progress=on_progress)
+    rebuild_paper_fts(session, on_progress=on_progress)
     session.commit()
     try:
         from .tasks.cloud import enqueue_pending_privacy_purges

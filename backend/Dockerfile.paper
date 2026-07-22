@@ -1,0 +1,40 @@
+FROM python:3.12-slim@sha256:423ed6ab25b1921a477529254bfeeabf5855151dc2c3141699a1bfc852199fbf
+
+# Tesseract CLI is Docling's OCR fallback. Install only the four v1 language
+# packs plus the native libraries required by the CPU layout/table models.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg git libgl1 libglib2.0-0 \
+    tesseract-ocr tesseract-ocr-eng tesseract-ocr-spa \
+    tesseract-ocr-fra tesseract-ocr-deu \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /srv
+
+COPY requirements-paper.txt ./
+# Install PyTorch from its CPU-only wheel index before resolving Docling.  The
+# ordinary PyPI wheel pulls CUDA runtime libraries even when inference is later
+# configured for CPU, bloating the image and weakening the runtime guarantee.
+RUN pip install --no-cache-dir \
+      --index-url https://download.pytorch.org/whl/cpu \
+      torch==2.9.1+cpu torchvision==0.24.1+cpu
+RUN pip install --no-cache-dir -r requirements-paper.txt
+
+# Parser models are fetched only while building the image. Runtime conversion
+# points Docling at this immutable directory and enables offline mode, so a PDF
+# job cannot trigger a model download or remote inference service.
+RUN mkdir -p /opt/docling/models \
+    && docling-tools models download -o /opt/docling/models
+
+COPY app ./app
+
+ENV PYTHONUNBUFFERED=1 \
+    DOCLING_ARTIFACTS_PATH=/opt/docling/models \
+    DOCLING_DEVICE=cpu \
+    DOCLING_NUM_THREADS=4 \
+    OMP_NUM_THREADS=4 \
+    CUDA_VISIBLE_DEVICES="" \
+    SYNAPSE_PAPER_WORKER=1 \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1
+
+CMD ["celery", "-A", "app.tasks.celery_app.celery", "worker", "--loglevel=info", "--concurrency=1", "-Q", "paper"]

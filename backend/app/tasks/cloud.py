@@ -178,15 +178,14 @@ def _record(status: str, detail: str) -> None:
 
 
 def _restricted_artifact_for_path(path: str, session: Session | None = None) -> bool:
-    """Whether a library/media path is local-only or repository-derived."""
+    """Whether a library/media path is forbidden from cloud publication."""
     lookup = path.removeprefix("media:") if path.startswith("media:") else path
     if session is None:
         with get_session() as owned:
             return _restricted_artifact_for_path(path, owned)
     artifacts = session.exec(select(Artifact)).all()
     return any(
-        (library.artifact_is_restricted(session, artifact)
-         or library.artifact_is_repository_derived(session, artifact)) and (
+        library.artifact_is_cloud_excluded(session, artifact) and (
             artifact.path == lookup
             or artifact.media_path == path
             or artifact.media_path == lookup
@@ -199,8 +198,7 @@ def _restricted_library_paths() -> list[str]:
     with get_session() as session:
         artifacts = [
             artifact for artifact in session.exec(select(Artifact)).all()
-            if (library.artifact_is_restricted(session, artifact)
-                or library.artifact_is_repository_derived(session, artifact))
+            if library.artifact_is_cloud_excluded(session, artifact)
         ]
     paths: set[str] = set()
     for artifact in artifacts:
@@ -216,8 +214,7 @@ def _restricted_remote_paths() -> tuple[list[str], list[str]]:
     with get_session() as session:
         artifacts = [
             artifact for artifact in session.exec(select(Artifact)).all()
-            if (library.artifact_is_restricted(session, artifact)
-                or library.artifact_is_repository_derived(session, artifact))
+            if library.artifact_is_cloud_excluded(session, artifact)
         ]
     library_paths: set[str] = set()
     media_paths: set[str] = set()
@@ -339,8 +336,7 @@ def _stage_public_library() -> Path:
             session.exec(text("BEGIN IMMEDIATE"))
             public_artifacts = [
                 artifact for artifact in session.exec(select(Artifact)).all()
-                if not library.artifact_is_restricted(session, artifact)
-                and not library.artifact_is_repository_derived(session, artifact)
+                if not library.artifact_is_cloud_excluded(session, artifact)
             ]
             allowed_exact: set[str] = set()
             history_prefixes: list[str] = []
