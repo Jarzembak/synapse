@@ -60,11 +60,17 @@ def project_scope(project_id: int | None, *, local_only: bool | None = None):
         _project_scope.reset(token)
 
 
-def _repository_local_only() -> bool:
-    """Return the active project's policy, failing closed for incomplete repos."""
+def _project_local_only() -> bool:
+    """Return the active project's source-neutral local-processing policy.
+
+    Repository behavior is unchanged. Paper projects use their own sticky
+    ``PaperSource.local_only`` decision, which is locked by the first
+    processing job. Missing privacy metadata for either sensitive source type
+    fails closed instead of silently becoming cloud eligible.
+    """
     scoped_project_id, scoped_policy = _project_scope.get()
-    if scoped_policy is not None:
-        return bool(scoped_policy)
+    if scoped_policy is True:
+        return True
     project_id = scoped_project_id
     try:
         if project_id is None:
@@ -86,26 +92,41 @@ def _repository_local_only() -> bool:
 
         with get_session() as session:
             project = session.get(Project, project_id)
-            if not project or project.source_type != "github":
+            if not project:
                 return False
             from sqlmodel import select
 
-            from .models import RepositorySource
+            if project.source_type == "github":
+                from .models import RepositorySource
 
-            source = session.exec(
-                select(RepositorySource).where(RepositorySource.project_id == project_id)
-            ).first()
-            # A GitHub project whose policy row is missing or unreadable must
-            # not become cloud-eligible by accident.
-            if source is None:
-                return True
-            private = bool(getattr(source, "is_private",
-                                   getattr(source, "private", False)))
-            return private or bool(getattr(source, "local_only", False))
+                source = session.exec(
+                    select(RepositorySource).where(
+                        RepositorySource.project_id == project_id)
+                ).first()
+                # A GitHub project whose policy row is missing or unreadable
+                # must not become cloud-eligible by accident.
+                if source is None:
+                    return True
+                private = bool(getattr(source, "is_private",
+                                       getattr(source, "private", False)))
+                return private or bool(getattr(source, "local_only", False))
+            if project.source_type == "paper":
+                from .models import PaperSource
+
+                source = session.exec(
+                    select(PaperSource).where(PaperSource.project_id == project_id)
+                ).first()
+                return True if source is None else bool(source.local_only)
+            return False
     except ImportError:
         # During an old-schema startup there cannot yet be a valid GitHub
         # project.  A scoped repository id is nevertheless treated as private.
         return project_id is not None
+
+
+def _repository_local_only() -> bool:
+    """Backward-compatible alias for callers/tests from the repository release."""
+    return _project_local_only()
 
 
 def _local_model() -> str:
@@ -152,7 +173,7 @@ def require_local_ollama_endpoint() -> None:
     if (parsed.scheme not in {"http", "https"} or not (host in allowed_names or loopback)
             or parsed.username or parsed.password or parsed.query or parsed.fragment):
         raise RuntimeError(
-            "repository processing requires OLLAMA_BASE_URL to use the "
+            "local-only processing requires OLLAMA_BASE_URL to use the "
             "local Ollama service, localhost, or a loopback address"
         )
 
@@ -164,7 +185,7 @@ def _enforce_local_provider(function: str, provider: str, model: str,
     # agree even when the global model matrix selects Gemini.
     if function == "asr":
         return provider, model
-    restricted = bool(local_only or _repository_local_only())
+    restricted = bool(local_only or _project_local_only())
     if function == "tts":
         return ("piper", "en_US-ryan-medium") if restricted else (provider, model)
     if restricted:
@@ -254,7 +275,7 @@ def complete(
     json_format: bool = False,
     local_only: bool = False,
 ) -> str:
-    restricted = bool(local_only or _repository_local_only())
+    restricted = bool(local_only or _project_local_only())
     if provider is None or model is None:
         provider, model = resolve_model(function)
     provider, model = _enforce_local_provider(

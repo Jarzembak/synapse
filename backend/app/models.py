@@ -23,6 +23,13 @@ class Project(SQLModel, table=True):
 class Artifact(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
     project_id: int | None = Field(default=None, foreign_key="project.id", index=True)
+    # Paper outputs can repeat by audience track and by ordered part.  Keeping
+    # the scope on the artifact (rather than encoding it into ``type``) makes
+    # provenance, breadcrumbs, deletion, and search filters unambiguous.
+    paper_series_id: int | None = Field(
+        default=None, foreign_key="paperseries.id", index=True)
+    paper_part_id: int | None = Field(
+        default=None, foreign_key="paperseriespart.id", index=True)
     # transcript | corrected | summary | deepdive_claude | deepdive_gemini |
     # deepdive_merged | podcast_script | podcast_audio | trimmed_audio |
     # mindmap | quickref_<category kind> | source_video | source_audio
@@ -45,6 +52,10 @@ class Artifact(SQLModel, table=True):
     # QuickRefSource relationships, this survives contributor/project deletion
     # so a later full cloud sync cannot reclassify the retained document.
     repository_derived: bool = Field(default=False, index=True)
+    # Stronger than the mutable project/model policy: the original paper PDF
+    # is always excluded from cloud synchronization, even for a cloud-enabled
+    # paper whose generated notes are eligible to sync.
+    cloud_sync_excluded: bool = Field(default=False, index=True)
     created: datetime = Field(default_factory=utcnow)
     updated: datetime = Field(default_factory=utcnow)
 
@@ -80,6 +91,10 @@ class QuickRefSource(SQLModel, table=True):
 class Job(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
     project_id: int | None = Field(default=None, foreign_key="project.id", index=True)
+    paper_series_id: int | None = Field(
+        default=None, foreign_key="paperseries.id", index=True)
+    paper_part_id: int | None = Field(
+        default=None, foreign_key="paperseriespart.id", index=True)
     task: str
     status: str = "queued"  # queued | running | done | error | canceled
     progress: str = ""
@@ -240,4 +255,149 @@ class RepositoryChunk(SQLModel, table=True):
     summary_text: str = ""
     summary_json: str = "{}"
     summary_config_hash: str = Field(default="", index=True)
+    created: datetime = Field(default_factory=utcnow)
+
+
+class PaperSource(SQLModel, table=True):
+    """Immutable PDF identity plus extraction/review policy for one project."""
+
+    id: int | None = Field(default=None, primary_key=True)
+    project_id: int = Field(foreign_key="project.id", index=True, unique=True)
+    original_filename: str
+    source_hash: str = Field(index=True)
+    relative_path: str
+    size_bytes: int = 0
+    page_count: int = 0
+    extracted_characters: int = 0
+    ocr_languages: str = '["eng"]'  # JSON list of Tesseract language codes
+    local_only: bool = Field(default=True, index=True)
+    privacy_locked: bool = Field(default=False, index=True)
+    parser_version: str = ""
+    parser_config_hash: str = Field(default="", index=True)
+    # pending | extracting | review_required | ready | error
+    status: str = Field(default="pending", index=True)
+    # UNKNOWN | EXCELLENT | GOOD | FAIR | POOR
+    quality_grade: str = Field(default="UNKNOWN", index=True)
+    quality_report: str = "{}"
+    coverage_report: str = "{}"
+    # JSON list: [{"page": 12, "reason": "...", "created": "..."}]
+    acknowledged_pages: str = "[]"
+    error: str = ""
+    created: datetime = Field(default_factory=utcnow)
+    updated: datetime = Field(default_factory=utcnow)
+
+
+class PaperChunk(SQLModel, table=True):
+    """Ordered, page-grounded evidence emitted by the local paper parser."""
+
+    id: int | None = Field(default=None, primary_key=True)
+    source_id: int = Field(foreign_key="papersource.id", index=True)
+    chunk_index: int
+    # Stable within an immutable source. The same PDF may be imported as a
+    # separate project, so identical source-derived IDs must not be globally
+    # unique across PaperSource rows.
+    evidence_id: str = Field(index=True)
+    page_number: int = Field(index=True)
+    section_path: str = ""
+    bbox: str = "{}"  # JSON {left, top, right, bottom, coordinate_space}
+    kind: str = Field(default="prose", index=True)
+    body: str
+    body_hash: str = Field(index=True)
+    extraction_method: str = "digital"
+    quality_grade: str = Field(default="UNKNOWN", index=True)
+    flags: str = "[]"  # JSON flags, e.g. visual_review_needed/unreliable_formula
+    estimated_tokens: int = 0
+    created: datetime = Field(default_factory=utcnow)
+
+
+class PaperChunkEmbedding(SQLModel, table=True):
+    """Provider-neutral float32 vector for immutable paper evidence."""
+
+    chunk_id: int = Field(foreign_key="paperchunk.id", primary_key=True)
+    model: str = Field(primary_key=True)
+    dimensions: int
+    vector: bytes
+    body_hash: str = Field(index=True)
+
+
+class PaperSynthesisCache(SQLModel, table=True):
+    """Content-addressed leaf maps and hierarchical reductions."""
+
+    id: int | None = Field(default=None, primary_key=True)
+    project_id: int = Field(foreign_key="project.id", index=True)
+    source_id: int = Field(foreign_key="papersource.id", index=True)
+    purpose: str = Field(index=True)
+    input_hash: str = Field(index=True)
+    config_hash: str = Field(index=True)
+    provider: str = ""
+    model: str = ""
+    body: str = ""
+    evidence_ids: str = "[]"
+    created: datetime = Field(default_factory=utcnow)
+    updated: datetime = Field(default_factory=utcnow)
+
+
+class PaperSeries(SQLModel, table=True):
+    """One independently planned and approved audience track."""
+
+    id: int | None = Field(default=None, primary_key=True)
+    project_id: int = Field(foreign_key="project.id", index=True)
+    # generalist | practitioner | expert
+    audience: str = Field(index=True)
+    # draft | approved | running | complete | error
+    status: str = Field(default="draft", index=True)
+    title: str = ""
+    target_minutes: int = 50
+    max_parts: int = 5
+    plan_version: int = 0
+    plan_json: str = "{}"
+    plan_hash: str = Field(default="", index=True)
+    # User-authored direction kept separate from generated/factual memory.
+    user_guidance: str = ""
+    approved_at: datetime | None = None
+    created: datetime = Field(default_factory=utcnow)
+    updated: datetime = Field(default_factory=utcnow)
+
+
+class PaperSeriesPart(SQLModel, table=True):
+    """Ordered production unit within an audience track."""
+
+    id: int | None = Field(default=None, primary_key=True)
+    series_id: int = Field(foreign_key="paperseries.id", index=True)
+    position: int
+    title: str
+    focus: str = ""
+    target_minutes: int = 50
+    # planned | generating | complete | error
+    status: str = Field(default="planned", index=True)
+    stale: bool = Field(default=False, index=True)
+    guide_status: str = "pending"
+    script_status: str = "pending"
+    audio_status: str = "pending"
+    user_guidance: str = ""
+    created: datetime = Field(default_factory=utcnow)
+    updated: datetime = Field(default_factory=utcnow)
+
+
+class PaperPartEvidence(SQLModel, table=True):
+    """Primary assignment or bounded bridge use of one evidence block."""
+
+    part_id: int = Field(foreign_key="paperseriespart.id", primary_key=True)
+    chunk_id: int = Field(foreign_key="paperchunk.id", primary_key=True)
+    role: str = "primary"  # primary | bridge
+    importance: str = "supporting"  # critical | major | supporting
+    reason: str = ""
+
+
+class PaperMemoryRevision(SQLModel, table=True):
+    """Immutable continuity ledger emitted after a finalized script."""
+
+    id: int | None = Field(default=None, primary_key=True)
+    series_id: int = Field(foreign_key="paperseries.id", index=True)
+    part_id: int = Field(foreign_key="paperseriespart.id", index=True)
+    parent_revision_id: int | None = Field(
+        default=None, foreign_key="papermemoryrevision.id", index=True)
+    revision: int
+    state_json: str = "{}"
+    content_hash: str = Field(index=True)
     created: datetime = Field(default_factory=utcnow)

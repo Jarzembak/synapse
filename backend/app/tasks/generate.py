@@ -341,6 +341,7 @@ def tag_task(artifact_id: int):
 
 # Richest-first ranking of documents a project's canonical tag set derives from.
 TAG_SOURCE_RANK = [
+    "paper_study_guide", "paper_overview", "paper_argument_map",
     "deepdive_merged", "repo_architecture", "repo_inventory",
     "corrected", "transcript", "summary",
 ]
@@ -368,11 +369,18 @@ def tag_project(project_id: int):
 
             repository_processing_policy(project_id)
             policy_local = True
+        elif project and project.source_type == "paper":
+            with get_session() as policy_session:
+                policy_local = library.project_is_restricted(
+                    policy_session, project_id)
         with get_session() as session:
-            arts = session.exec(
-                select(Artifact).where(Artifact.project_id == project_id)
-            ).all()
-            by_type = {a.type: a for a in arts}
+            arts = session.exec(select(Artifact).where(
+                Artifact.project_id == project_id
+            )).all()
+            by_type = {
+                a.type: a for a in arts
+                if a.paper_series_id is None and a.paper_part_id is None
+            }
             source = next(
                 (by_type[t] for t in TAG_SOURCE_RANK if t in by_type), None
             )

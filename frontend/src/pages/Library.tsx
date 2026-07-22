@@ -6,7 +6,9 @@ import {
   fmtDate,
   Project,
   TYPE_LABELS,
+  isPaperProject,
   isRepositoryProject,
+  paperAudienceLabel,
   shortSha,
   typeLabel,
 } from "../api";
@@ -45,7 +47,7 @@ interface HybridResult {
   excerpt: string;
   tags: string[];
   score: number;
-  source_kind?: "artifact" | "repository" | "repository_file";
+  source_kind?: "artifact" | "repository" | "repository_file" | "paper" | "paper_evidence";
   path?: string | null;
   repository_path?: string | null;
   file_path?: string | null;
@@ -56,6 +58,13 @@ interface HybridResult {
   permalink?: string | null;
   source_url?: string | null;
   restricted?: boolean;
+  paper_series_id?: number | null;
+  paper_part_id?: number | null;
+  audience?: string | null;
+  evidence_id?: string | null;
+  page?: number | null;
+  section?: string | string[] | null;
+  internal_pdf_url?: string | null;
 }
 
 interface HybridResponse {
@@ -190,6 +199,14 @@ function SourceMeta({ source }: { source: HybridResult }) {
           @ {source.start_time}
         </span>
       ) : null}
+      {source.page && (
+        <a className="citation-time paper-page-citation"
+          href={source.internal_pdf_url ?? source.source_url ?? `/api/papers/${source.project_id}/source#page=${source.page}`}
+          target="_blank" rel="noreferrer" title={Array.isArray(source.section) ? source.section.join(" › ") : source.section ?? "Open cited paper page"}>
+          page {source.page}{source.section ? ` · ${Array.isArray(source.section) ? source.section.join(" › ") : source.section}` : ""}
+        </a>
+      )}
+      {source.evidence_id && <code className="paper-evidence-id">{source.evidence_id}</code>}
     </span>
   );
 }
@@ -241,6 +258,9 @@ export default function Library() {
   const selectedTypes = useMemo(() => csvValues(typeParam), [typeParam]);
   const selectedTags = useMemo(() => csvValues(tagParam), [tagParam]);
   const projectId = positiveInteger(urlParams.get("project_id"));
+  const paperSeriesId = positiveInteger(urlParams.get("paper_series_id"));
+  const paperPartId = positiveInteger(urlParams.get("paper_part_id"));
+  const audience = urlParams.get("audience") ?? "";
   const projectSlug = urlParams.get("project") ?? "";
   const rawSort = urlParams.get("sort") as SortKey | null;
   const sort: SortKey = rawSort && SORT_KEYS.has(rawSort)
@@ -259,6 +279,7 @@ export default function Library() {
   const unresolvedProject = Boolean(projectSlug && !resolvedProjectId && !metadataLoading);
   const selectedProject = projects.find((project) => project.id === resolvedProjectId) ?? null;
   const askingRepository = isRepositoryProject(selectedProject);
+  const askingPaper = isPaperProject(selectedProject);
 
   function updateUrl(
     updates: Record<string, string | number | null>,
@@ -291,7 +312,10 @@ export default function Library() {
   }
 
   function clearFilters() {
-    updateUrl({ title: null, type: null, tag: null, project: null, project_id: null });
+    updateUrl({
+      title: null, type: null, tag: null, project: null, project_id: null,
+      paper_series_id: null, paper_part_id: null, audience: null,
+    });
   }
 
   function changeMode(nextMode: SearchMode) {
@@ -341,20 +365,26 @@ export default function Library() {
     if (selectedTags.length) params.set("tag", selectedTags.join(","));
     if (projectSlug) params.set("project", projectSlug);
     if (projectId) params.set("project_id", String(projectId));
+    if (paperSeriesId) params.set("paper_series_id", String(paperSeriesId));
+    if (paperPartId) params.set("paper_part_id", String(paperPartId));
+    if (audience) params.set("audience", audience);
     params.set("sort", sort);
     params.set("order", order);
     params.set("offset", String(offset));
     params.set("limit", String(limit));
     return `/library/query?${params.toString()}`;
-  }, [q, title, typeParam, tagParam, projectSlug, projectId, sort, order, offset, limit]);
+  }, [q, title, typeParam, tagParam, projectSlug, projectId, paperSeriesId, paperPartId, audience, sort, order, offset, limit]);
 
   const hybridRequest = useMemo(() => {
     const params = new URLSearchParams({ q, limit: "12" });
     if (selectedTypes.length) params.set("type", selectedTypes.join(","));
     if (selectedTags.length) params.set("tag", selectedTags.join(","));
     if (resolvedProjectId) params.set("project_id", String(resolvedProjectId));
+    if (paperSeriesId) params.set("paper_series_id", String(paperSeriesId));
+    if (paperPartId) params.set("paper_part_id", String(paperPartId));
+    if (audience) params.set("audience", audience);
     return `/library/hybrid?${params.toString()}`;
-  }, [q, typeParam, tagParam, resolvedProjectId]);
+  }, [q, typeParam, tagParam, resolvedProjectId, paperSeriesId, paperPartId, audience]);
 
   const activeRequest = mode === "exact" ? exactRequest : hybridRequest;
 
@@ -447,7 +477,8 @@ export default function Library() {
       ? `id:${resolvedProjectId}`
       : projectSlug ? `slug:${projectSlug}` : "";
   const hasFilters = Boolean(
-    title || selectedTypes.length || selectedTags.length || projectId || projectSlug,
+    title || selectedTypes.length || selectedTags.length || projectId || projectSlug
+      || paperSeriesId || paperPartId || audience,
   );
   const hasSearchCriteria = Boolean(q.trim() || hasFilters);
   const exact = exactLoaded?.key === exactRequest ? exactLoaded.data : null;
@@ -457,6 +488,9 @@ export default function Library() {
     type: selectedTypes,
     tags: selectedTags,
     project_id: resolvedProjectId,
+    paper_series_id: paperSeriesId,
+    paper_part_id: paperPartId,
+    audience,
     unresolved_project: unresolvedProject ? projectSlug : null,
   });
   const askIsStale = Boolean(askResult && askResult.contextKey !== askContextKey);
@@ -490,6 +524,9 @@ export default function Library() {
           type: selectedTypes,
           tags: selectedTags,
           project_id: resolvedProjectId,
+          paper_series_id: paperSeriesId,
+          paper_part_id: paperPartId,
+          audience: audience || null,
           limit: 8,
         }),
       });
@@ -760,6 +797,25 @@ export default function Library() {
             )}
           </div>
 
+          {(askingPaper || audience || paperSeriesId || paperPartId) && (
+            <div className="filter-section paper-library-filters">
+              <label htmlFor="paper-audience-filter">Paper audience</label>
+              <select id="paper-audience-filter" value={audience}
+                onChange={(event) => updateUrl({ audience: event.target.value || null })}>
+                <option value="">All audiences and shared analysis</option>
+                <option value="generalist">Generalist</option>
+                <option value="practitioner">Practitioner</option>
+                <option value="expert">Expert</option>
+              </select>
+              <label htmlFor="paper-series-filter">Series ID <small>(optional)</small></label>
+              <input id="paper-series-filter" type="number" min={1} value={paperSeriesId ?? ""}
+                onChange={(event) => updateUrl({ paper_series_id: event.target.value || null })} />
+              <label htmlFor="paper-part-filter">Part ID <small>(optional)</small></label>
+              <input id="paper-part-filter" type="number" min={1} value={paperPartId ?? ""}
+                onChange={(event) => updateUrl({ paper_part_id: event.target.value || null })} />
+            </div>
+          )}
+
           <div className="filter-section">
             <label htmlFor="project-filter">Project</label>
             <select
@@ -872,11 +928,13 @@ export default function Library() {
         <div className="ask-intro">
           <p className="eyebrow">Grounded Q&amp;A</p>
           <h3 id="ask-library-title">
-            {askingRepository ? "Ask this repository" : "Ask your library"}
+            {askingRepository ? "Ask this repository" : askingPaper ? "Ask this paper" : "Ask your library"}
           </h3>
           <p className="meta">
             {askingRepository
               ? `Answers are limited to ${selectedProject?.title} and cite its generated guides or immutable source files.`
+              : askingPaper
+                ? `Answers are limited to ${selectedProject?.title} and cite stable evidence IDs with clickable PDF pages${audience ? ` for the ${paperAudienceLabel(audience)} track` : ""}.`
               : "Answers use the selected project, artifact types, and tags. Every answer keeps its supporting excerpts visible below it."}
           </p>
           {title && <p className="hint">The title-only filter applies to Exact results, not Q&amp;A.</p>}
@@ -890,6 +948,7 @@ export default function Library() {
             value={askQuestion}
             placeholder={askingRepository
               ? "How does this repository work?"
+              : askingPaper ? "What evidence supports the paper’s central claim?"
               : "What does my library say about...?"}
             onChange={(event) => setAskQuestion(event.target.value)}
           />

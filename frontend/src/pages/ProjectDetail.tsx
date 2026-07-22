@@ -5,6 +5,7 @@ import {
   Artifact,
   fmtDateTime,
   fmtTime,
+  isPaperProject,
   isRepositoryProject,
   Project,
   RepositoryDetail,
@@ -15,6 +16,7 @@ import {
 } from "../api";
 import { useEventSource } from "../useEventSource";
 import { StreamStatus, useStreamStatus } from "../useStreamStatus";
+import PaperProjectPanel from "../components/PaperProjectPanel";
 
 interface DetailStep extends Step {
   missing: string[];
@@ -364,8 +366,11 @@ export default function ProjectDetail() {
       `Delete "${detail.project.title}"?\n\n` +
       (isRepositoryProject(detail.project)
         ? "This permanently deletes all project artifacts and retained repository snapshots. "
+        : isPaperProject(detail.project)
+          ? "This permanently deletes the source PDF, extracted evidence, audience tracks, and all generated artifacts. "
         : "This permanently deletes all project artifacts and downloaded source media. ") +
-      "Quick-reference documents it contributed to will remain.\n\nThis cannot be undone.",
+      (isPaperProject(detail.project) ? "" : "Quick-reference documents it contributed to will remain. ") +
+      "\n\nThis cannot be undone.",
     );
     if (!confirmed) return;
 
@@ -476,6 +481,19 @@ export default function ProjectDetail() {
   }
 
   const { project, steps } = detail;
+  if (isPaperProject(project)) {
+    return (
+      <PaperProjectPanel
+        project={project}
+        fallbackArtifacts={detail.artifacts}
+        onProjectReload={load}
+        onDelete={deleteProject}
+        deleting={deleting}
+        streamLabel={STREAM_LABEL[streamStatus]}
+        streamClass={streamStatus}
+      />
+    );
+  }
   const repositoryProject = isRepositoryProject(project);
   const repositoryGuides = repositoryProject ? REPOSITORY_GUIDES.map((guide) => ({
     ...guide,

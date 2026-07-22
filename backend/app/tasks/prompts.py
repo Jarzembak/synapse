@@ -281,6 +281,61 @@ Resolve disagreements by presenting the evidence and uncertainty, never by guess
 architecture-first clarity of document 1 and the maintainer-oriented practicality of document 2.
 Do not create new citations or claim any code was executed. Output Markdown only."""
 
+PAPER_MAP = """Map one page-grounded research-paper evidence block into strict JSON.
+Capture definitions, claims, hypotheses, methods, datasets/materials, results,
+uncertainty, assumptions, limitations, prerequisites, bibliography relationships,
+and referenced figures/tables. Preserve the supplied evidence_id exactly. A caption
+or visual locator is not permission to interpret the unseen visual. Separate what the
+paper states from model-added background or critique. Return JSON only."""
+
+PAPER_REDUCE = """Recursively reduce structured paper maps without losing evidence IDs.
+Preserve the union of critical claims, methods, results, uncertainty, assumptions,
+limitations, prerequisites, and reference relationships. Merge duplicates, but never
+drop the only support for a topic. Keep acknowledged extraction gaps explicit. JSON only."""
+
+PAPER_SHARED = """Write the requested shared research-paper artifact from the complete
+hierarchically reduced evidence map. Every paper-supported substantive statement must
+carry [P:evidence_id]. Put outside knowledge only in explicitly labeled Background
+context, critique only in Critique, assumptions only in Assumptions, and unresolved
+matters only in Open questions. Do not imply external literature review or interpret
+figures beyond extracted captions. Markdown only."""
+
+PAPER_PLAN = """Design a prerequisite-aware teaching arc for the requested audience.
+Return strict JSON: {\"title\": string, \"parts\": [{\"title\": string,
+\"focus\": string, \"topics\": [string], \"evidence_ids\": [string]}]}.
+Choose one to five sequential parts targeting about 50 minutes each (40-60 allowed).
+Respect the paper's argument while teaching prerequisites before dependent material.
+Every supplied critical/major topic must have one primary part. Use only supplied
+evidence IDs and do not invent external literature."""
+
+PAPER_SUITE = """Write one audience-specific paper study artifact for the requested
+purpose and audience. Use the complete reduced paper map, not a source prefix. Clearly
+separate Paper-supported material, Background context, Critique, Assumptions, and Open
+questions. Cite every paper-supported substantive statement with [P:evidence_id].
+Acknowledged extraction gaps must remain visible and cannot solely support a critical
+claim. No external literature lookup. Markdown only."""
+
+PAPER_PART_GUIDE = """Write a cited study guide that doubles as podcast show notes for
+this series part. Use only assigned primary evidence plus explicitly supplied bridge
+evidence. Preserve the teaching focus and identify callbacks without reteaching prior
+parts. Cite every paper-supported substantive statement with [P:evidence_id]. Separate
+background, critique, assumptions, and open questions. Markdown only."""
+
+PAPER_PART_SCRIPT = """Write a segment-based two-host script for this paper-series part.
+Format each segment as `## Segment: <title>`, followed by exactly one hidden
+`<!--SEGMENT_EVIDENCE:id1,id2-->` ledger, then alternating `HOST_A:` / `HOST_B:` lines.
+Do not speak page numbers, citation tokens, URLs, or stage directions. Honor the series
+memory: do not repeat completed explanations or prior stories, resolve promised
+callbacks, and end with a handoff to the next planned part. Use only assigned/bridge
+evidence and clearly verbalize uncertainty. Markdown plus dialogue only."""
+
+PAPER_MEMORY = """From the finalized script and its validated evidence ledger, return
+strict JSON for the immutable series bible: terminology (including pronunciations),
+introduced_topics, completed_topics, deferred_topics, covered_claims, covered_examples,
+used_stories_analogies, open_questions, promised_callbacks, resolved_callbacks,
+handoff_notes, and evidence_ids. Record only what the script actually established;
+never convert user guidance or model background into a paper-supported fact."""
+
 DEFAULTS: dict[str, str] = {
     "correct": CORRECT,
     "summary": SUMMARY,
@@ -309,6 +364,14 @@ DEFAULTS: dict[str, str] = {
     "repository_deepdive_a": REPOSITORY_DEEPDIVE_A,
     "repository_deepdive_b": REPOSITORY_DEEPDIVE_B,
     "repository_merge": REPOSITORY_MERGE,
+    "paper_map": PAPER_MAP,
+    "paper_reduce": PAPER_REDUCE,
+    "paper_shared": PAPER_SHARED,
+    "paper_plan": PAPER_PLAN,
+    "paper_suite": PAPER_SUITE,
+    "paper_part_guide": PAPER_PART_GUIDE,
+    "paper_part_script": PAPER_PART_SCRIPT,
+    "paper_memory": PAPER_MEMORY,
 }
 
 PROMPT_LABELS: dict[str, str] = {
@@ -339,6 +402,14 @@ PROMPT_LABELS: dict[str, str] = {
     "repository_deepdive_a": "Repository: architecture deep dive",
     "repository_deepdive_b": "Repository: maintainer deep dive",
     "repository_merge": "Repository: deep-dive merge",
+    "paper_map": "Paper: evidence map",
+    "paper_reduce": "Paper: hierarchical reduction",
+    "paper_shared": "Paper: shared artifacts",
+    "paper_plan": "Paper: audience series plan",
+    "paper_suite": "Paper: audience study suite",
+    "paper_part_guide": "Paper series: part guide",
+    "paper_part_script": "Paper series: two-host script",
+    "paper_memory": "Paper series: continuity memory",
 }
 
 

@@ -16,6 +16,10 @@ file-and-line-cited codebase study: overview, setup guide, architecture map,
 required knowledge, dependencies, deep dives, quick-references, podcast, mind
 map, and repository-grounded Q&A.
 
+PDF research papers and white papers have their own evidence-first pipeline:
+offline layout/OCR extraction, page-grounded claims and search, shared analysis,
+and independently approved Generalist, Practitioner, and Expert podcast series.
+
 Vibe coded by Fable and Sol and inspired by Jeff McJunkin's methodology.
 
 It supports both local models — the bundled Ollama (CPU-friendly by default)
@@ -31,6 +35,7 @@ without touching code.
 - [Quick start](#quick-start)
 - [Using the app](#using-the-app)
 - [GitHub repository analysis](#github-repository-analysis)
+- [Research paper analysis](#research-paper-analysis)
 - [Themes](#themes)
 - [Advanced settings](#advanced-settings)
 - [Cloud storage](#cloud-storage)
@@ -48,24 +53,26 @@ without touching code.
 
 ### Architecture
 
-Six containers, orchestrated by `docker-compose.yml`:
+Seven containers, orchestrated by `docker-compose.yml`:
 
 | Service | Role |
 |---|---|
 | `frontend` | nginx serving the built React SPA; proxies `/api` to `api` |
 | `api` | FastAPI — REST endpoints, SSE job stream, reads/writes the library |
 | `worker` | Celery worker — runs every pipeline step (this is where yt-dlp, ffmpeg, faster-whisper, Kokoro/Piper, and all LLM calls actually execute) |
+| `paper-worker` | concurrency-one, CPU-only Docling/Tesseract worker — extracts PDF layout, reading order, tables, formulas, OCR, provenance, and quality using models baked into its image |
 | `beat` | Celery scheduler — checks hourly whether a configured backup is due |
 | `redis` | Celery broker + result backend |
 | `ollama` | Local model server for any step configured to use a local model (Synapse can also use an OpenAI-compatible server you run yourself — see [Configuring models](#configuring-models)) |
 
 `api`, `worker`, and `beat` share the same backend image and codebase; `api`
 serves HTTP/SSE, `worker` consumes jobs, and `beat` only schedules periodic
-checks, so a slow transcription or LLM call never blocks the UI.
+checks, so a slow transcription or LLM call never blocks the UI. The parser
+worker has a smaller dedicated image and consumes only the `paper` queue.
 
-### The pipeline
+### The media pipeline
 
-A "project" is one video/audio source. Its pipeline is thirteen independent
+A media project is one video/audio source. Its pipeline is thirteen independent
 steps, run in order from the project's pipeline board — each writes an
 artifact you can open immediately, and each can be re-run on its own (e.g. if
 you edit the glossary and want to re-run correction, or swap the deep-dive
@@ -319,6 +326,53 @@ A project follows the branch or ref you selected but never updates silently.
 Use **Check for updates** to compare its pinned commit with GitHub, then
 **Update analysis** to queue a new snapshot and rebuild affected artifacts.
 Unchanged evidence summaries are reused by content/configuration hash.
+
+## Research paper analysis
+
+Choose **Projects -> Research paper** to upload a PDF in the browser or import
+one from the read-only `/host-media` mount. V1 admits PDFs up to 250 MiB, 500
+pages, and five million extracted characters. English, Spanish, French, and
+German OCR can be selected per import. The source PDF is copied immutably into
+the project's library folder, retained for citations and backups, and always
+excluded from cloud sync. A revised PDF is a new project.
+
+Extraction runs locally in the concurrency-one `paper-worker`. It records every
+admitted prose, heading, definition, equation, table, caption, footnote, and
+reference block with a stable evidence ID, page, section path, bounding box,
+method, and quality metadata. There is no representative sampling or prefix
+truncation. Tables and formulas are structurally extracted and flagged when
+unreliable; charts and diagrams retain their captions and page locations but
+are marked for visual review rather than interpreted. A POOR document or
+nontrivial page blocks analysis until you replace the PDF or acknowledge the
+named page with a reason. Acknowledged gaps remain visible and cannot solely
+support a critical claim.
+
+After review, complete leaf maps and recursive, evidence-preserving reductions
+produce a coverage report, argument map, whole-paper mind map, quick references,
+and paper-grounded Library search/Q&A. The pipeline then drafts any selected
+Generalist, Practitioner, and Expert tracks and stops for approval. Each track
+is independent and contains one to five sequential 40–60 minute parts (50
+minutes by default). The plan editor requires every evidence block to have one
+primary part or a reasoned omission and prevents mapped critical topics from
+being silently demoted.
+
+An approved track generates its audience overview, methods/reproducibility,
+evidence/results, prerequisites/terminology, limitations/critique, explanatory
+and methodology deep dives, and definitive study guide. Each part adds cited
+show notes, a two-host script, and audio. Spoken dialogue contains no page
+citations; its segments keep validated evidence ledgers and clickable PDF page
+links outside the dialogue. Finalized scripts create immutable series-memory
+revisions for terminology, covered/deferred topics, claims, examples, stories,
+open questions, callbacks, and handoffs. Regenerating a script preserves but
+marks following scripts/audio stale and offers an explicit rebuild-following
+action; audio-only reruns do not change memory.
+
+Paper processing is local-only by default, covering LLMs, embeddings, tagging,
+Q&A, TTS, and cloud sync. Encrypted backups are required while a local-only
+paper exists. Cloud-enabled projects may use configured model providers and
+merge eligible quick references into the cross-project library, but their raw
+PDF still never syncs. V1 performs no external scholarly lookup or generative
+visual interpretation, and multipart GitHub generation remains a later release.
 
 ## Themes
 
@@ -612,10 +666,28 @@ Set `ALLOW_PRIVATE_URLS=true` only when you intentionally need a source served
 inside your trusted network. Credentials embedded in a URL are always rejected;
 use the per-project cookies upload for authenticated sites instead.
 
-**Authenticated sites (Udemy, etc.):** on the project detail page, upload a
-`cookies.txt` (Netscape format, exportable with any browser cookie-export
-extension) before running **Ingest**, **Download & keep media**, or
-**Transcript** — yt-dlp uses it for that project's requests.
+### Downloading from sites that require a login
+
+For X/Twitter, Udemy, private Vimeo videos, Patreon, and other
+[yt-dlp-supported sites](https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md):
+
+1. Sign in with your normal browser and confirm that the exact video plays.
+2. Export that site's cookies as a Mozilla/Netscape-format `cookies.txt` file
+   using a trusted, local-only cookie exporter. For X, include both `x.com` and
+   `twitter.com` cookies when your session uses both domains.
+3. Create a URL project in Synapse, open its project page, and upload
+   `cookies.txt` **before** running **Ingest**, **Download & keep media**, or
+   **Transcript**. Choose **Download & keep media** to archive the video and an
+   audio-only copy; all three steps reuse the project's uploaded cookies.
+
+Cookies expire, so if yt-dlp reports a login or `403` error, sign in again,
+verify playback, and export a fresh file—preferably from a browser on the same
+network as Synapse. Treat `cookies.txt` like a password: never commit, share,
+or place it in a URL. Cookies only reproduce access your account already has;
+Synapse does not bypass DRM, and you should download only material you are
+authorized to retain. See yt-dlp's
+[cookie FAQ](https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp)
+for exporter and file-format troubleshooting.
 
 **Bigger local models on other hardware:** if you have a GPU box elsewhere on
 your network already running Ollama, set `OLLAMA_BASE_URL` in `.env` to its
@@ -789,10 +861,10 @@ WARNING so it doesn't drown out the app's own log lines.
   behind upstream; if Google/Microsoft ever change their token format in a
   way it can't parse, switching the Dockerfile to rclone's official install
   script would pull the latest release.
-- Job leasing/restart recovery currently assumes the single worker service
-  defined by `docker-compose.yml`. Running multiple independent worker
-  services would need a distributed lease/leader design for the serialized
-  whole-project queue.
+- Job leasing/restart recovery assumes one ordinary worker and one paper worker
+  on their queue-partitioned tasks, as defined by `docker-compose.yml`. Scaling
+  either queue to independent worker replicas would need a distributed
+  lease/leader design for serialized project and track work.
 - Semantic retrieval stores vectors in SQLite and scores them in-process. It is
   intentionally simple and private for a personal library; a very large
   multi-user collection would warrant a dedicated vector index.

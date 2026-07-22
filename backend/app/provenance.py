@@ -34,6 +34,12 @@ ARTIFACT_STEP = {
     "podcast_audio": "tts",
     "trimmed_audio": "trim",
     "mindmap": "mindmap",
+    "source_paper": "paper_extract",
+    "paper_extraction_report": "paper_extract",
+    "paper_coverage": "paper_analyze",
+    "paper_argument_map": "paper_analyze",
+    "paper_mindmap": "paper_analyze",
+    "paper_quick_references": "paper_analyze",
 }
 
 STEP_INPUT_TYPES: dict[str, list[str]] = {
@@ -55,6 +61,8 @@ STEP_INPUT_TYPES: dict[str, list[str]] = {
     "tts": ["podcast_script"],
     "trim": ["transcript"],
     "mindmap": ["deepdive_merged"],
+    "paper_extract": [],
+    "paper_analyze": ["paper_extraction_report"],
 }
 
 STEP_FUNCTION = {
@@ -74,6 +82,7 @@ STEP_FUNCTION = {
     "repo_architecture": "repository_architecture",
     "repo_expertise": "repository_expertise",
     "repo_environment": "repository_environment",
+    "paper_analyze": "paper_synthesis",
 }
 
 STEP_PROMPTS: dict[str, list[str]] = {
@@ -94,6 +103,7 @@ STEP_PROMPTS: dict[str, list[str]] = {
     "repo_architecture": ["repository_reduce", "repository_architecture"],
     "repo_expertise": ["repository_reduce", "repository_expertise"],
     "repo_environment": ["repository_reduce", "repository_environment"],
+    "paper_analyze": ["paper_map", "paper_reduce", "paper_shared", "paper_plan"],
 }
 
 REPOSITORY_INPUT_TYPES: dict[str, list[str]] = {
@@ -180,6 +190,31 @@ def _source_signature(project: Project) -> dict:
         except Exception:
             value["missing"] = True
         return value
+    if project.source_type == "paper":
+        try:
+            from .db import get_session
+            from .models import PaperSource
+
+            with get_session() as session:
+                source = session.exec(select(PaperSource).where(
+                    PaperSource.project_id == project.id
+                )).first()
+                if source is None:
+                    value["missing"] = True
+                else:
+                    value.update({
+                        "source_hash": source.source_hash,
+                        "source_bytes": source.size_bytes,
+                        "page_count": source.page_count,
+                        "ocr_languages": source.ocr_languages,
+                        "local_only": source.local_only,
+                        "parser_version": source.parser_version,
+                        "parser_config_hash": source.parser_config_hash,
+                        "acknowledged_pages": source.acknowledged_pages,
+                    })
+        except Exception:
+            value["missing"] = True
+        return value
     if project.source_type in {"local", "upload"}:
         try:
             from .tasks.media import resolve_local_source, resolve_uploaded_source
@@ -201,7 +236,11 @@ def _resolved_inputs(session: Session, project: Project,
         (REPOSITORY_INPUT_TYPES if project.source_type == "github" else STEP_INPUT_TYPES)
         .get(step, STEP_INPUT_TYPES.get(step, [])))
     artifacts = session.exec(
-        select(Artifact).where(Artifact.project_id == project.id)
+        select(Artifact).where(
+            Artifact.project_id == project.id,
+            Artifact.paper_series_id == None,  # noqa: E711
+            Artifact.paper_part_id == None,  # noqa: E711
+        )
     ).all()
     by_type = {artifact.type: artifact for artifact in artifacts}
     # Corrected/raw is a fallback pair: use only the richest one that exists.
@@ -211,12 +250,16 @@ def _resolved_inputs(session: Session, project: Project,
 
 
 def upstream_state(session: Session, project: Project, step: str) -> list[dict]:
-    if step in {"ingest", "download", "transcribe", "repo_snapshot", "repo_inventory"}:
+    if step in {"ingest", "download", "transcribe", "repo_snapshot", "repo_inventory",
+                "paper_extract"}:
         return [{"type": "source", "hash": _digest(_source_signature(project))}]
     out: list[dict] = []
     if project.source_type == "github":
         source = _source_signature(project)
         out.append({"type": "repository_source", "hash": _digest(source), **source})
+    elif project.source_type == "paper":
+        source = _source_signature(project)
+        out.append({"type": "paper_source", "hash": _digest(source), **source})
     for artifact_type, artifact in _resolved_inputs(session, project, step):
         out.append({
             "type": artifact_type,
@@ -232,6 +275,7 @@ def effective_config(step: str, project: Project | None = None) -> dict:
 
     value: dict = {"step": step}
     repository = bool(project and project.source_type == "github")
+    paper = bool(project and project.source_type == "paper")
     functions = REPOSITORY_STEP_FUNCTION if repository else STEP_FUNCTION
     function = functions.get(step)
     if function:
@@ -299,6 +343,35 @@ def effective_config(step: str, project: Project | None = None) -> dict:
             "analysis": get_setting("repository.analysis") or {},
             "map_model": {"provider": map_provider, "model": map_model,
                           "params": get_setting("params.repository_map") or {}},
+        }
+    if paper and project:
+        models = {}
+        for paper_function in (
+            "paper_map", "paper_reduce", "paper_synthesis", "paper_plan",
+            "paper_script", "paper_memory",
+        ):
+            with llm.project_scope(project.id):
+                provider, model = llm.resolve_model(paper_function)
+            models[paper_function] = {
+                "provider": provider,
+                "model": model,
+                "params": get_setting(f"params.{paper_function}") or {},
+            }
+        value["paper"] = {
+            "source": _source_signature(project),
+            "models": models,
+            "analysis": get_setting("paper.analysis") or {},
+        }
+        # Avoid duplicating pydantic settings imports at module load and keep
+        # the exact configured limits in the signature.
+        from .config import settings
+
+        value["paper"]["limits"] = {
+            "max_upload_bytes": settings.max_paper_upload_bytes,
+            "max_pages": settings.max_paper_pages,
+            "max_extracted_chars": settings.max_paper_extracted_chars,
+            "target_minutes": settings.paper_target_minutes,
+            "max_parts": settings.paper_max_parts,
         }
     return value
 
@@ -373,7 +446,12 @@ def is_step_stale(session: Session, project: Project, step: str,
     if not output:
         return False
     artifact = session.exec(
-        select(Artifact).where(Artifact.project_id == project.id, Artifact.type == output)
+        select(Artifact).where(
+            Artifact.project_id == project.id,
+            Artifact.paper_series_id == None,  # noqa: E711
+            Artifact.paper_part_id == None,  # noqa: E711
+            Artifact.type == output,
+        )
     ).first()
     if not artifact:
         return False

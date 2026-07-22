@@ -1,7 +1,10 @@
 export async function api<T = any>(path: string, opts?: RequestInit): Promise<T> {
+  const isFormData = typeof FormData !== "undefined" && opts?.body instanceof FormData;
   const res = await fetch(`/api${path}`, {
-    headers: { "Content-Type": "application/json" },
     ...opts,
+    headers: isFormData
+      ? opts?.headers
+      : { "Content-Type": "application/json", ...opts?.headers },
   });
   if (!res.ok) {
     let detail = res.statusText;
@@ -50,6 +53,7 @@ export interface Project {
   created: string;
   progress?: ProjectProgress; // derived pipeline status (list endpoint)
   repository?: GitHubSource | null;
+  paper?: PaperSource | null;
 }
 
 export interface Artifact {
@@ -63,6 +67,10 @@ export interface Artifact {
   model: string | null;
   restricted?: boolean;
   repository_derived?: boolean;
+  paper_series_id?: number | null;
+  paper_part_id?: number | null;
+  audience?: PaperAudience | null;
+  cloud_sync_excluded?: boolean;
   created: string;
   updated: string;
   tags?: string[];
@@ -268,6 +276,8 @@ export interface Job {
   id: number;
   project_id: number | null;
   parent_job_id?: number | null;
+  paper_series_id?: number | null;
+  paper_part_id?: number | null;
   task: string;
   task_label?: string;
   project_title?: string;
@@ -310,6 +320,27 @@ export const TYPE_LABELS: Record<string, string> = {
   repo_expertise: "Required knowledge",
   repo_environment: "Dependencies and environment",
   repository_source: "Repository source",
+  paper_source: "Source paper",
+  source_paper: "Source paper",
+  paper_coverage: "Extraction and coverage report",
+  paper_extraction_report: "Source extraction report",
+  paper_argument_map: "Claim and argument map",
+  paper_mindmap: "Whole-paper mind map",
+  paper_quickrefs: "Paper quick references",
+  paper_quick_references: "Paper quick references",
+  paper_overview: "Paper overview",
+  paper_methods: "Methods and reproducibility guide",
+  paper_evidence: "Evidence and results guide",
+  paper_prerequisites: "Prerequisites and terminology",
+  paper_critique: "Limitations and critique",
+  paper_explanatory_deepdive: "Explanatory deep dive",
+  paper_methodology_deepdive: "Critical-methodology deep dive",
+  paper_deepdive_explanatory: "Explanatory deep dive",
+  paper_deepdive_methodology: "Critical-methodology deep dive",
+  paper_study_guide: "Definitive study guide",
+  paper_part_guide: "Part study guide and show notes",
+  paper_part_script: "Two-host episode script",
+  paper_part_audio: "Podcast audio",
 };
 
 /** Human label for an artifact type; custom quick-ref categories fall back
@@ -342,4 +373,251 @@ export const REPOSITORY_ARTIFACT_TYPES = [
 export const isRepositoryProject = (project: Project | null | undefined): boolean =>
   Boolean(project && ["github", "repository", "github_repository"].includes(project.source_type));
 
+export const isPaperProject = (project: Project | null | undefined): boolean =>
+  project?.source_type === "paper";
+
 export const shortSha = (sha?: string | null): string => sha ? sha.slice(0, 8) : "unknown";
+
+export type PaperAudience = "generalist" | "practitioner" | "expert";
+export type PaperQualityGrade = "EXCELLENT" | "GOOD" | "FAIR" | "POOR" | string;
+export type PaperEvidenceKind =
+  | "prose" | "heading" | "definition" | "equation" | "table"
+  | "caption" | "footnote" | "reference" | "visual" | string;
+
+export interface PaperPageIssue {
+  page: number;
+  grade?: PaperQualityGrade;
+  reason?: string;
+  acknowledged?: boolean;
+  acknowledgement_reason?: string | null;
+  visual_review_needed?: boolean;
+}
+
+export interface PaperSource {
+  id?: number;
+  project_id: number;
+  filename?: string;
+  original_filename?: string;
+  path?: string;
+  source_hash?: string;
+  sha256?: string;
+  page_count?: number;
+  character_count?: number;
+  extracted_characters?: number;
+  status?: string;
+  extraction_status?: string;
+  quality_grade?: PaperQualityGrade;
+  quality?: PaperQualityGrade;
+  quality_report?: Record<string, unknown>;
+  extraction_method?: string;
+  parser_version?: string;
+  ocr_languages?: string[];
+  local_only?: boolean;
+  privacy_locked?: boolean;
+  cloud_sync_excluded?: boolean;
+  poor_pages?: Array<number | PaperPageIssue>;
+  unacknowledged_poor_pages?: number[];
+  analysis_blocked?: boolean;
+  page_issues?: PaperPageIssue[];
+  acknowledged_pages?: Array<number | PaperPageIssue>;
+  pdf_url?: string;
+  created?: string;
+  updated?: string;
+}
+
+export interface PaperCoverageTopic {
+  id: string;
+  title: string;
+  kind?: string;
+  importance?: "critical" | "major" | "supporting" | string;
+  evidence_ids?: string[];
+  assigned_part_id?: number | null;
+  assigned_part?: number | null;
+  omitted?: boolean;
+  omission_reason?: string | null;
+}
+
+export interface PaperCoverage {
+  evidence_blocks?: number;
+  mapped_blocks?: number;
+  pages_total?: number;
+  pages_admitted?: number;
+  pages_acknowledged?: number;
+  critical_total?: number;
+  critical_assigned?: number;
+  critical_omitted?: number;
+  major_total?: number;
+  major_assigned?: number;
+  percent?: number;
+  complete?: boolean;
+  analysis_blocked?: boolean;
+  warnings?: string[];
+  topics?: PaperCoverageTopic[];
+}
+
+export interface PaperPartEvidence {
+  evidence_id?: string;
+  chunk_id?: number;
+  role?: "primary" | "bridge" | string;
+  importance?: string;
+  title?: string;
+  page?: number;
+  section?: string;
+  reason?: string;
+}
+
+export interface PaperSeriesPart {
+  id: number;
+  paper_series_id?: number;
+  position: number;
+  title: string;
+  focus?: string;
+  target_minutes?: number;
+  status?: string;
+  stale?: boolean;
+  structure_locked?: boolean;
+  locked?: boolean;
+  assignments?: Array<string | PaperPartEvidence>;
+  evidence?: PaperPartEvidence[];
+  evidence_ids?: string[];
+  topics?: string[];
+  duration_minutes?: number;
+  learning_objectives?: string[];
+  primary_evidence_ids?: string[];
+  bridge_evidence_ids?: string[];
+  artifacts?: Artifact[];
+  jobs?: Job[];
+  guide_artifact?: Artifact | null;
+  script_artifact?: Artifact | null;
+  audio_artifact?: Artifact | null;
+  memory_revision_id?: number | null;
+  guide_status?: string;
+  script_status?: string;
+  audio_status?: string;
+  created?: string;
+  updated?: string;
+}
+
+export interface PaperPlanOmission {
+  topic_id?: string | null;
+  reason: string;
+  importance?: string;
+  evidence_id?: string | null;
+  demoted_from?: "critical" | "major" | null;
+}
+
+export interface PaperSeriesPlan {
+  version?: number;
+  title?: string;
+  rationale?: string;
+  parts?: PaperSeriesPart[];
+  omissions?: PaperPlanOmission[];
+  topics?: PaperCoverageTopic[];
+  critical_topics?: PaperCoverageTopic[];
+  coverage?: PaperCoverage;
+}
+
+export interface PaperMemoryState {
+  terminology?: Array<string | { term: string; pronunciation?: string; meaning?: string }>;
+  introduced_topics?: string[];
+  completed_topics?: string[];
+  deferred_topics?: string[];
+  covered_claims?: string[];
+  examples?: string[];
+  stories_and_analogies?: string[];
+  open_questions?: string[];
+  promised_callbacks?: string[];
+  handoff_notes?: string[];
+  evidence_ids?: string[];
+  [key: string]: unknown;
+}
+
+export interface PaperMemoryRevision {
+  id: number;
+  paper_series_id?: number;
+  paper_part_id?: number | null;
+  parent_id?: number | null;
+  revision: number;
+  state?: PaperMemoryState;
+  state_json?: PaperMemoryState | string;
+  content_hash?: string;
+  created?: string;
+}
+
+export interface PaperSeries {
+  id: number;
+  project_id: number;
+  audience: PaperAudience;
+  title?: string;
+  status: string;
+  target_minutes?: number;
+  max_parts?: number;
+  plan_version?: number;
+  plan_hash?: string;
+  plan?: PaperSeriesPlan;
+  parts?: PaperSeriesPart[];
+  omissions?: PaperPlanOmission[];
+  coverage?: PaperCoverage;
+  memory_revision?: PaperMemoryRevision | null;
+  memory_revisions?: PaperMemoryRevision[];
+  user_guidance?: string;
+  artifacts?: Artifact[];
+  jobs?: Job[];
+  created?: string;
+  updated?: string;
+}
+
+export interface PaperQuality {
+  grade?: PaperQualityGrade;
+  status?: string;
+  blocked?: boolean;
+  poor_pages?: Array<number | PaperPageIssue>;
+  page_issues?: PaperPageIssue[];
+  acknowledged_pages?: Array<number | PaperPageIssue>;
+  warnings?: string[];
+  report?: Record<string, unknown>;
+}
+
+export interface PaperDetail {
+  project: Project;
+  source: PaperSource;
+  quality?: PaperQuality;
+  coverage?: PaperCoverage;
+  artifacts?: Artifact[];
+  shared_artifacts?: Artifact[];
+  series?: PaperSeries[];
+  tracks?: PaperSeries[];
+  jobs?: Job[];
+}
+
+export interface PaperCitation {
+  kind?: "paper";
+  source_hash?: string;
+  evidence_id: string;
+  page: number;
+  section?: string | string[];
+  bounding_box?: number[] | Record<string, number> | null;
+  excerpt?: string;
+  internal_url?: string;
+  pdf_url?: string;
+  url?: string;
+  extraction_method?: string;
+}
+
+export type SourceCitation = RepositoryCitation | PaperCitation;
+
+export function isPaperCitation(citation: SourceCitation): citation is PaperCitation {
+  return Boolean(citation && typeof citation === "object"
+    && "evidence_id" in citation && "page" in citation);
+}
+
+export const PAPER_AUDIENCES: Array<{ key: PaperAudience; label: string; description: string }> = [
+  { key: "generalist", label: "Generalist", description: "Build intuition first and explain specialist terms in plain language." },
+  { key: "practitioner", label: "Practitioner", description: "Emphasize application, implementation choices, and reproducibility." },
+  { key: "expert", label: "Expert", description: "Preserve technical detail and foreground methodology and uncertainty." },
+];
+
+export function paperAudienceLabel(audience?: string | null): string {
+  return PAPER_AUDIENCES.find((item) => item.key === audience)?.label
+    ?? (audience ? audience.charAt(0).toUpperCase() + audience.slice(1) : "Audience");
+}

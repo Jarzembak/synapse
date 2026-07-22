@@ -1,6 +1,6 @@
 import { FormEvent, useEffect, useRef, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
-import { api, fmtDate, fmtDateTime, isRepositoryProject, PipelineStatus, Project } from "../api";
+import { api, fmtDate, fmtDateTime, isPaperProject, isRepositoryProject, PipelineStatus, Project } from "../api";
 import { useEventSource } from "../useEventSource";
 
 // derived pipeline status → chip label + the CSS class it borrows from .jobstatus
@@ -134,12 +134,16 @@ export default function Projects() {
 
   async function remove(p: Project) {
     const repository = isRepositoryProject(p);
+    const paper = isPaperProject(p);
     const ok = confirm(
       `Delete "${p.title}"?\n\n` +
       (repository
         ? "This permanently deletes all of its artifacts and retained repository snapshots. "
+        : paper
+          ? "This permanently deletes the source PDF, extracted evidence, audience tracks, and generated artifacts. "
         : "This permanently deletes all of its artifacts and any downloaded media. ") +
-      "Quick-reference docs it contributed to will remain.\n\nThis cannot be undone."
+      (paper ? "" : "Quick-reference docs it contributed to will remain. ") +
+      "\n\nThis cannot be undone."
     );
     if (!ok) return;
     try {
@@ -165,6 +169,12 @@ export default function Projects() {
           <h3>Code repository</h3>
           <p>Build a cited, plain-language guide to a public or private repository.</p>
           <Link className="button-link" to="/projects/new/repository">Import GitHub repository</Link>
+        </section>
+        <section className="card source-type-card paper-source-card">
+          <span className="source-badge paper">Paper</span>
+          <h3>Research or white paper</h3>
+          <p>Extract page-grounded evidence, review quality, and teach dense material as an audience series.</p>
+          <Link className="button-link" to="/projects/new/paper">Import PDF paper</Link>
         </section>
       </div>
       <h3 id="new-media-project">New media project</h3>
@@ -239,8 +249,8 @@ export default function Projects() {
             <tr key={p.id}>
               <td>
                 <Link to={`/projects/${p.id}`}>{p.title}</Link>{" "}
-                <span className={`source-badge ${isRepositoryProject(p) ? "repository" : "media"}`}>
-                  {isRepositoryProject(p) ? "GitHub" : "Media"}
+                <span className={`source-badge ${isRepositoryProject(p) ? "repository" : isPaperProject(p) ? "paper" : "media"}`}>
+                  {isRepositoryProject(p) ? "GitHub" : isPaperProject(p) ? "Paper" : "Media"}
                 </span>
               </td>
               <td className="mono" title={p.repository?.full_name ?? p.source}>
