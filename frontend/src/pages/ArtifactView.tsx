@@ -6,11 +6,18 @@ import {
   api,
   Artifact,
   fmtDateTime,
+  isPaperCitation,
+  isPaperProject,
   isRepositoryProject,
+  paperAudienceLabel,
+  PaperCitation,
+  PaperSeries,
+  PaperSeriesPart,
   Project,
   RepositoryCitation,
   RepositoryDetail,
   shortSha,
+  SourceCitation,
   typeLabel,
 } from "../api";
 import MindMap, { Graph } from "../components/MindMap";
@@ -22,8 +29,10 @@ interface Detail {
   tags: string[];
   project: Project | null;
   repository?: RepositoryDetail | null;
-  citations?: RepositoryCitation[];
+  citations?: SourceCitation[];
   related_artifacts?: Artifact[];
+  paper_series?: PaperSeries | null;
+  paper_part?: PaperSeriesPart | null;
 }
 
 interface TocItem {
@@ -141,6 +150,21 @@ function citationsFromMarkdown(markdown: string, fallbackSha: string): Repositor
   return citations;
 }
 
+function paperCitationsFromMarkdown(markdown: string): PaperCitation[] {
+  const citations: PaperCitation[] = [];
+  const linked = /\[(?:p(?:age)?\.?\s*)?(\d+)(?:\s*[·,:-]\s*([^\]]+))?\]\(((?:\/api\/papers\/|https?:\/\/)[^)]+(?:#page=\d+)?)\)(?:<!--P:([^>]+)-->)?/gi;
+  for (const match of markdown.matchAll(linked)) {
+    citations.push({
+      kind: "paper",
+      evidence_id: match[4] || `page-${match[1]}-${citations.length + 1}`,
+      page: Number(match[1]),
+      section: match[2]?.trim(),
+      internal_url: match[3],
+    });
+  }
+  return citations;
+}
+
 function CommandBlock({ children }: { children?: ReactNode }) {
   const [copied, setCopied] = useState(false);
   const content = textFromNode(children).replace(/\n$/, "");
@@ -208,9 +232,9 @@ export default function ArtifactView() {
         setRepository(nextDetail.repository ?? null);
         setRelated(nextDetail.related_artifacts ?? []);
 
-        if (isRepositoryProject(nextDetail.project) && nextDetail.project) {
+        if ((isRepositoryProject(nextDetail.project) || isPaperProject(nextDetail.project)) && nextDetail.project) {
           const tasks: Promise<void>[] = [];
-          if (!nextDetail.repository) {
+          if (isRepositoryProject(nextDetail.project) && !nextDetail.repository) {
             tasks.push(api<RepositoryDetail>(`/repositories/${nextDetail.project.id}`, {
               signal: controller.signal,
             }).then((value) => { if (!controller.signal.aborted) setRepository(value); }).catch(() => {}));
@@ -273,14 +297,18 @@ export default function ArtifactView() {
   if (error && errorFor === (id ?? "")) return <p className="error" role="alert">{error}</p>;
   if (!detail || detail.artifact.id !== Number(id)) return <p role="status">Loading artifact...</p>;
 
-  const graph = detail.artifact.type === "mindmap" ? parseGraph(detail.body) : null;
+  const graph = detail.artifact.type.endsWith("mindmap") ? parseGraph(detail.body) : null;
   const repositoryProject = isRepositoryProject(detail.project);
+  const paperProject = isPaperProject(detail.project);
   const commitSha = repository?.snapshot.commit_sha
     ?? (typeof detail.meta.commit_sha === "string" ? detail.meta.commit_sha : null);
   const rawCitations = detail.citations ?? detail.meta.citations;
   const citations = Array.isArray(rawCitations)
-    ? rawCitations as RepositoryCitation[]
+    ? (rawCitations as SourceCitation[]).filter((citation): citation is RepositoryCitation => !isPaperCitation(citation))
     : citationsFromMarkdown(detail.body, commitSha ?? "");
+  const paperCitations = Array.isArray(rawCitations)
+    ? (rawCitations as SourceCitation[]).filter(isPaperCitation)
+    : paperCitationsFromMarkdown(detail.body);
   const coverage = repository?.coverage;
   const metaCoverage = detail.meta.coverage && typeof detail.meta.coverage === "object"
     ? detail.meta.coverage as Record<string, unknown>
@@ -300,6 +328,21 @@ export default function ArtifactView() {
 
   return (
     <div className="artifact">
+      <nav className="artifact-breadcrumbs" aria-label="Breadcrumb">
+        <Link to="/projects">Projects</Link>
+        {detail.project && <><span aria-hidden="true">›</span><Link to={`/projects/${detail.project.id}`}>{detail.project.title}</Link></>}
+        {paperProject && detail.artifact.paper_series_id && (
+          <><span aria-hidden="true">›</span><Link to={`/paper-series/${detail.artifact.paper_series_id}`}>
+            {paperAudienceLabel(detail.paper_series?.audience ?? detail.artifact.audience ?? (typeof detail.meta.audience === "string" ? detail.meta.audience : null))} series
+          </Link></>
+        )}
+        {paperProject && detail.artifact.paper_part_id && (
+          <><span aria-hidden="true">›</span><Link to={`/paper-series/${detail.artifact.paper_series_id}?part=${detail.artifact.paper_part_id}`}>
+            {detail.paper_part?.title ?? (typeof detail.meta.part_title === "string" ? detail.meta.part_title : "Series part")}
+          </Link></>
+        )}
+        <span aria-hidden="true">›</span><span>{detail.artifact.title}</span>
+      </nav>
       <header>
         <h2>{detail.artifact.title}</h2>
         <p className="meta">
@@ -333,6 +376,15 @@ export default function ArtifactView() {
             )}
           </div>
         )}
+        {paperProject && (
+          <div className="artifact-provenance paper-provenance" aria-label="Paper provenance">
+            <span className="source-badge paper">Paper-grounded</span>
+            {typeof detail.meta.source_hash === "string" && <span>Source <code>{detail.meta.source_hash.slice(0, 12)}</code></span>}
+            {paperCitations.length > 0 && <span>{paperCitations.length} page-grounded citation{paperCitations.length === 1 ? "" : "s"}</span>}
+            {detail.artifact.paper_part_id && <span>Series part {String(detail.paper_part?.position ?? detail.meta.part_position ?? detail.artifact.paper_part_id)}</span>}
+            {detail.project && <Link to={`/?project_id=${detail.project.id}&source_type=paper&mode=hybrid#ask-library-title`}>Ask this paper</Link>}
+          </div>
+        )}
         <p className="tags">
           {detail.tags.map((tag) => <span key={tag} className="tag">{tag}</span>)}
           {editingTags ? (
@@ -356,7 +408,7 @@ export default function ArtifactView() {
         {actionError && <p className="error" role="alert">Could not save tags: {actionError}</p>}
       </header>
 
-      {!repositoryProject && detail.artifact.media_path && (
+      {!repositoryProject && !paperProject && detail.artifact.media_path && (
         <>
           {detail.artifact.type === "source_video" ? (
             <video controls src={`/api/media/${detail.artifact.id}`}
@@ -376,7 +428,23 @@ export default function ArtifactView() {
         </>
       )}
 
-      {graph ? (
+      {paperProject && ["paper_source", "source_paper"].includes(detail.artifact.type) && detail.project && (
+        <section className="paper-artifact-viewer" aria-labelledby="paper-artifact-viewer-title">
+          <h3 id="paper-artifact-viewer-title">Source PDF</h3>
+          <iframe className="paper-pdf-viewer" title={detail.artifact.title}
+            src={`/api/papers/${detail.project.id}/source#page=${Math.max(1, Number(searchParams.get("page")) || 1)}&view=FitH`} />
+          <p><a href={`/api/papers/${detail.project.id}/source`} download>Download original PDF</a></p>
+        </section>
+      )}
+
+      {paperProject && detail.artifact.type === "paper_part_audio" && detail.artifact.media_path && (
+        <section className="paper-audio-player" aria-label="Paper series audio">
+          <audio controls src={`/api/media/${detail.artifact.id}`} style={{ width: "100%" }} />
+          <p><a href={`/api/media/${detail.artifact.id}`} download>Download podcast audio</a></p>
+        </section>
+      )}
+
+      {paperProject && ["paper_source", "source_paper"].includes(detail.artifact.type) ? null : graph ? (
         <MindMap graph={graph} />
       ) : (
         <div className={`artifact-reading-layout ${toc.length < 2 ? "without-toc" : ""}`}>
@@ -446,9 +514,33 @@ export default function ArtifactView() {
         </section>
       )}
 
-      {repositoryProject && related.length > 0 && (
+      {paperProject && paperCitations.length > 0 && detail.project && (
+        <section className="artifact-citations paper-citations" aria-labelledby="paper-citations-title">
+          <h3 id="paper-citations-title">Paper evidence</h3>
+          <p className="meta">Links jump to the immutable source PDF page used by this artifact.</p>
+          <ol>
+            {paperCitations.map((citation, index) => {
+              const link = citation.internal_url ?? citation.pdf_url ?? citation.url
+                ?? `/api/papers/${detail.project!.id}/source#page=${citation.page}`;
+              return (
+                <li key={`${citation.evidence_id}:${index}`}>
+                  <div className="citation-head">
+                    <span className="citation-marker">[{citation.evidence_id}]</span>
+                    <a href={link} target="_blank" rel="noreferrer">Page {citation.page}</a>
+                    {citation.section && <span>{Array.isArray(citation.section) ? citation.section.join(" › ") : citation.section}</span>}
+                    {citation.extraction_method && <span className="kindbadge">{citation.extraction_method}</span>}
+                  </div>
+                  {citation.excerpt && <blockquote>{citation.excerpt}</blockquote>}
+                </li>
+              );
+            })}
+          </ol>
+        </section>
+      )}
+
+      {(repositoryProject || paperProject) && related.length > 0 && (
         <aside className="related-artifacts" aria-labelledby="related-artifacts-title">
-          <h3 id="related-artifacts-title">Continue exploring this repository</h3>
+          <h3 id="related-artifacts-title">Continue exploring this {paperProject ? "paper" : "repository"}</h3>
           <div className="related-artifact-grid">
             {related.slice(0, 8).map((artifact) => (
               <Link className="card" to={`/artifacts/${artifact.id}`} key={artifact.id}>

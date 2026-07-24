@@ -615,7 +615,10 @@ def _write_repository_artifact(project_id: int, artifact_type: str,
     with get_session() as session:
         project = get_project(session, project_id)
         existing = session.exec(select(Artifact).where(
-            Artifact.project_id == project_id, Artifact.type == artifact_type
+            Artifact.project_id == project_id,
+            Artifact.paper_series_id == None,  # noqa: E711
+            Artifact.paper_part_id == None,  # noqa: E711
+            Artifact.type == artifact_type,
         )).first()
         previous_commit = ""
         history_snapshot = None

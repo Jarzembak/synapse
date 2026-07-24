@@ -53,6 +53,17 @@ class Settings(BaseSettings):
     repository_max_map_chunks: int = 64
     repository_max_map_input_chars: int = 800_000
     repository_local_model: str = "qwen3:8b"
+    # Research-paper v1 intentionally fails at explicit, reviewable limits.
+    # Inputs inside these limits are mapped completely; the paper pipeline
+    # never converts an oversized source into a hidden prefix/sample.
+    max_paper_upload_bytes: int = 250 * 1024 * 1024
+    max_paper_pages: int = 500
+    max_paper_extracted_chars: int = 5_000_000
+    paper_ocr_languages: str = "eng,spa,fra,deu"
+    paper_target_minutes: int = 50
+    paper_min_minutes: int = 40
+    paper_max_minutes: int = 60
+    paper_max_parts: int = 5
 
 
 settings = Settings()
@@ -104,6 +115,16 @@ FUNCTION_DEFAULTS: dict[str, dict[str, str]] = {
     "repository_architecture": {"provider": "ollama", "model": "qwen3:8b"},
     "repository_expertise":    {"provider": "ollama", "model": "qwen3:8b"},
     "repository_environment":  {"provider": "ollama", "model": "qwen3:8b"},
+    # Paper leaf maps are deliberately local by default. Cloud-enabled paper
+    # projects may use the configured synthesis models, while project_scope()
+    # forces every function back to the validated local model when local_only
+    # is set on the paper source.
+    "paper_map":       {"provider": "ollama",    "model": "qwen3:8b"},
+    "paper_reduce":    {"provider": "anthropic", "model": "claude-sonnet-5"},
+    "paper_synthesis": {"provider": "anthropic", "model": "claude-sonnet-5"},
+    "paper_plan":      {"provider": "anthropic", "model": "claude-sonnet-5"},
+    "paper_script":    {"provider": "anthropic", "model": "claude-sonnet-5"},
+    "paper_memory":    {"provider": "ollama",    "model": "qwen3:8b"},
     # ASR + TTS are not chat providers; handled by their own tasks.
     "asr":            {"provider": "faster-whisper", "model": "distil-large-v3"},
     "tts":            {"provider": "piper",    "model": "en_US-ryan-medium"},

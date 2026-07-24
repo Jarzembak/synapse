@@ -7,9 +7,9 @@ from sqlmodel import select
 
 from .. import library
 from ..db import get_session
-from ..models import Artifact
-from ..recovery import rebuild_repository_fts
-from ..search import index_artifact
+from ..models import Artifact, PaperSource
+from ..recovery import rebuild_paper_fts, rebuild_repository_fts
+from ..search import index_artifact, index_paper_source
 from ..settings_store import get_setting
 from .celery_app import celery
 from .common import set_job, transition_job
@@ -24,6 +24,15 @@ def index_artifact_chunks(artifact_id: int):
         if not session.get(Artifact, artifact_id):
             return 0
         return index_artifact(session, artifact_id)
+
+
+@celery.task(name="index_paper_chunks", autoretry_for=(OSError,),
+             retry_backoff=True, retry_jitter=True, max_retries=3)
+def index_paper_chunks(source_id: int):
+    with get_session() as session:
+        if not session.get(PaperSource, source_id):
+            return 0
+        return index_paper_source(session, source_id)
 
 
 @celery.task(name="rebuild_search")
@@ -57,11 +66,25 @@ def rebuild_search(job_id: int):
                 on_progress=lambda message: set_job(
                     session, job_id, progress=message),
             )
+            paper_indexed = rebuild_paper_fts(
+                session,
+                on_progress=lambda message: set_job(
+                    session, job_id, progress=message),
+            )
             session.commit()
+        paper_semantic = 0
+        if semantic:
+            with get_session() as session:
+                paper_source_ids = session.exec(select(PaperSource.id)).all()
+            for source_id in paper_source_ids:
+                with get_session() as session:
+                    paper_semantic += index_paper_source(session, source_id)
         with get_session() as session:
             transition_job(session, job_id, {"running"}, "done",
                            progress=(f"complete; {indexed} semantic chunks; "
-                                     f"{repository_indexed} repository chunks"))
+                                     f"{paper_semantic} paper semantic chunks; "
+                                     f"{repository_indexed} repository chunks; "
+                                     f"{paper_indexed} paper chunks"))
     except Exception as exc:
         log.exception("search rebuild failed")
         with get_session() as session:

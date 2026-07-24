@@ -14,7 +14,7 @@ from .db import get_session, init_db  # noqa: E402
 from .models import Tag  # noqa: E402
 from .routers import (  # noqa: E402
     artifacts, backup, jobs, logs, projects, quickrefs, recovery, repositories,
-    search, system,
+    search, system, papers,
 )
 from .routers.settings import router as settings_router, tags_router  # noqa: E402
 
@@ -46,6 +46,8 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Synapse", lifespan=lifespan)
 app.include_router(projects.router)
 app.include_router(repositories.router)
+app.include_router(papers.router)
+app.include_router(papers.series_router)
 app.include_router(jobs.router)
 app.include_router(artifacts.router)
 app.include_router(quickrefs.router)

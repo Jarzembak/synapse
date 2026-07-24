@@ -8,11 +8,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # deno below). Debian's packaged rclone (1.60) predates the bisync reliability
 # work (resilient/recover modes, conflict-resolve) that two-way cloud sync
 # depends on, and is years behind on provider token formats.
-ARG RCLONE_VERSION=1.74.4
-ARG RCLONE_SHA256=fe435e0c36228e7c2f116a8701f01127bb1f694005fc11d1f27186c8bca4115d
-ADD https://downloads.rclone.org/v${RCLONE_VERSION}/rclone-v${RCLONE_VERSION}-linux-amd64.zip /tmp/rclone.zip
-RUN echo "${RCLONE_SHA256}  /tmp/rclone.zip" | sha256sum -c - \
-    && unzip -j /tmp/rclone.zip "rclone-v${RCLONE_VERSION}-linux-amd64/rclone" -d /usr/local/bin \
+# Do not begin these build arguments with RCLONE_: rclone maps that prefix to
+# runtime flags, so RCLONE_VERSION=1.74.4 breaks even `rclone --version`.
+ARG SYNC_RCLONE_VERSION=1.74.4
+ARG SYNC_RCLONE_SHA256=fe435e0c36228e7c2f116a8701f01127bb1f694005fc11d1f27186c8bca4115d
+ADD https://downloads.rclone.org/v${SYNC_RCLONE_VERSION}/rclone-v${SYNC_RCLONE_VERSION}-linux-amd64.zip /tmp/rclone.zip
+RUN echo "${SYNC_RCLONE_SHA256}  /tmp/rclone.zip" | sha256sum -c - \
+    && unzip -j /tmp/rclone.zip "rclone-v${SYNC_RCLONE_VERSION}-linux-amd64/rclone" -d /usr/local/bin \
     && rm /tmp/rclone.zip \
     && rclone --version
 

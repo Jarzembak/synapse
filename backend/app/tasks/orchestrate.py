@@ -1,9 +1,8 @@
 """Dependency-aware, restart-safe orchestration for every project source.
 
-The media and repository pipelines deliberately share the durable job runner,
-but not their dependency graph.  In particular, repository source is never
-adapted into a pretend transcript: GitHub projects start from a pinned snapshot
-and line-addressed evidence inventory.
+Media, repository, and paper pipelines share the durable job runner but never
+their evidence semantics. Papers start from an immutable PDF and page-addressed
+evidence, not from a pretend transcript.
 """
 from __future__ import annotations
 
@@ -55,14 +54,20 @@ REPOSITORY_STEPS: list[tuple[str, str]] = [
     ("mindmap", "Mind map"),
 ]
 
+PAPER_STEPS: list[tuple[str, str]] = [
+    ("paper_extract", "Extract & review PDF"),
+    ("paper_analyze", "Map evidence & propose audience tracks"),
+]
+
 # Legacy exports are a union registry.  Existing API/tests import these names;
 # execution always uses the source-specific helpers below so shared steps such
 # as ``summarize`` cannot accidentally acquire both media and repo dependencies.
 STEPS: list[tuple[str, str]] = MEDIA_STEPS + [
     item for item in REPOSITORY_STEPS if item[0] not in {s for s, _ in MEDIA_STEPS}
-]
+] + [item for item in PAPER_STEPS
+     if item[0] not in {s for s, _ in MEDIA_STEPS + REPOSITORY_STEPS}]
 STEP_NAMES = {s for s, _ in STEPS}
-STEP_LABELS = {**dict(MEDIA_STEPS), **dict(REPOSITORY_STEPS)}
+STEP_LABELS = {**dict(MEDIA_STEPS), **dict(REPOSITORY_STEPS), **dict(PAPER_STEPS)}
 
 MEDIA_HARD_DEPS: dict[str, set[str]] = {
     "ingest": set(),
@@ -107,6 +112,12 @@ REPOSITORY_HARD_DEPS: dict[str, set[str]] = {
 }
 REPOSITORY_RUN_DEPS = REPOSITORY_HARD_DEPS
 
+PAPER_HARD_DEPS: dict[str, set[str]] = {
+    "paper_extract": set(),
+    "paper_analyze": {"paper_extract"},
+}
+PAPER_RUN_DEPS = PAPER_HARD_DEPS
+
 # Compatibility graphs: media semantics for shared steps, repository-only
 # entries for the new steps.  Call deps_for(project) for actual execution.
 HARD_DEPS: dict[str, set[str]] = {
@@ -117,6 +128,8 @@ HARD_DEPS: dict[str, set[str]] = {
     "repo_architecture": {"repo_inventory"},
     "repo_expertise": {"repo_inventory"},
     "repo_environment": {"repo_inventory"},
+    "paper_extract": set(),
+    "paper_analyze": {"paper_extract"},
 }
 RUN_DEPS: dict[str, set[str]] = {
     **MEDIA_RUN_DEPS,
@@ -126,6 +139,8 @@ RUN_DEPS: dict[str, set[str]] = {
     "repo_architecture": {"repo_inventory"},
     "repo_expertise": {"repo_inventory"},
     "repo_environment": {"repo_inventory"},
+    "paper_extract": set(),
+    "paper_analyze": {"paper_extract"},
 }
 
 STEP_OUTPUT: dict[str, str | None] = {
@@ -148,6 +163,8 @@ STEP_OUTPUT: dict[str, str | None] = {
     "tts": "podcast_audio",
     "trim": "trimmed_audio",
     "mindmap": "mindmap",
+    "paper_extract": "paper_extraction_report",
+    "paper_analyze": "paper_coverage",
 }
 
 BUILTIN_PROFILES: dict[str, dict] = {
@@ -182,6 +199,11 @@ BUILTIN_PROFILES: dict[str, dict] = {
         "description": "Pinned static repository analysis, guides, deep dives and learning media.",
         "steps": [s for s, _ in REPOSITORY_STEPS],
     },
+    "paper": {
+        "label": "Research paper study",
+        "description": "Local extraction, complete evidence mapping, shared guides, and audience-track proposals.",
+        "steps": [s for s, _ in PAPER_STEPS],
+    },
 }
 
 
@@ -189,9 +211,15 @@ def is_repository_project(project: Project) -> bool:
     return project.source_type == "github"
 
 
+def is_paper_project(project: Project) -> bool:
+    return project.source_type == "paper"
+
+
 def step_specs(project: Project | None = None) -> list[tuple[str, str]]:
     if project is not None and is_repository_project(project):
         return list(REPOSITORY_STEPS)
+    if project is not None and is_paper_project(project):
+        return list(PAPER_STEPS)
     # The unscoped endpoint is the legacy media catalog. Repository callers
     # always have a project and receive their source-specific graph above.
     return list(MEDIA_STEPS)
@@ -213,6 +241,8 @@ def step_output(step: str) -> str | None:
 def deps_for(project: Project, *, run: bool = False) -> dict[str, set[str]]:
     if is_repository_project(project):
         return REPOSITORY_RUN_DEPS if run else REPOSITORY_HARD_DEPS
+    if is_paper_project(project):
+        return PAPER_RUN_DEPS if run else PAPER_HARD_DEPS
     return MEDIA_RUN_DEPS if run else MEDIA_HARD_DEPS
 
 
@@ -241,9 +271,15 @@ def pipeline_profiles(project: Project | None = None) -> dict[str, dict]:
             },
             "repository": repository,
         }
+    elif is_paper_project(project):
+        paper = dict(BUILTIN_PROFILES["paper"])
+        builtins = {
+            "full": {**paper, "label": "Analyze paper & propose tracks"},
+            "paper": paper,
+        }
     else:
         builtins = {key: value for key, value in BUILTIN_PROFILES.items()
-                    if key != "repository"}
+                    if key not in {"repository", "paper"}}
     return {**builtins, **clean}
 
 
@@ -257,7 +293,12 @@ def _artifact_for_step(session, project_id: int, step: str) -> Artifact | None:
     if not output:
         return None
     return session.exec(
-        select(Artifact).where(Artifact.project_id == project_id, Artifact.type == output)
+        select(Artifact).where(
+            Artifact.project_id == project_id,
+            Artifact.paper_series_id == None,  # noqa: E711
+            Artifact.paper_part_id == None,  # noqa: E711
+            Artifact.type == output,
+        )
     ).first()
 
 
@@ -278,7 +319,11 @@ def step_done(session, project: Project, step: str,
     if artifact_types is None:
         artifact_types = {
             a.type for a in session.exec(
-                select(Artifact).where(Artifact.project_id == project.id)
+                select(Artifact).where(
+                    Artifact.project_id == project.id,
+                    Artifact.paper_series_id == None,  # noqa: E711
+                    Artifact.paper_part_id == None,  # noqa: E711
+                )
             ).all()
         }
     if step == "ingest":
@@ -373,7 +418,11 @@ def _selected_steps(project: Project, options: dict) -> set[str]:
         selected = {s for s in options["steps"] if s in applicable}
     else:
         profiles = pipeline_profiles(project)
-        default_profile = "repository" if is_repository_project(project) else "full"
+        default_profile = (
+            "repository" if is_repository_project(project)
+            else "paper" if is_paper_project(project)
+            else "full"
+        )
         profile = profiles.get(options.get("profile") or default_profile,
                                profiles[default_profile])
         selected = set(profile["steps"])
@@ -419,6 +468,8 @@ def maybe_start_next_run_all() -> None:
 def _active_step(session, project_id: int, step: str) -> Job | None:
     return session.exec(
         select(Job).where(Job.project_id == project_id, Job.task == step,
+                          Job.paper_series_id == None,  # noqa: E711
+                          Job.paper_part_id == None,  # noqa: E711
                           Job.status.in_(("queued", "running")))
         .order_by(Job.created.desc())
     ).first()
@@ -532,7 +583,9 @@ def run_all(job_id: int, project_id: int):
         running = set(adopted)
         done: set[str] = set()
         failed: set[str] = set()
-        default_timeout = 24 * 3600 if project.source_type == "github" else 6 * 3600
+        default_timeout = (24 * 3600
+                           if project.source_type in {"github", "paper"}
+                           else 6 * 3600)
         deadline = time.monotonic() + float(
             options.get("timeout_seconds") or default_timeout)
 

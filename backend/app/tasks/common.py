@@ -114,6 +114,22 @@ def pipeline_task(fn):
                 # repository excerpt to a cloud model.
                 repository_processing_policy(project_id)
                 local_only_policy = True
+            elif policy_project and policy_project.source_type == "paper":
+                from sqlmodel import select
+
+                from ..models import PaperSource
+
+                with get_session() as policy_session:
+                    source = policy_session.exec(select(PaperSource).where(
+                        PaperSource.project_id == project_id
+                    )).first()
+                    # First worker pickup is the irreversible privacy boundary.
+                    # Missing source metadata fails closed.
+                    if source:
+                        source.privacy_locked = True
+                        policy_session.add(source)
+                        policy_session.commit()
+                    local_only_policy = True if source is None else bool(source.local_only)
             context_token = current_job_id.set(job_id)
             try:
                 from .. import llm
@@ -168,7 +184,10 @@ def artifact_body(session: Session, project_id: int, type: str) -> str:
     """Read the body of a project's artifact of the given type from disk."""
     art = session.exec(
         select(Artifact).where(
-            Artifact.project_id == project_id, Artifact.type == type
+            Artifact.project_id == project_id,
+            Artifact.paper_series_id == None,  # noqa: E711
+            Artifact.paper_part_id == None,  # noqa: E711
+            Artifact.type == type,
         )
     ).first()
     if not art:

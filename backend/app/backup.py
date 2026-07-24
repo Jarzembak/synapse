@@ -101,6 +101,10 @@ def _snapshot_contains_restricted_data(
             "SELECT 1 FROM repositorysource WHERE "
             + " OR ".join(source_predicates) + " LIMIT 1"
         ).fetchone() if source_predicates else None)
+        paper_columns = columns("papersource")
+        paper_source = (connection.execute(
+            "SELECT 1 FROM papersource WHERE local_only = 1 LIMIT 1"
+        ).fetchone() if "local_only" in paper_columns else None)
         artifact = (connection.execute(
             "SELECT 1 FROM artifact WHERE restricted = 1 LIMIT 1"
         ).fetchone() if "restricted" in columns("artifact") else None)
@@ -117,7 +121,7 @@ def _snapshot_contains_restricted_data(
                 "WHERE secret_finding_count > 0 LIMIT 1"
             ).fetchone() if "secret_finding_count" in columns(
                 "repositorysnapshot") else None)
-        return bool(source or artifact or tag or repository_secret)
+        return bool(source or paper_source or artifact or tag or repository_secret)
     finally:
         connection.close()
 
@@ -125,11 +129,14 @@ def _snapshot_contains_restricted_data(
 def _validate_unencrypted_policy(session) -> None:
     from sqlmodel import select
 
-    from .models import Artifact, RepositorySource, Tag
+    from .models import Artifact, PaperSource, RepositorySource, Tag
 
     private_source = session.exec(select(RepositorySource).where(
         (RepositorySource.is_private == True)  # noqa: E712
         | (RepositorySource.local_only == True)  # noqa: E712
+    )).first()
+    private_paper = session.exec(select(PaperSource).where(
+        PaperSource.local_only == True  # noqa: E712
     )).first()
     restricted_artifact = session.exec(select(Artifact).where(
         Artifact.restricted == True  # noqa: E712
@@ -137,10 +144,10 @@ def _validate_unencrypted_policy(session) -> None:
     restricted_tag = session.exec(select(Tag).where(
         Tag.restricted == True  # noqa: E712
     )).first()
-    if private_source or restricted_artifact or restricted_tag:
+    if private_source or private_paper or restricted_artifact or restricted_tag:
         raise ValueError(
             "BACKUP_ENCRYPTION_KEY is required while private or local-only "
-            "repository analysis exists because the backup contains source-derived data"
+            "source analysis exists because the backup contains source-derived data"
         )
 
 
@@ -257,7 +264,7 @@ def create_backup(*, include_media: bool = True,
             raise ValueError(
                 "BACKUP_ENCRYPTION_KEY is required because the database "
                 "snapshot contains private, local-only, or restricted raw "
-                "repository data"
+                "source data"
             )
         archive = tmp / f"synapse-{stamp}.zip"
         includes = ["database", "library"]

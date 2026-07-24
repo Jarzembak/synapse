@@ -14,7 +14,9 @@ from sqlmodel import select, text
 
 from ..db import get_session
 from ..models import (
-    Artifact, Job, Project, RepositoryChunk, RepositoryFile,
+    Artifact, Job, PaperChunk, PaperChunkEmbedding, PaperMemoryRevision,
+    PaperPartEvidence, PaperSeries, PaperSeriesPart, PaperSource,
+    PaperSynthesisCache, Project, RepositoryChunk, RepositoryFile,
     RepositorySnapshot, RepositorySource,
 )
 from .. import library
@@ -264,10 +266,16 @@ def list_projects():
         projects = session.exec(select(Project).order_by(Project.created.desc())).all()
         # batch the per-project inputs so the list is a fixed handful of queries
         arts_by_pid: dict[int, set[str]] = defaultdict(set)
-        for pid, typ in session.exec(select(Artifact.project_id, Artifact.type)).all():
+        for pid, typ in session.exec(select(Artifact.project_id, Artifact.type).where(
+                Artifact.paper_series_id == None,  # noqa: E711
+                Artifact.paper_part_id == None,  # noqa: E711
+        )).all():
             arts_by_pid[pid].add(typ)
         jobs_by_pid: dict[int, list[Job]] = defaultdict(list)
-        for job in session.exec(select(Job).order_by(Job.updated)).all():
+        for job in session.exec(select(Job).where(
+                Job.paper_series_id == None,  # noqa: E711
+                Job.paper_part_id == None,  # noqa: E711
+        ).order_by(Job.updated)).all():
             jobs_by_pid[job.project_id].append(job)
         return [
             {**p.model_dump(),
@@ -289,10 +297,18 @@ def get_project(project_id: int):
         if not project:
             raise HTTPException(404)
         artifacts = session.exec(
-            select(Artifact).where(Artifact.project_id == project_id)
+            select(Artifact).where(
+                Artifact.project_id == project_id,
+                Artifact.paper_series_id == None,  # noqa: E711
+                Artifact.paper_part_id == None,  # noqa: E711
+            )
         ).all()
         jobs = session.exec(
-            select(Job).where(Job.project_id == project_id).order_by(Job.created.desc())
+            select(Job).where(
+                Job.project_id == project_id,
+                Job.paper_series_id == None,  # noqa: E711
+                Job.paper_part_id == None,  # noqa: E711
+            ).order_by(Job.created.desc())
         ).all()
         # latest job per step for the pipeline board
         latest: dict[str, Job] = {}
@@ -327,7 +343,10 @@ def get_project(project_id: int):
             (j for j in jobs if j.task == "run_all" and j.status in ("queued", "running")),
             None,
         )
-        any_active = any(j.status in ("queued", "running") for j in jobs)
+        any_active = bool(session.exec(select(Job.id).where(
+            Job.project_id == project_id,
+            Job.status.in_(("queued", "running")),
+        )).first())
         return {
             "project": project,
             "artifacts": artifacts,
@@ -358,6 +377,8 @@ def run_step(project_id: int, step: str):
             raise HTTPException(409, f"{step} does not apply to this project")
         running = session.exec(
             select(Job).where(Job.project_id == project_id, Job.task == step,
+                              Job.paper_series_id == None,  # noqa: E711
+                              Job.paper_part_id == None,  # noqa: E711
                               Job.status.in_(("queued", "running")))
         ).first()
         if running:
@@ -390,6 +411,21 @@ def run_step(project_id: int, step: str):
                 raise HTTPException(
                     409, "rerun stale prerequisite step(s) first: "
                     + ", ".join(sorted(stale_upstream)))
+        if project.source_type == "paper":
+            paper_source = session.exec(select(PaperSource).where(
+                PaperSource.project_id == project_id
+            )).first()
+            if paper_source is None:
+                raise HTTPException(409, "paper source metadata is missing")
+            if step == "paper_analyze":
+                try:
+                    from ..paper import require_analysis_ready
+
+                    require_analysis_ready(paper_source)
+                except Exception as exc:
+                    raise HTTPException(409, str(exc)) from exc
+            paper_source.privacy_locked = True
+            session.add(paper_source)
         missing = missing_deps(session, project, step)
         if missing:
             raise HTTPException(409, f"{step} requires: {', '.join(missing)}")
@@ -440,6 +476,8 @@ def run_all(project_id: int, req: RunAllRequest | None = None):
             raise HTTPException(409, "project is being deleted")
         existing = session.exec(
             select(Job).where(Job.project_id == project_id, Job.task == "run_all",
+                              Job.paper_series_id == None,  # noqa: E711
+                              Job.paper_part_id == None,  # noqa: E711
                               Job.status.in_(("queued", "running")))
         ).first()
         if existing:
@@ -453,6 +491,14 @@ def run_all(project_id: int, req: RunAllRequest | None = None):
                 raise HTTPException(
                     409, "wait for the active repository step to finish before "
                     "starting a full repository run")
+        if project.source_type == "paper":
+            paper_source = session.exec(select(PaperSource).where(
+                PaperSource.project_id == project_id
+            )).first()
+            if paper_source is None:
+                raise HTTPException(409, "paper source metadata is missing")
+            paper_source.privacy_locked = True
+            session.add(paper_source)
         options = (req or RunAllRequest()).model_dump()
         profiles = pipeline_profiles(project)
         if options.get("steps") is not None and not options["steps"]:
@@ -669,6 +715,57 @@ def delete_project(project_id: int):
             session.exec(text(
                 "DELETE FROM quickrefsource WHERE project_id=:id"
             ).bindparams(id=project_id))
+            paper_source = session.exec(select(PaperSource).where(
+                PaperSource.project_id == project_id
+            )).first()
+            paper_series = session.exec(select(PaperSeries).where(
+                PaperSeries.project_id == project_id
+            )).all()
+            paper_series_ids = [row.id for row in paper_series]
+            paper_parts = session.exec(select(PaperSeriesPart).where(
+                PaperSeriesPart.series_id.in_(paper_series_ids)
+            )).all() if paper_series_ids else []
+            paper_part_ids = [row.id for row in paper_parts]
+            if paper_series_ids:
+                session.exec(text(
+                    "DELETE FROM papermemoryrevision WHERE series_id IN ("
+                    "SELECT id FROM paperseries WHERE project_id=:id)"
+                ).bindparams(id=project_id))
+            if paper_part_ids:
+                session.exec(text(
+                    "DELETE FROM paperpartevidence WHERE part_id IN ("
+                    "SELECT p.id FROM paperseriespart p JOIN paperseries s "
+                    "ON s.id=p.series_id WHERE s.project_id=:id)"
+                ).bindparams(id=project_id))
+            for part in paper_parts:
+                session.delete(part)
+            session.flush()
+            for series in paper_series:
+                session.delete(series)
+            session.flush()
+            if paper_source:
+                chunks = session.exec(select(PaperChunk).where(
+                    PaperChunk.source_id == paper_source.id
+                )).all()
+                chunk_ids = [row.id for row in chunks]
+                if chunk_ids:
+                    for embedding in session.exec(select(PaperChunkEmbedding).where(
+                        PaperChunkEmbedding.chunk_id.in_(chunk_ids)
+                    )).all():
+                        session.delete(embedding)
+                    for chunk in chunks:
+                        session.exec(text(
+                            "DELETE FROM paper_chunk_fts WHERE chunk_id=:id"
+                        ).bindparams(id=chunk.id))
+                        session.delete(chunk)
+                    session.flush()
+                for cache in session.exec(select(PaperSynthesisCache).where(
+                    PaperSynthesisCache.source_id == paper_source.id
+                )).all():
+                    session.delete(cache)
+                session.flush()
+                session.delete(paper_source)
+                session.flush()
             repository_source = session.exec(
                 select(RepositorySource).where(
                     RepositorySource.project_id == project_id)

@@ -55,9 +55,14 @@ def _migrate(conn) -> None:
     _add_column(conn, "artifact", "provenance", "VARCHAR NOT NULL DEFAULT '{}'")
     _add_column(conn, "artifact", "restricted", "BOOLEAN NOT NULL DEFAULT 0")
     _add_column(conn, "artifact", "repository_derived", "BOOLEAN NOT NULL DEFAULT 0")
+    _add_column(conn, "artifact", "paper_series_id", "INTEGER")
+    _add_column(conn, "artifact", "paper_part_id", "INTEGER")
+    _add_column(conn, "artifact", "cloud_sync_excluded", "BOOLEAN NOT NULL DEFAULT 0")
     _add_column(conn, "tag", "restricted", "BOOLEAN NOT NULL DEFAULT 0")
     _add_column(conn, "job", "parent_job_id", "INTEGER")
     _add_column(conn, "job", "options", "VARCHAR NOT NULL DEFAULT '{}'")
+    _add_column(conn, "job", "paper_series_id", "INTEGER")
+    _add_column(conn, "job", "paper_part_id", "INTEGER")
     for name in ("started", "finished", "heartbeat"):
         _add_column(conn, "job", name, "DATETIME")
     # Development builds may already have an early repository schema.  Keep
@@ -87,6 +92,8 @@ def _migrate(conn) -> None:
         _add_column(conn, "repositorychunk", "summary_text", "VARCHAR NOT NULL DEFAULT ''")
         _add_column(conn, "repositorychunk", "summary_json", "VARCHAR NOT NULL DEFAULT '{}'")
         _add_column(conn, "repositorychunk", "summary_config_hash", "VARCHAR NOT NULL DEFAULT ''")
+    if _columns(conn, "paperseriespart"):
+        _add_column(conn, "paperseriespart", "target_minutes", "INTEGER NOT NULL DEFAULT 50")
 
     # Backfill the durable origin marker while contributor/project lineage is
     # still available. This closes the upgrade case where deleting a GitHub
@@ -106,11 +113,33 @@ def _migrate(conn) -> None:
                 "WHERE p.source_type='github')"
             )
 
+    # Schema v2 treated every job as project-root scoped.  Paper projects add
+    # independent audience-track and part runs, so replace that index before
+    # creating the three mutually exclusive scoped variants below.
+    for index_name in (
+        "uq_active_project_task",
+        "uq_active_root_task",
+        "uq_active_paper_series_task",
+        "uq_active_paper_part_task",
+        "uq_paper_memory_part_hash",
+        "uq_paper_chunk_evidence",
+    ):
+        conn.exec_driver_sql(f"DROP INDEX IF EXISTS {index_name}")
+
     indexes = [
         "CREATE UNIQUE INDEX IF NOT EXISTS uq_artifact_path_type ON artifact(path, type)",
         "CREATE UNIQUE INDEX IF NOT EXISTS uq_quickref_kind_slug ON quickref(kind, slug)",
-        "CREATE UNIQUE INDEX IF NOT EXISTS uq_active_project_task "
-        "ON job(project_id, task) WHERE status IN ('queued','running')",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_active_root_task "
+        "ON job(project_id, task) WHERE status IN ('queued','running') "
+        "AND paper_series_id IS NULL AND paper_part_id IS NULL",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_active_paper_series_task "
+        "ON job(project_id, paper_series_id, task) "
+        "WHERE status IN ('queued','running') "
+        "AND paper_series_id IS NOT NULL AND paper_part_id IS NULL",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_active_paper_part_task "
+        "ON job(project_id, paper_series_id, paper_part_id, task) "
+        "WHERE status IN ('queued','running') "
+        "AND paper_series_id IS NOT NULL AND paper_part_id IS NOT NULL",
         "CREATE UNIQUE INDEX IF NOT EXISTS uq_running_run_all "
         "ON job((1)) WHERE task='run_all' AND status='running'",
         "CREATE UNIQUE INDEX IF NOT EXISTS uq_search_chunk_position "
@@ -121,6 +150,10 @@ def _migrate(conn) -> None:
         "CREATE INDEX IF NOT EXISTS ix_artifact_restricted ON artifact(restricted)",
         "CREATE INDEX IF NOT EXISTS ix_artifact_repository_derived "
         "ON artifact(repository_derived)",
+        "CREATE INDEX IF NOT EXISTS ix_artifact_paper_scope "
+        "ON artifact(paper_series_id, paper_part_id)",
+        "CREATE INDEX IF NOT EXISTS ix_artifact_cloud_sync_excluded "
+        "ON artifact(cloud_sync_excluded)",
         "CREATE INDEX IF NOT EXISTS ix_tag_restricted ON tag(restricted)",
         "CREATE UNIQUE INDEX IF NOT EXISTS uq_repository_source_project "
         "ON repositorysource(project_id)",
@@ -138,6 +171,26 @@ def _migrate(conn) -> None:
         "ON repositorychunk(body_hash)",
         "CREATE INDEX IF NOT EXISTS ix_repository_source_cloud_purge "
         "ON repositorysource(cloud_purge_pending)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_paper_source_project "
+        "ON papersource(project_id)",
+        "CREATE INDEX IF NOT EXISTS ix_paper_source_hash "
+        "ON papersource(source_hash)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_paper_chunk_source_position "
+        "ON paperchunk(source_id, chunk_index)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_paper_chunk_source_evidence "
+        "ON paperchunk(source_id, evidence_id)",
+        "CREATE INDEX IF NOT EXISTS ix_paper_chunk_source_page "
+        "ON paperchunk(source_id, page_number)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_paper_synthesis_cache_key "
+        "ON papersynthesiscache(source_id, purpose, input_hash, config_hash)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_paper_series_audience "
+        "ON paperseries(project_id, audience)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_paper_series_part_position "
+        "ON paperseriespart(series_id, position)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_paper_memory_revision "
+        "ON papermemoryrevision(series_id, revision)",
+        "CREATE INDEX IF NOT EXISTS ix_paper_memory_part_hash "
+        "ON papermemoryrevision(part_id, content_hash)",
     ]
     for ddl in indexes:
         try:
@@ -154,6 +207,9 @@ def _migrate(conn) -> None:
         current = 1
     if current < 2:
         conn.exec_driver_sql("INSERT INTO schema_version(version) VALUES (2)")
+        current = 2
+    if current < 3:
+        conn.exec_driver_sql("INSERT INTO schema_version(version) VALUES (3)")
 
 
 def init_db() -> None:
@@ -180,6 +236,14 @@ def init_db() -> None:
                 "CREATE VIRTUAL TABLE IF NOT EXISTS repository_chunk_fts "
                 "USING fts5(body, chunk_id UNINDEXED, file_id UNINDEXED, "
                 "snapshot_id UNINDEXED, project_id UNINDEXED)"
+            )
+        )
+        conn.execute(
+            text(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS paper_chunk_fts "
+                "USING fts5(body, chunk_id UNINDEXED, source_id UNINDEXED, "
+                "project_id UNINDEXED, page_number UNINDEXED, "
+                "evidence_id UNINDEXED)"
             )
         )
 

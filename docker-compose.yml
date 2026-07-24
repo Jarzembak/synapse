@@ -70,6 +70,48 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  paper-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.paper
+    # PDF parsing is deliberately isolated and serialized: Docling's layout,
+    # table, formula, and OCR stages are CPU/RAM intensive, while downstream
+    # map/reduce and audience generation remain on the ordinary worker.
+    command: >-
+      celery -A app.tasks.celery_app.celery worker --loglevel=info
+      --concurrency=1 -Q paper
+    env_file: .env
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - LIBRARY_DIR=/data/library
+      - MEDIA_DIR=/data/media
+      - REPOSITORY_DIR=/data/repositories
+      - DB_PATH=/data/db/vst.sqlite3
+      - BACKUP_DIR=/data/backups
+      - LOG_DIR=/data/logs
+      - LOG_NAME=paper-worker
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - SYNAPSE_PAPER_WORKER=1
+      - DOCLING_ARTIFACTS_PATH=/opt/docling/models
+      - DOCLING_DEVICE=cpu
+      - DOCLING_NUM_THREADS=${PAPER_WORKER_THREADS:-4}
+      - OMP_NUM_THREADS=${PAPER_WORKER_THREADS:-4}
+      - HF_HUB_OFFLINE=1
+      - TRANSFORMERS_OFFLINE=1
+    volumes:
+      - ./data/library:/data/library
+      - ./data/media:/data/media
+      - ./data/repositories:/data/repositories
+      - ./data/db:/data/db
+      - ./data/backups:/data/backups
+      - ./data/logs:/data/logs
+      - ${HOST_MEDIA_DIR:-./data/media}:/host-media:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+    stop_grace_period: 10m
+    restart: unless-stopped
+
   beat:
     build: ./backend
     command: >-

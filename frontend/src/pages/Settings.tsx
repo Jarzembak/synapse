@@ -15,7 +15,15 @@ interface ProfileInfo { label: string; description: string; steps: string[]; cus
 interface StepInfo { name: string; label: string }
 interface SearchConfig { semantic_enabled: boolean; embedding_provider: string; embedding_model: string }
 interface ProviderModelsInfo { configured: boolean; ok: boolean; models: string[]; detail: string }
-interface SearchStatus { chunks: number; embeddings: number; semantic_enabled: boolean; embedding_model: string }
+interface SearchStatus {
+  chunks: number;
+  repository_chunks: number;
+  paper_chunks: number;
+  embeddings: number;
+  paper_embeddings: number;
+  semantic_enabled: boolean;
+  embedding_model: string;
+}
 interface BackupConfig {
   retention: number;
   schedule_hours: number;
@@ -54,14 +62,16 @@ function ModelPicker({ value, models, onCommit, onDraft }: {
         onBlur={(e) => { if (e.target.value.trim()) onCommit(e.target.value.trim()); }} />
     );
   }
-  const showCustom = customMode || !models.includes(value);
+  const listedValue = models.includes(value);
+  const showCustom = customMode || (value !== "" && !listedValue);
   return (
     <span className="row">
-      <select value={showCustom ? "__custom__" : value}
+      <select value={showCustom ? "__custom__" : listedValue ? value : ""}
         onChange={(e) => {
           if (e.target.value === "__custom__") setCustomMode(true);
           else { setCustomMode(false); onCommit(e.target.value); }
         }}>
+        <option value="" disabled>choose a model…</option>
         {models.map((m) => <option key={m} value={m}>{m}</option>)}
         <option value="__custom__">custom…</option>
       </select>
@@ -799,7 +809,13 @@ export default function Settings() {
               <td>
                 <select
                   value={cfg.provider}
-                  onChange={(e) => saveModel(fn, { ...cfg, provider: e.target.value })}
+                  onChange={(e) => {
+                    const provider = e.target.value;
+                    setFunctions((current) => ({
+                      ...current,
+                      [fn]: { provider, model: "" },
+                    }));
+                  }}
                 >
                   {[...new Set([...(providerOptions[fn] ?? providers), cfg.provider])].map((p) => (
                     <option key={p} value={p}>{p}</option>
@@ -808,6 +824,7 @@ export default function Settings() {
               </td>
               <td>
                 <ModelPicker
+                  key={cfg.provider}
                   value={cfg.model}
                   models={providerModels[cfg.provider]?.models ?? []}
                   onCommit={(model) => void saveModel(fn, { ...cfg, model })}
@@ -979,8 +996,13 @@ export default function Settings() {
           <p className="meta">Semantic search remains optional; exact full-text search always works.</p>
           {searchStatus && (
             <p className="meta">
-              {searchStatus.chunks.toLocaleString()} retrieval chunks · {searchStatus.embeddings.toLocaleString()} embedded
-              {searchStatus.semantic_enabled && searchStatus.embeddings < searchStatus.chunks
+              Artifacts: {searchStatus.chunks.toLocaleString()} chunks / {searchStatus.embeddings.toLocaleString()} embedded
+              {" · "}Repositories: {searchStatus.repository_chunks.toLocaleString()} evidence chunks
+              {" · "}Papers: {searchStatus.paper_chunks.toLocaleString()} evidence chunks / {searchStatus.paper_embeddings.toLocaleString()} embedded
+              {searchStatus.semantic_enabled && (
+                searchStatus.embeddings < searchStatus.chunks
+                || searchStatus.paper_embeddings < searchStatus.paper_chunks
+              )
                 ? " · rebuild pending or incomplete" : ""}
             </p>
           )}

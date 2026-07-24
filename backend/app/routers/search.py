@@ -10,8 +10,8 @@ from sqlmodel import select
 from .. import library, llm
 from ..db import get_session
 from ..models import (
-    Artifact, ArtifactTag, ChunkEmbedding, Job, Project, RepositoryChunk,
-    SearchChunk, Tag,
+    Artifact, ArtifactTag, ChunkEmbedding, Job, PaperChunk,
+    PaperChunkEmbedding, PaperSeries, Project, RepositoryChunk, SearchChunk, Tag,
 )
 from ..search import embedding_model, hybrid_chunks
 from ..settings_store import get_setting
@@ -40,6 +40,8 @@ def _tags_for(session, artifact_ids: list[int]) -> dict[int, list[str]]:
 def query_library(
     q: str = "", title: str = "", type: str = "", tag: str = "",
     project_id: int | None = None, project: str = "",
+    paper_series_id: int | None = None, paper_part_id: int | None = None,
+    audience: str = "",
     sort: str = "relevance", order: str = "desc", offset: int = 0, limit: int = 50,
 ):
     """Server-side pagination without the former silent 500-artifact ceiling."""
@@ -69,6 +71,15 @@ def query_library(
                 return {"items": [], "total": 0, "offset": offset, "limit": limit,
                         "facets": {"types": {}, "projects": {}, "tags": {}}}
             statement = statement.where(Artifact.project_id == matched_project.id)
+        if paper_series_id is not None:
+            statement = statement.where(Artifact.paper_series_id == paper_series_id)
+        if paper_part_id is not None:
+            statement = statement.where(Artifact.paper_part_id == paper_part_id)
+        if audience:
+            series_ids = session.exec(select(PaperSeries.id).where(
+                PaperSeries.audience == audience
+            )).all()
+            statement = statement.where(Artifact.paper_series_id.in_(series_ids))
         requested_tags = {value for value in tag.split(",") if value}
         if requested_tags:
             statement = (statement.join(ArtifactTag, ArtifactTag.artifact_id == Artifact.id)
@@ -119,7 +130,10 @@ def query_library(
 
 @router.get("/hybrid")
 def hybrid_search(q: str, type: str = "", tag: str = "",
-                  project_id: int | None = None, limit: int = 12):
+                  project_id: int | None = None, limit: int = 12,
+                  paper_series_id: int | None = None,
+                  paper_part_id: int | None = None,
+                  audience: str = ""):
     if not q.strip():
         return {"results": [], "semantic_enabled": bool(
             get_setting("search.semantic_enabled", False))}
@@ -129,6 +143,8 @@ def hybrid_search(q: str, type: str = "", tag: str = "",
             artifact_types={value for value in type.split(",") if value} or None,
             project_id=project_id,
             tags={value for value in tag.split(",") if value} or None,
+            paper_series_id=paper_series_id, paper_part_id=paper_part_id,
+            audience=audience or None,
         )
     return {"results": results,
             "semantic_enabled": bool(get_setting("search.semantic_enabled", False)),
@@ -140,6 +156,9 @@ class AskRequest(BaseModel):
     type: list[str] = Field(default_factory=list)
     tags: list[str] = Field(default_factory=list)
     project_id: int | None = None
+    paper_series_id: int | None = None
+    paper_part_id: int | None = None
+    audience: str | None = None
     limit: int = 8
 
 
@@ -157,27 +176,39 @@ def ask_library(req: AskRequest):
 
             policy_by_project[req.project_id] = repository_processing_policy(
                 req.project_id)
+        elif requested_project and requested_project.source_type == "paper":
+            with get_session() as session:
+                policy_by_project[req.project_id] = library.project_is_restricted(
+                    session, req.project_id)
     with get_session() as session:
         sources = hybrid_chunks(
             session, question, max(1, min(req.limit, 12)),
             artifact_types=set(req.type) or None, project_id=req.project_id,
             tags=set(req.tags) or None,
             force_local_semantic=any(policy_by_project.values()),
+            paper_series_id=req.paper_series_id,
+            paper_part_id=req.paper_part_id,
+            audience=req.audience,
         )
     if not sources:
         return {
             "answer": "I couldn't find enough library material to answer that question.",
             "sources": [], "grounded": True,
         }
-    repository_project_ids = {
+    source_project_ids = {
         int(source["project_id"]) for source in sources
         if source.get("project_id") is not None
     }
     with get_session() as session:
         repository_project_ids = {
-            project_id for project_id in repository_project_ids
+            project_id for project_id in source_project_ids
             if (session.get(Project, project_id)
                 and session.get(Project, project_id).source_type == "github")
+        }
+        paper_project_ids = {
+            project_id for project_id in source_project_ids
+            if (session.get(Project, project_id)
+                and session.get(Project, project_id).source_type == "paper")
         }
     if repository_project_ids:
         from ..repository import repository_processing_policy
@@ -185,6 +216,11 @@ def ask_library(req: AskRequest):
         for project_id in sorted(repository_project_ids):
             if project_id not in policy_by_project:
                 policy_by_project[project_id] = repository_processing_policy(project_id)
+    if paper_project_ids:
+        with get_session() as session:
+            for project_id in paper_project_ids:
+                policy_by_project[project_id] = library.project_is_restricted(
+                    session, project_id)
 
     context = []
     public_sources = []
@@ -196,6 +232,12 @@ def ask_library(req: AskRequest):
                 f" at {source.get('path')}:{source.get('start_line')}"
                 f"-{source.get('end_line')} ({str(source.get('commit_sha') or '')[:12]})"
             )
+        elif source.get("source_kind") == "paper":
+            section = source.get("section") or []
+            rendered_section = " > ".join(section) if isinstance(section, list) else str(section)
+            timestamp = f" at page {source.get('page')}"
+            if rendered_section:
+                timestamp += f" ({rendered_section})"
         else:
             timestamp = f" at {source['start_time']}" if source.get("start_time") else ""
         context.append(
@@ -247,12 +289,17 @@ def index_status():
     with get_session() as session:
         chunks = len(session.exec(select(SearchChunk.id)).all())
         repository_chunks = len(session.exec(select(RepositoryChunk.id)).all())
+        paper_chunks = len(session.exec(select(PaperChunk.id)).all())
         embeddings = len(session.exec(
             select(ChunkEmbedding.chunk_id).where(ChunkEmbedding.model == embedding_model())
         ).all())
+        paper_embeddings = len(session.exec(select(PaperChunkEmbedding.chunk_id).where(
+            PaperChunkEmbedding.model == embedding_model()
+        )).all())
     return {
         "chunks": chunks, "repository_chunks": repository_chunks,
-        "embeddings": embeddings,
+        "paper_chunks": paper_chunks,
+        "embeddings": embeddings, "paper_embeddings": paper_embeddings,
         "semantic_enabled": bool(get_setting("search.semantic_enabled", False)),
         "embedding_model": embedding_model(),
     }

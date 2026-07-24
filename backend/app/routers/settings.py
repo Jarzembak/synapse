@@ -12,7 +12,7 @@ from ..db import get_session
 from ..models import Job, Tag
 from ..settings_store import (get_setting, set_setting,
                               set_cloud_settings_if_no_pending_purge,
-                              set_settings_if_no_repository_jobs)
+                              set_settings_if_no_analysis_jobs)
 from ..tasks.prompts import DEFAULTS as PROMPT_DEFAULTS, PROMPT_LABELS
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
@@ -31,9 +31,9 @@ KEEP_ALIVE_RE = re.compile(
     r"^-?(\d+(\.\d+)?|(\d+(\.\d+)?(ns|us|µs|ms|s|m|h))+)$")
 
 
-def _set_repository_sensitive(values: dict[str, object]) -> None:
+def _set_analysis_sensitive(values: dict[str, object]) -> None:
     try:
-        set_settings_if_no_repository_jobs(values)
+        set_settings_if_no_analysis_jobs(values)
     except RuntimeError as exc:
         raise HTTPException(409, str(exc)) from exc
 
@@ -219,7 +219,7 @@ def set_model(function: str, req: ModelOverride):
                  f"choose from {', '.join(FUNCTION_PROVIDERS[function])}")
     if not model:
         raise HTTPException(400, "model cannot be blank")
-    _set_repository_sensitive({
+    _set_analysis_sensitive({
         f"model.{function}": {"provider": provider, "model": model}})
     return {"ok": True}
 
@@ -264,7 +264,7 @@ def set_voices(req: Voices):
     if req.gemini:
         updates["tts.gemini_voices"] = req.gemini
     if updates:
-        _set_repository_sensitive(updates)
+        _set_analysis_sensitive(updates)
     return {"ok": True}
 
 
@@ -309,9 +309,9 @@ def set_prompt(name: str, req: PromptOverride):
     if name not in PROMPT_DEFAULTS:
         raise HTTPException(400, f"unknown prompt {name!r}")
     if req.value.strip() and req.value.strip() != PROMPT_DEFAULTS[name].strip():
-        _set_repository_sensitive({f"prompt.{name}": req.value})
+        _set_analysis_sensitive({f"prompt.{name}": req.value})
     else:
-        _set_repository_sensitive({f"prompt.{name}": None})
+        _set_analysis_sensitive({f"prompt.{name}": None})
     return {"ok": True}
 
 
@@ -319,7 +319,7 @@ def set_prompt(name: str, req: PromptOverride):
 def reset_prompt(name: str):
     if name not in PROMPT_DEFAULTS:
         raise HTTPException(400, f"unknown prompt {name!r}")
-    _set_repository_sensitive({f"prompt.{name}": None})
+    _set_analysis_sensitive({f"prompt.{name}": None})
     return {"ok": True, "default": PROMPT_DEFAULTS[name]}
 
 
@@ -340,7 +340,7 @@ def set_params(function: str, req: Params):
     if function not in FUNCTION_DEFAULTS:
         raise HTTPException(400, f"unknown function {function!r}")
     payload = {k: v for k, v in req.model_dump().items() if v is not None}
-    _set_repository_sensitive({f"params.{function}": payload or None})
+    _set_analysis_sensitive({f"params.{function}": payload or None})
     return {"ok": True}
 
 
@@ -413,7 +413,7 @@ def set_advanced(group: str, req: AdvancedGroup):
     if group not in ADVANCED_DEFAULTS:
         raise HTTPException(400, f"unknown group {group!r}")
     values = _validated_advanced(group, req.values)
-    _set_repository_sensitive({f"advanced.{group}": values or None})
+    _set_analysis_sensitive({f"advanced.{group}": values or None})
     return {"ok": True}
 
 
@@ -491,7 +491,7 @@ def save_search_settings(req: SearchConfig):
     model = req.embedding_model.strip()
     if req.semantic_enabled and not model:
         raise HTTPException(422, "an embedding model is required")
-    _set_repository_sensitive({
+    _set_analysis_sensitive({
         "search.semantic_enabled": req.semantic_enabled,
         "search.embedding_provider": req.embedding_provider,
         "search.embedding_model": model or "nomic-embed-text",
