@@ -31,7 +31,9 @@ from .celery_app import celery
 from .common import auto_tag, get_project, pipeline_task, progress
 from .paper import (
     _compact_map_for_prompt, _paper_analysis_settings, hierarchical_reduce,
-    latest_analysis_bundle, map_all_evidence, paper_source_signature_from_model,
+    latest_analysis_bundle, map_all_evidence, paper_analysis_config_signature,
+    paper_analysis_lineage, paper_model_execution_signature,
+    paper_source_signature_from_model,
 )
 from .prompts import get_prompt
 
@@ -185,8 +187,9 @@ def _assigned_chunks(part_id: int) -> tuple[list[PaperChunk], list[PaperChunk], 
 
 
 def _part_context(job_id: int, project_id: int, _series_id: int,
-                  part: PaperSeriesPart,
-                  _purpose: str) -> tuple[list[dict], list[PaperChunk], list[dict]]:
+                   part: PaperSeriesPart,
+                   _purpose: str) -> tuple[
+                       list[dict], list[PaperChunk], list[dict], dict[str, str]]:
     primary, bridge, ledger = _assigned_chunks(part.id)
     chunks = primary + bridge
     if not primary:
@@ -203,7 +206,12 @@ def _part_context(job_id: int, project_id: int, _series_id: int,
         # planned audience tracks reuse identical reduction work.
         purpose="paper_part_assigned_evidence",
     )
-    return reduced, chunks, ledger
+    upstream_analysis = {
+        "analysis_config_signature": paper_analysis_config_signature(
+            project_id)["signature"],
+        "reduced_context_digest": _digest(reduced),
+    }
+    return reduced, chunks, ledger, upstream_analysis
 
 
 def _latest_memory(series_id: int, *, part_id: int | None = None) -> PaperMemoryRevision | None:
@@ -231,6 +239,8 @@ def _signature(source: PaperSource, series: PaperSeries, *, function: str,
                prompt: str, provider: str, model: str,
                evidence: Iterable[str], part: PaperSeriesPart | None = None,
                memory: PaperMemoryRevision | None = None,
+               upstream_analysis: dict[str, str] | None = None,
+               dependent_executions: dict[str, dict] | None = None,
                extra: dict | None = None) -> tuple[str, str, dict]:
     evidence_ids = sorted({str(value) for value in evidence if value})
     input_value = {
@@ -251,17 +261,31 @@ def _signature(source: PaperSource, series: PaperSeries, *, function: str,
             "part": part.user_guidance if part else "",
         },
     }
+    plan_lineage = _loads(series.plan_json, {}).get("analysis_lineage")
+    if isinstance(plan_lineage, dict) and plan_lineage:
+        input_value["plan_analysis_lineage"] = plan_lineage
+    if upstream_analysis:
+        input_value["upstream_analysis"] = upstream_analysis
+    if extra:
+        input_value["dependencies"] = extra
     config = {
         "function": function,
         "provider": provider,
         "model": model,
         "prompt_hash": _digest(prompt),
-        "params": get_setting(f"params.{function}") or {},
+        "execution": paper_model_execution_signature(
+            function,
+            provider,
+            model,
+            local_only=bool(source.local_only),
+        ),
         "paper_analysis": get_setting("paper.analysis") or {},
     }
+    if dependent_executions:
+        config["dependent_executions"] = dependent_executions
     input_hash, config_hash = _digest(input_value), _digest(config)
     provenance = {
-        "schema": 1,
+        "schema": 2,
         "source_kind": "paper",
         "source": paper_source_signature_from_model(source),
         "input": input_value,
@@ -273,6 +297,8 @@ def _signature(source: PaperSource, series: PaperSeries, *, function: str,
         },
         **(extra or {}),
     }
+    if upstream_analysis:
+        provenance["upstream_analysis"] = upstream_analysis
     return input_hash, config_hash, provenance
 
 
@@ -281,11 +307,14 @@ def _write_markdown(project: Project, source: PaperSource, series: PaperSeries,
                     function: str, prompt: str, provider: str, model: str,
                     evidence_ids: Iterable[str], part: PaperSeriesPart | None = None,
                     memory: PaperMemoryRevision | None = None,
+                    upstream_analysis: dict[str, str] | None = None,
+                    dependent_executions: dict[str, dict] | None = None,
                     extra_meta: dict | None = None) -> Artifact:
     input_hash, config_hash, provenance = _signature(
         source, series, function=function, prompt=prompt,
         provider=provider, model=model, evidence=evidence_ids,
-        part=part, memory=memory,
+        part=part, memory=memory, upstream_analysis=upstream_analysis,
+        dependent_executions=dependent_executions,
     )
     base = f"projects/{project.slug}/series/{series.id}-{series.audience}"
     rel_path = (f"{base}/part-{part.position:02d}/{artifact_type}.md"
@@ -326,6 +355,7 @@ def _generate_suite_item(job_id: int, project_id: int, series_id: int,
     bundle = latest_analysis_bundle(project_id)
     if not bundle:
         raise RuntimeError("run paper shared analysis before audience production")
+    upstream_analysis = paper_analysis_lineage(bundle)
     context = {
         "audience": series.audience,
         "target_minutes": series.target_minutes,
@@ -359,6 +389,7 @@ def _generate_suite_item(job_id: int, project_id: int, series_id: int,
         body=body, function="paper_synthesis", prompt=prompt,
         provider=provider, model=model,
         evidence_ids=bundle["leaf_evidence_ids"],
+        upstream_analysis=upstream_analysis,
         extra_meta={"citation_count": citations},
     )
     if artifact_type == "paper_study_guide":
@@ -369,7 +400,7 @@ def _generate_suite_item(job_id: int, project_id: int, series_id: int,
 def _generate_part_guide(job_id: int, project_id: int, series_id: int,
                          part_id: int) -> int:
     project, source, series, part = _series_rows(project_id, series_id, part_id)
-    reduced, chunks, ledger = _part_context(
+    reduced, chunks, ledger, upstream_analysis = _part_context(
         job_id, project_id, series_id, part, "guide")
     prompt = get_prompt("paper_part_guide")
     context = {
@@ -401,6 +432,7 @@ def _generate_part_guide(job_id: int, project_id: int, series_id: int,
         body=body, function="paper_synthesis", prompt=prompt,
         provider=provider, model=model,
         evidence_ids=[row["evidence_id"] for row in ledger],
+        upstream_analysis=upstream_analysis,
         extra_meta={"citation_count": citations, "evidence_assignment": ledger},
     )
     with get_session() as session:
@@ -561,7 +593,7 @@ def _generate_part_script(job_id: int, project_id: int, series_id: int,
     prior = _prior_memory(series_id, part.position)
     if part.position > 1 and prior is None:
         raise RuntimeError("the previous part must have a finalized memory revision")
-    reduced, chunks, ledger = _part_context(
+    reduced, chunks, ledger, upstream_analysis = _part_context(
         job_id, project_id, series_id, part, "script")
     prior_state = _loads(prior.state_json, {}) if prior else {}
     prompt = get_prompt("paper_part_script")
@@ -589,17 +621,27 @@ def _generate_part_script(job_id: int, project_id: int, series_id: int,
     body, cited, segment_count = _normalize_script(body, chunks)
     body = _render_script_links(body, project_id)
     prior_script_done = previous_status in {"done", "complete"}
+    memory_prompt = get_prompt("paper_memory")
+    with llm.project_scope(project_id, local_only=local_only):
+        memory_provider, memory_model = llm.resolve_model("paper_memory")
+    memory_execution = paper_model_execution_signature(
+        "paper_memory",
+        memory_provider,
+        memory_model,
+        local_only=local_only,
+        json_format=True,
+    )
     artifact = _write_markdown(
         project, source, series, part=part,
         artifact_type="paper_part_script",
         title=f"Part {part.position}: {part.title} — Two-host script",
         body=body, function="paper_script", prompt=prompt,
         provider=provider, model=model, evidence_ids=cited, memory=prior,
+        upstream_analysis=upstream_analysis,
+        dependent_executions={"paper_memory": memory_execution},
         extra_meta={"segments": segment_count, "evidence_assignment": ledger},
     )
-    memory_prompt = get_prompt("paper_memory")
     with llm.project_scope(project_id, local_only=local_only):
-        memory_provider, memory_model = llm.resolve_model("paper_memory")
         raw_memory = llm.complete_json(
             "paper_memory", memory_prompt,
             "PRIOR MEMORY:\n" + json.dumps(prior_state, ensure_ascii=False)
@@ -619,6 +661,8 @@ def _generate_part_script(job_id: int, project_id: int, series_id: int,
             "parent": prior.content_hash if prior else None,
             "script_hash": hashlib.sha256(body.encode("utf-8")).hexdigest(),
             "state": state,
+            "memory_prompt_hash": _digest(memory_prompt),
+            "memory_execution": memory_execution,
         })
         # Finalizing a regenerated script is itself a new immutable continuity
         # event, even when a deterministic model happened to reproduce the
@@ -725,7 +769,9 @@ def _generate_part_audio(job_id: int, project_id: int, series_id: int,
                     evidence=script_evidence_ids,
                     part=part, memory=_latest_memory(series_id, part_id=part_id),
                     extra={"script_artifact_id": script.id,
-                           "script_input_hash": script.input_hash},
+                           "script_input_hash": script.input_hash,
+                           "script_body_hash": hashlib.sha256(
+                               body.encode("utf-8")).hexdigest()},
                 )
                 artifact = library.write_artifact(
                     session, project_id=project_id, project_slug=project.slug,
@@ -736,8 +782,7 @@ def _generate_part_audio(job_id: int, project_id: int, series_id: int,
                     rel_path=f"{base}/paper_part_audio.md", media_rel=media_rel,
                     provider=provider, model=model,
                     paper_series_id=series_id, paper_part_id=part_id,
-                    input_hash_override=_digest({"script": script.input_hash,
-                                                 "body": hashlib.sha256(body.encode()).hexdigest()}),
+                    input_hash_override=input_hash,
                     config_hash_override=config_hash,
                     provenance_override=provenance,
                     extra_meta={"duration_seconds": media.duration_seconds(destination),

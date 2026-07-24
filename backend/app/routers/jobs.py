@@ -16,10 +16,18 @@ from ..tasks.orchestrate import STEP_LABELS, cancel_children, maybe_start_next_r
 router = APIRouter(prefix="/api/jobs", tags=["jobs"])
 
 
+NONSTEP_LABELS = {
+    "run_all": "Run all steps",
+    "cloud_sync_all": "Cloud sync — everything",
+    "ollama_pull": "Install local model",
+    "create_backup": "Create backup",
+    "rebuild_library": "Rebuild index from vault",
+    "rebuild_search": "Rebuild search index",
+}
+
+
 def _label(task: str) -> str:
-    if task == "run_all":
-        return "Run all steps"
-    return STEP_LABELS.get(task, task)
+    return NONSTEP_LABELS.get(task) or STEP_LABELS.get(task, task)
 
 
 def _project_titles(session) -> dict[int, str]:

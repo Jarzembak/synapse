@@ -22,6 +22,7 @@ from app.models import (
     PaperSource,
     Project,
 )
+from app.settings_store import get_setting, set_setting
 
 
 @pytest.fixture(scope="module")
@@ -79,6 +80,57 @@ def test_paper_upload_is_immutable_and_always_cloud_excluded(client):
     assert pdf.status_code == 200
     assert pdf.headers["content-type"].startswith("application/pdf")
     assert pdf.content.startswith(b"%PDF-")
+
+
+def test_shared_model_settings_are_locked_during_active_paper_jobs(client):
+    payload = _upload(client)
+    project_id = payload["project"]["id"]
+    setting_key = "model.paper_map"
+    previous = get_setting(setting_key)
+    previous_local_model = get_setting("repository.local_model")
+    with get_session() as session:
+        job = Job(project_id=project_id, task="paper_analyze", status="running")
+        session.add(job)
+        session.commit()
+        session.refresh(job)
+        job_id = job.id
+
+    try:
+        response = client.put(f"/api/settings/models/{setting_key.removeprefix('model.')}", json={
+            "provider": "ollama",
+            "model": "guard-test-model",
+        })
+        assert response.status_code == 409, response.text
+        assert "repository or paper processing" in response.text
+        assert get_setting(setting_key) == previous
+
+        # Local-only papers are pinned to repository.local_model regardless of
+        # their model-matrix choice, so that shared setting must also stay
+        # immutable for the duration of a paper job.
+        response = client.put("/api/repositories/settings", json={
+            "local_model": "guard-paper-model",
+        })
+        assert response.status_code == 409, response.text
+        assert "repository or paper processing" in response.text
+        assert get_setting("repository.local_model") == previous_local_model
+
+        # Repository scan bounds do not affect papers and remain independently
+        # editable while paper analysis is active.
+        repository_settings = client.get("/api/repositories/settings").json()
+        response = client.put("/api/repositories/settings", json={
+            "limits": {
+                "max_files": repository_settings["limits"]["max_files"],
+            },
+        })
+        assert response.status_code == 200, response.text
+    finally:
+        with get_session() as session:
+            job = session.get(Job, job_id)
+            if job:
+                session.delete(job)
+                session.commit()
+        set_setting(setting_key, previous)
+        set_setting("repository.local_model", previous_local_model)
 
 
 def test_plan_is_versioned_and_critical_coverage_is_enforced(client):

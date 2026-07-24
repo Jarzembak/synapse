@@ -83,8 +83,13 @@ def set_setting(key: str, value) -> None:
         session.commit()
 
 
-def set_settings_if_no_repository_jobs(values: dict[str, object]) -> None:
-    """Atomically freeze repository-affecting settings during active runs."""
+def _set_settings_if_no_project_jobs(
+    values: dict[str, object],
+    *,
+    source_types: tuple[str, ...],
+    scope_label: str,
+) -> None:
+    """Atomically freeze settings while an affected project is processing."""
     from sqlmodel import select, text
 
     from .db import get_session
@@ -96,21 +101,49 @@ def set_settings_if_no_repository_jobs(values: dict[str, object]) -> None:
             select(Job.id)
             .join(Project, Project.id == Job.project_id)
             .where(
-                Project.source_type == "github",
+                Project.source_type.in_(source_types),
                 Job.status.in_(("queued", "running")),
             )
         ).first()
         if active:
             session.rollback()
             raise RuntimeError(
-                "wait for active repository processing to finish before changing "
-                "repository model, prompt, or analysis settings"
+                f"wait for active {scope_label} processing to finish before "
+                "changing model, prompt, or analysis settings"
             )
         for key, value in values.items():
             row = session.get(Setting, key) or Setting(key=key)
             row.value = _dumps(key, value)
             session.add(row)
         session.commit()
+
+
+def set_settings_if_no_repository_jobs(values: dict[str, object]) -> None:
+    """Atomically freeze repository settings during affected active runs.
+
+    ``repository.local_model`` is also the enforced model for local-only paper
+    processing, so that one shared key must be frozen for both project types.
+    Repository scan limits remain repository-only.
+    """
+    shared_local_model = "repository.local_model" in values
+    _set_settings_if_no_project_jobs(
+        values,
+        source_types=(
+            ("github", "paper") if shared_local_model else ("github",)
+        ),
+        scope_label=(
+            "repository or paper" if shared_local_model else "repository"
+        ),
+    )
+
+
+def set_settings_if_no_analysis_jobs(values: dict[str, object]) -> None:
+    """Freeze shared generation settings during repository or paper runs."""
+    _set_settings_if_no_project_jobs(
+        values,
+        source_types=("github", "paper"),
+        scope_label="repository or paper",
+    )
 
 
 def set_cloud_settings_if_no_pending_purge(values: dict[str, object]) -> None:

@@ -26,6 +26,7 @@ from app.routers.papers import (
     approve_paper_plan,
     rerun_extraction,
 )
+from app.tasks import paper as paper_tasks
 from app.tasks import paper_series
 from app.settings_store import get_setting, set_setting
 
@@ -144,6 +145,208 @@ def test_local_only_paper_forces_chat_and_tts_to_local_providers(monkeypatch):
             if leftover:
                 session.delete(leftover)
                 session.commit()
+
+
+def test_paper_cache_signatures_include_effective_local_generation_settings(
+    monkeypatch,
+):
+    project_id, _series_id, _first_id, _second_id, _chunk = _series_fixture(
+        local_only=True)
+    local = {
+        "num_ctx": 8_192,
+        "think": "on",
+        "json_mode": True,
+        "keep_alive": "5m",
+        "timeout_seconds": 300,
+    }
+    monkeypatch.setattr(paper_tasks, "advanced", lambda group: dict(local))
+    monkeypatch.setattr(llm.settings, "ollama_base_url", "http://ollama:11434")
+
+    execution = paper_tasks.paper_model_execution_signature(
+        "paper_map", "ollama", "paper-local",
+        local_only=True, json_format=True,
+    )
+    assert execution["provider_settings"] == {
+        "num_ctx": llm.REPOSITORY_NUM_CTX,
+        "think": False,
+        "json_mode": True,
+    }
+
+    with get_session() as session:
+        source = session.exec(select(PaperSource).where(
+            PaperSource.project_id == project_id
+        )).one()
+        first_map_hash = paper_tasks._map_config_hash(
+            source, "ollama", "paper-local")
+    first_analysis = paper_tasks.paper_analysis_config_signature(
+        project_id)["signature"]
+
+    local["json_mode"] = False
+    with get_session() as session:
+        source = session.exec(select(PaperSource).where(
+            PaperSource.project_id == project_id
+        )).one()
+        second_map_hash = paper_tasks._map_config_hash(
+            source, "ollama", "paper-local")
+    second_analysis = paper_tasks.paper_analysis_config_signature(
+        project_id)["signature"]
+
+    assert second_map_hash != first_map_hash
+    assert second_analysis != first_analysis
+
+
+def test_paper_audio_signature_includes_voices_and_audio_tuning(monkeypatch):
+    values = {
+        "params.tts": {},
+        "tts.voices": {"HOST_A": "am_michael", "HOST_B": "af_heart"},
+        "tts.piper_voices": {
+            "HOST_A": "en_US-ryan-medium",
+            "HOST_B": "en_US-amy-medium",
+        },
+        "tts.gemini_voices": {"HOST_A": "Charon", "HOST_B": "Kore"},
+    }
+    audio = {"tts_speed": 1.0, "tts_gap": 0.4}
+    monkeypatch.setattr(
+        paper_tasks,
+        "get_setting",
+        lambda key, default=None: (
+            json.loads(json.dumps(values[key])) if key in values else default
+        ),
+    )
+    monkeypatch.setattr(
+        paper_tasks,
+        "advanced",
+        lambda group: dict(audio) if group == "audio" else {},
+    )
+
+    first = paper_tasks.paper_model_execution_signature(
+        "tts", "piper", "en_US-ryan-medium", local_only=True)
+    values["tts.piper_voices"]["HOST_A"] = "en_US-joe-medium"
+    audio["tts_speed"] = 1.1
+    second = paper_tasks.paper_model_execution_signature(
+        "tts", "piper", "en_US-ryan-medium", local_only=True)
+
+    assert first != second
+    assert first["audio"]["tts_speed"] == 1.0
+    assert first["voices"]["piper"]["HOST_A"] == "en_US-ryan-medium"
+
+
+def test_root_and_series_signatures_bind_upstream_analysis_and_dependencies(
+    monkeypatch,
+):
+    project_id, series_id, first_id, _second_id, chunk = _series_fixture(
+        local_only=False)
+    local = {
+        "num_ctx": 16_384,
+        "think": "auto",
+        "json_mode": True,
+        "keep_alive": "5m",
+        "timeout_seconds": 300,
+    }
+    monkeypatch.setattr(paper_tasks, "advanced", lambda group: dict(local))
+    with get_session() as session:
+        source = session.exec(select(PaperSource).where(
+            PaperSource.project_id == project_id
+        )).one()
+        series = session.get(PaperSeries, series_id)
+        part = session.get(PaperSeriesPart, first_id)
+
+    lineage = paper_tasks.paper_analysis_lineage({
+        "analysis_config_signature": "analysis-a",
+        "hierarchical_context": [{"summary": "reduced evidence"}],
+    })
+    changed_lineage = {**lineage, "analysis_config_signature": "analysis-b"}
+
+    root_input, root_config, root_provenance = paper_tasks._root_provenance(
+        project_id,
+        source,
+        function="paper_synthesis",
+        provider="anthropic",
+        model="claude-test",
+        prompt="shared prompt",
+        evidence_ids=[chunk.evidence_id],
+        input_hash="content-hash",
+        upstream_analysis=lineage,
+    )
+    changed_root_input, changed_root_config, _ = paper_tasks._root_provenance(
+        project_id,
+        source,
+        function="paper_synthesis",
+        provider="anthropic",
+        model="claude-test",
+        prompt="shared prompt",
+        evidence_ids=[chunk.evidence_id],
+        input_hash="content-hash",
+        upstream_analysis=changed_lineage,
+    )
+    assert root_input != changed_root_input
+    assert root_config == changed_root_config
+    assert root_provenance["upstream_analysis"] == lineage
+
+    memory_execution = paper_tasks.paper_model_execution_signature(
+        "paper_memory", "ollama", "memory-model",
+        local_only=False, json_format=True,
+    )
+    series_input, series_config, series_provenance = paper_series._signature(
+        source,
+        series,
+        function="paper_script",
+        prompt="script prompt",
+        provider="anthropic",
+        model="claude-test",
+        evidence=[chunk.evidence_id],
+        part=part,
+        upstream_analysis=lineage,
+        dependent_executions={"paper_memory": memory_execution},
+        extra={
+            "script_artifact_id": 42,
+            "script_input_hash": "script-input",
+            "script_body_hash": "script-body-a",
+        },
+    )
+    changed_series_input, changed_series_config, _ = paper_series._signature(
+        source,
+        series,
+        function="paper_script",
+        prompt="script prompt",
+        provider="anthropic",
+        model="claude-test",
+        evidence=[chunk.evidence_id],
+        part=part,
+        upstream_analysis=changed_lineage,
+        dependent_executions={"paper_memory": memory_execution},
+        extra={
+            "script_artifact_id": 42,
+            "script_input_hash": "script-input",
+            "script_body_hash": "script-body-a",
+        },
+    )
+    changed_body_input, _, _ = paper_series._signature(
+        source,
+        series,
+        function="paper_script",
+        prompt="script prompt",
+        provider="anthropic",
+        model="claude-test",
+        evidence=[chunk.evidence_id],
+        part=part,
+        upstream_analysis=lineage,
+        dependent_executions={"paper_memory": memory_execution},
+        extra={
+            "script_artifact_id": 42,
+            "script_input_hash": "script-input",
+            "script_body_hash": "script-body-b",
+        },
+    )
+    assert series_input != changed_series_input
+    assert series_input != changed_body_input
+    assert series_config == changed_series_config
+    assert series_provenance["upstream_analysis"] == lineage
+    assert (
+        series_provenance["config"]["dependent_executions"]["paper_memory"]
+        ["provider_settings"]["json_mode"]
+        is True
+    )
 
 
 def test_script_normalization_rejects_duplicate_ledgers_and_strips_spoken_links():
@@ -309,7 +512,15 @@ def test_script_regeneration_creates_revision_and_stales_current_audio_and_futur
     monkeypatch.setattr(
         paper_series,
         "_part_context",
-        lambda *_args, **_kwargs: ([{"summary": "Result", "evidence_ids": [chunk.evidence_id]}], [chunk], ledger),
+        lambda *_args, **_kwargs: (
+            [{"summary": "Result", "evidence_ids": [chunk.evidence_id]}],
+            [chunk],
+            ledger,
+            {
+                "analysis_config_signature": "fixture-analysis",
+                "reduced_context_digest": "fixture-reduction",
+            },
+        ),
     )
     monkeypatch.setattr(paper_series.llm, "resolve_model", lambda _fn: ("test", "test-model"))
     monkeypatch.setattr(

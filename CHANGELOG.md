@@ -3,6 +3,55 @@
 All notable changes to Synapse are documented here. Releases use Semantic
 Versioning (`MAJOR.MINOR.PATCH`).
 
+## [1.3.0] - 2026-07-19
+
+Model-selection and cloud-sync usability.
+
+### Added
+
+- **`openai` provider:** OpenAI's own API joins `anthropic`/`gemini` as a
+  frontier provider (`OPENAI_API_KEY` in `.env`), with its live model catalog
+  in the matrix dropdowns and a readiness check in System. `openai_compat`
+  is now explicitly for OpenAI-compatible servers that *aren't* OpenAI (it
+  flags a base URL pointing at api.openai.com and steers you to the new
+  provider).
+- **Two-way cloud sync (opt-in):** Settings → Advanced → Cloud storage gains a
+  sync-direction toggle. Two-way mode runs "Sync everything now" through
+  `rclone bisync` for the library — edits, additions, and deletions propagate
+  in both directions (newer side wins conflicts; the loser is kept with a
+  `.conflict` suffix; mass-deletion runs abort as a safety stop). The first
+  run establishes a newer-wins baseline (`--resync-mode newer`) that never
+  deletes; a fresh baseline is forced automatically when the provider, its
+  credentials, or the remote base changes. Every two-way pass finishes by
+  rebuilding the index from the vault — chained into an embedding rebuild
+  when semantic search is enabled — so pulled changes appear in the app.
+  Archived media and per-artifact auto-upload stay one-way push.
+- **Model dropdowns per provider:** every model field in the matrix (and the
+  embedding-model field) now lists what the selected provider actually offers
+  — installed models for `ollama`/`openai_compat`, the vendor's live model
+  catalog for `anthropic`/`gemini` — with a "custom…" escape hatch and a
+  refresh control (`GET /api/settings/provider-models` replaces
+  `/api/settings/local-models`).
+- **Install Ollama models from the UI:** Settings → Model matrix gains an
+  "Install an Ollama model" field (`POST /api/settings/ollama/pull`) that runs
+  `ollama pull` as a background job with live download progress in Jobs.
+- README: a top-of-page quick reference for starting the stack in CPU or GPU
+  mode (including making GPU the default via `COMPOSE_FILE` and why Docker
+  Desktop's ▶ button doesn't switch modes), and a "Configuring models"
+  rewrite clarifying that providers are server types, not locations, and
+  where Ollama models come from.
+
+### Changed
+
+- The backend image pins a current rclone release with checksum verification
+  (replacing Debian's packaged 1.60), required for reliable bisync and
+  current provider token formats.
+- Non-pipeline jobs (cloud sync, backups, index rebuilds, model installs) now
+  show human-readable labels in Jobs.
+- Two-way sync honors the repository privacy model: restricted and
+  repository-derived artifacts are excluded from bisync in both directions
+  via a filters file, and full syncs serialize with the privacy purge task.
+
 ## [1.2.0] - 2026-07-17
 
 ### Added

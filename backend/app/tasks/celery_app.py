@@ -48,7 +48,7 @@ if PAPER_WORKER:
 else:
     from . import (  # noqa: E402,F401
         ingest, transcribe, generate, repository, quickref, audio, cloud,
-        orchestrate, backup, recovery, search, paper, paper_series,
+        orchestrate, backup, recovery, search, paper, paper_series, localmodels,
     )
 
 from celery.signals import worker_ready  # noqa: E402

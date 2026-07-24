@@ -12,7 +12,7 @@ artifact type — both are fixed at creation so existing docs never orphan.
 """
 from __future__ import annotations
 
-from .settings_store import get_setting, set_settings_if_no_repository_jobs
+from .settings_store import get_setting, set_settings_if_no_analysis_jobs
 
 CUSTOM_KEY = "quickref.custom_categories"
 
@@ -35,7 +35,7 @@ def custom_categories() -> list[dict]:
 
 
 def save_custom_categories(cats: list[dict]) -> None:
-    set_settings_if_no_repository_jobs({
+    set_settings_if_no_analysis_jobs({
         CUSTOM_KEY: [
             {k: v for k, v in c.items() if k != "builtin"} for c in cats
         ],

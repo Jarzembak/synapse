@@ -1546,6 +1546,8 @@ def update_paper_plan(series_id: int, req: PaperPlanUpdateRequest):
             "topics": source_topics or prior_plan.get("topics", []),
             "critical_topics": critical_topics,
         }
+        if isinstance(prior_plan.get("analysis_lineage"), dict):
+            plan["analysis_lineage"] = prior_plan["analysis_lineage"]
         series.title = req.title.strip() if req.title is not None else series.title
         series.target_minutes = req.target_minutes or series.target_minutes
         if req.user_guidance is not None:

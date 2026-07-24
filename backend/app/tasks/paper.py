@@ -18,7 +18,7 @@ from typing import Any, Iterable
 from sqlmodel import select
 
 from .. import library, llm, paper as paper_store
-from ..config import settings
+from ..config import advanced, settings
 from ..db import get_session
 from ..models import (
     Artifact, PaperChunk, PaperPartEvidence, PaperSeries, PaperSeriesPart,
@@ -142,6 +142,65 @@ def _paper_analysis_settings() -> dict[str, int]:
     }
 
 
+def paper_model_execution_signature(
+    function: str,
+    provider: str,
+    model: str,
+    *,
+    local_only: bool,
+    json_format: bool = False,
+) -> dict[str, Any]:
+    """Describe the output-affecting settings used for one paper model call.
+
+    Paper caches cannot key only on provider/model: Ollama's context window and
+    thinking mode alter the generated evidence map, and native JSON enforcement
+    changes structured map/reduction/planning calls.  Record the *effective*
+    restricted values rather than the mutable UI values they override.
+    """
+    value: dict[str, Any] = {
+        "provider": provider,
+        "model": model,
+        "params": get_setting(f"params.{function}") or {},
+    }
+    if function == "tts":
+        value["audio"] = advanced("audio")
+        value["voices"] = {
+            "kokoro": get_setting("tts.voices") or {},
+            "piper": get_setting("tts.piper_voices") or {},
+            "gemini": get_setting("tts.gemini_voices") or {},
+        }
+    if provider not in {"ollama", "openai_compat"}:
+        return value
+
+    local = advanced("local")
+    provider_settings: dict[str, Any] = {}
+    if provider == "ollama":
+        num_ctx = int(local.get("num_ctx") or 16_384)
+        provider_settings["num_ctx"] = (
+            max(num_ctx, llm.REPOSITORY_NUM_CTX) if local_only else num_ctx
+        )
+        provider_settings["think"] = (
+            False if local_only else local.get("think", "auto")
+        )
+    if json_format:
+        provider_settings["json_mode"] = bool(local.get("json_mode", True))
+    if provider_settings:
+        value["provider_settings"] = provider_settings
+    return value
+
+
+def paper_analysis_lineage(bundle: dict[str, Any]) -> dict[str, str]:
+    """Stable upstream identity shared by root and audience-specific outputs."""
+    context_digest = str(bundle.get("hierarchical_context_digest") or "")
+    if not context_digest:
+        context_digest = _digest(bundle.get("hierarchical_context", []))
+    return {
+        "analysis_config_signature": str(
+            bundle.get("analysis_config_signature") or ""),
+        "reduced_context_digest": context_digest,
+    }
+
+
 def _ocr_languages(source: PaperSource) -> tuple[str, ...]:
     values = _json(source.ocr_languages, [])
     if not values:
@@ -202,19 +261,25 @@ def paper_analysis_config_signature(project_id: int) -> dict[str, Any]:
         "plan": _paper_prompt("paper_plan", PAPER_PLAN_PROMPT),
     }
     models: dict[str, dict[str, str]] = {}
+    executions: dict[str, dict[str, Any]] = {}
+    structured = {"paper_map", "paper_reduce", "paper_plan"}
     with llm.project_scope(project_id, local_only=local_only):
         for function in ("paper_map", "paper_reduce", "paper_synthesis", "paper_plan"):
             provider, model = llm.resolve_model(function)
             models[function] = {"provider": provider, "model": model}
+            executions[function] = paper_model_execution_signature(
+                function,
+                provider,
+                model,
+                local_only=local_only,
+                json_format=function in structured,
+            )
     value = {
-        "schema": 1,
+        "schema": 2,
         "source_parser": source_parser,
         "prompts": {name: _digest(body) for name, body in prompts.items()},
         "models": models,
-        "params": {
-            function: get_setting(f"params.{function}") or {}
-            for function in models
-        },
+        "executions": executions,
         "analysis": _paper_analysis_settings(),
     }
     return {**value, "signature": _digest(value)}
@@ -364,14 +429,18 @@ def _chunk_metadata(chunk: PaperChunk) -> dict[str, Any]:
 
 def _map_config_hash(source: PaperSource, provider: str, model: str) -> str:
     return _digest({
-        "schema": 1,
+        "schema": 2,
         "source_hash": source.source_hash,
         "parser_version": source.parser_version,
         "parser_config_hash": source.parser_config_hash,
         "prompt": _digest(_paper_prompt("paper_map", PAPER_MAP_PROMPT)),
-        "provider": provider,
-        "model": model,
-        "params": get_setting("params.paper_map") or {},
+        "execution": paper_model_execution_signature(
+            "paper_map",
+            provider,
+            model,
+            local_only=bool(source.local_only),
+            json_format=True,
+        ),
         "settings": _paper_analysis_settings(),
     })
 
@@ -567,15 +636,19 @@ def hierarchical_reduce(job_id: int, project_id: int, maps: list[dict],
         provider, model = llm.resolve_model("paper_reduce")
     limits = _paper_analysis_settings()
     config_hash = _digest({
-        "schema": 1,
+        "schema": 2,
         "purpose": purpose,
         "source_hash": source_hash,
         "parser_version": parser_version,
         "parser_config_hash": parser_config_hash,
         "prompt": _digest(_paper_prompt("paper_reduce", PAPER_REDUCE_PROMPT)),
-        "provider": provider,
-        "model": model,
-        "params": get_setting("params.paper_reduce") or {},
+        "execution": paper_model_execution_signature(
+            "paper_reduce",
+            provider,
+            model,
+            local_only=local_only,
+            json_format=True,
+        ),
         "limits": limits,
     })
     expected_ids = {value for item in maps for value in _all_evidence_ids(item)}
@@ -739,11 +812,13 @@ def build_analysis_bundle(job_id: int, project_id: int) -> dict[str, Any]:
     analysis_signature = paper_analysis_config_signature(project_id)
     importance = _evidence_importance(maps)
     topics = _topic_inventory(maps)
+    context_digest = _digest(context)
     bundle = {
-        "schema": 1,
+        "schema": 2,
         "source_hash": coverage["source_hash"],
         "analysis_config_signature": analysis_signature["signature"],
         "hierarchical_context": context,
+        "hierarchical_context_digest": context_digest,
         "leaf_evidence_ids": [item["evidence_id"] for item in maps],
         "evidence_importance": importance,
         "topics": topics,
@@ -760,9 +835,10 @@ def build_analysis_bundle(job_id: int, project_id: int) -> dict[str, Any]:
     }
     input_hash = _digest(maps)
     config_hash = _digest({
-        "schema": 1,
+        "schema": 2,
         "analysis": analysis_signature,
         "source_hash": coverage["source_hash"],
+        "reduced_context_digest": context_digest,
     })
     with get_session() as session:
         _cache_put(
@@ -822,13 +898,24 @@ def latest_analysis_bundle(project_id: int) -> dict[str, Any] | None:
 def _root_provenance(project_id: int, source: PaperSource, *, function: str,
                      provider: str, model: str, prompt: str,
                      evidence_ids: Iterable[str], input_hash: str,
-                     extra: dict | None = None) -> tuple[str, dict[str, Any]]:
+                     upstream_analysis: dict[str, str] | None = None,
+                     extra: dict | None = None) -> tuple[str, str, dict[str, Any]]:
+    if upstream_analysis:
+        input_hash = _digest({
+            "content_input_hash": input_hash,
+            "upstream_analysis": upstream_analysis,
+        })
     config = {
         "function": function,
         "provider": provider,
         "model": model,
         "prompt_hash": _digest(prompt),
-        "params": get_setting(f"params.{function}") or {},
+        "execution": paper_model_execution_signature(
+            function,
+            provider,
+            model,
+            local_only=bool(source.local_only),
+        ),
         "analysis_settings": _paper_analysis_settings(),
     }
     config_hash = _digest({
@@ -838,7 +925,7 @@ def _root_provenance(project_id: int, source: PaperSource, *, function: str,
         **config,
     })
     provenance = {
-        "schema": 1,
+        "schema": 2,
         "source_kind": "paper",
         "source": paper_source_signature_from_model(source),
         "input": {
@@ -848,9 +935,11 @@ def _root_provenance(project_id: int, source: PaperSource, *, function: str,
         "config": config,
         "output_scope": {"paper_series_id": None, "paper_part_id": None},
     }
+    if upstream_analysis:
+        provenance["upstream_analysis"] = upstream_analysis
     if extra:
         provenance.update(extra)
-    return config_hash, provenance
+    return input_hash, config_hash, provenance
 
 
 def paper_source_signature_from_model(source: PaperSource) -> dict[str, Any]:
@@ -878,10 +967,11 @@ def _write_root_artifact(
     prompt: str,
     evidence_ids: Iterable[str],
     input_hash: str,
+    upstream_analysis: dict[str, str] | None = None,
     extra_meta: dict | None = None,
     provenance_extra: dict | None = None,
 ) -> int:
-    config_hash, provenance = _root_provenance(
+    input_hash, config_hash, provenance = _root_provenance(
         project_id,
         source,
         function=function,
@@ -890,6 +980,7 @@ def _write_root_artifact(
         prompt=prompt,
         evidence_ids=evidence_ids,
         input_hash=input_hash,
+        upstream_analysis=upstream_analysis,
         extra=provenance_extra,
     )
     with get_session() as session:
@@ -1095,10 +1186,11 @@ def _synthesize_shared(
         require=True,
     )
     evidence_ids = bundle["leaf_evidence_ids"]
+    upstream_analysis = paper_analysis_lineage(bundle)
     input_hash = _digest({
         "source_hash": source.source_hash,
         "artifact_type": artifact_type,
-        "context": bundle["hierarchical_context"],
+        "reduced_context_digest": upstream_analysis["reduced_context_digest"],
         "evidence_ids": evidence_ids,
     })
     return _write_root_artifact(
@@ -1113,6 +1205,7 @@ def _synthesize_shared(
         prompt=system_prompt,
         evidence_ids=evidence_ids,
         input_hash=input_hash,
+        upstream_analysis=upstream_analysis,
         extra_meta={"citation_count": citation_count},
     )
 
@@ -1238,12 +1331,14 @@ def generate_series_plan(job_id: int, project_id: int, series_id: int,
         audience = series.audience
     with llm.project_scope(project_id, local_only=local_only):
         provider, model = llm.resolve_model("paper_plan")
+    upstream_analysis = paper_analysis_lineage(bundle)
     context = {
         "audience": audience,
         "source": paper_source_signature_from_model(source),
         "coverage": bundle["coverage"],
         "importance_counts": dict(Counter(bundle["evidence_importance"].values())),
         "hierarchical_context": bundle["hierarchical_context"],
+        "upstream_analysis": upstream_analysis,
     }
     prompt_context = _compact_map_for_prompt(context)
     if _estimated_tokens(prompt_context) > _paper_analysis_settings()["final_context_tokens"] + 500:
@@ -1252,14 +1347,19 @@ def generate_series_plan(job_id: int, project_id: int, series_id: int,
             "paper.analysis.final_context_tokens")
     input_hash = _digest(context)
     config_hash = _digest({
-        "schema": 1,
+        "schema": 2,
         "audience": audience,
         "prompt": _digest(_paper_prompt("paper_plan", PAPER_PLAN_PROMPT)),
-        "provider": provider,
-        "model": model,
-        "params": get_setting("params.paper_plan") or {},
+        "execution": paper_model_execution_signature(
+            "paper_plan",
+            provider,
+            model,
+            local_only=local_only,
+            json_format=True,
+        ),
         "source_hash": source.source_hash,
         "parser_config_hash": source.parser_config_hash,
+        "upstream_analysis": upstream_analysis,
     })
     with get_session() as session:
         cached = _cache_get(
@@ -1303,6 +1403,7 @@ def generate_series_plan(job_id: int, project_id: int, series_id: int,
         importance=bundle["evidence_importance"],
         topics=bundle.get("topics", []),
     )
+    plan["analysis_lineage"] = upstream_analysis
     with get_session() as session:
         series = session.get(PaperSeries, series_id)
         old_parts = session.exec(select(PaperSeriesPart).where(
@@ -1446,12 +1547,14 @@ def paper_analyze(job_id: int, project_id: int):
         source = paper_store.paper_source_for_project(session, project_id)
         chunks = session.exec(select(PaperChunk).where(
             PaperChunk.source_id == source.id).order_by(PaperChunk.chunk_index)).all()
+    upstream_analysis = paper_analysis_lineage(bundle)
     coverage_body = _coverage_body(source, bundle, chunks)
     coverage_input_hash = _digest({
         "source_hash": source.source_hash,
         "coverage": bundle["coverage"],
         "importance": bundle["evidence_importance"],
         "acknowledged_pages": _json(source.acknowledged_pages, []),
+        "upstream_analysis": upstream_analysis,
     })
     coverage_id = _write_root_artifact(
         project_id,
@@ -1465,6 +1568,7 @@ def paper_analyze(job_id: int, project_id: int):
         prompt="deterministic coverage report schema 1",
         evidence_ids=bundle["leaf_evidence_ids"],
         input_hash=coverage_input_hash,
+        upstream_analysis=upstream_analysis,
         extra_meta={"coverage": bundle["coverage"]},
     )
     shared_ids = {

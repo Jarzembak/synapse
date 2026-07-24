@@ -14,8 +14,16 @@ interface VoicesState { kokoro: Record<string, string>; piper: Record<string, st
 interface ProfileInfo { label: string; description: string; steps: string[]; custom?: boolean }
 interface StepInfo { name: string; label: string }
 interface SearchConfig { semantic_enabled: boolean; embedding_provider: string; embedding_model: string }
-interface LocalModelsInfo { configured: boolean; ok: boolean; models: string[]; detail: string }
-interface SearchStatus { chunks: number; embeddings: number; semantic_enabled: boolean; embedding_model: string }
+interface ProviderModelsInfo { configured: boolean; ok: boolean; models: string[]; detail: string }
+interface SearchStatus {
+  chunks: number;
+  repository_chunks: number;
+  paper_chunks: number;
+  embeddings: number;
+  paper_embeddings: number;
+  semantic_enabled: boolean;
+  embedding_model: string;
+}
 interface BackupConfig {
   retention: number;
   schedule_hours: number;
@@ -30,7 +38,53 @@ interface CloudState {
   config: Record<string, string>;
   remote_base: string;
   auto: boolean;
+  mode: string;
   last_sync: { status: string; detail: string; at: string } | null;
+}
+
+// A model field that offers the provider's actual models as a dropdown while
+// still allowing any custom name. Falls back to a plain input when the
+// provider's model list isn't available (server down, key not set).
+function ModelPicker({ value, models, onCommit, onDraft }: {
+  value: string;
+  models: string[];
+  onCommit: (model: string) => void;   // save (dropdown pick / input blur)
+  onDraft: (model: string) => void;    // local state only (while typing)
+}) {
+  // Explicit state, not derived from value∈models: deriving would unmount the
+  // input mid-typing the moment a draft matches a listed model, swallowing
+  // the blur that commits it.
+  const [customMode, setCustomMode] = useState(false);
+  if (models.length === 0) {
+    return (
+      <input value={value} placeholder="model name"
+        onChange={(e) => onDraft(e.target.value)}
+        onBlur={(e) => { if (e.target.value.trim()) onCommit(e.target.value.trim()); }} />
+    );
+  }
+  const listedValue = models.includes(value);
+  const showCustom = customMode || (value !== "" && !listedValue);
+  return (
+    <span className="row">
+      <select value={showCustom ? "__custom__" : listedValue ? value : ""}
+        onChange={(e) => {
+          if (e.target.value === "__custom__") setCustomMode(true);
+          else { setCustomMode(false); onCommit(e.target.value); }
+        }}>
+        <option value="" disabled>choose a model…</option>
+        {models.map((m) => <option key={m} value={m}>{m}</option>)}
+        <option value="__custom__">custom…</option>
+      </select>
+      {showCustom && (
+        <input value={value} placeholder="model name"
+          onChange={(e) => onDraft(e.target.value)}
+          onBlur={(e) => {
+            const draft = e.target.value.trim();
+            if (draft) { onCommit(draft); setCustomMode(false); }
+          }} />
+      )}
+    </span>
+  );
 }
 
 const FN_LABELS: Record<string, string> = {
@@ -80,7 +134,8 @@ export default function Settings() {
   const [functions, setFunctions] = useState<Record<string, ModelCfg>>({});
   const [providers, setProviders] = useState<string[]>([]);
   const [providerOptions, setProviderOptions] = useState<Record<string, string[]>>({});
-  const [localModels, setLocalModels] = useState<Record<string, LocalModelsInfo>>({});
+  const [providerModels, setProviderModels] = useState<Record<string, ProviderModelsInfo>>({});
+  const [pullName, setPullName] = useState("");
   const [voices, setVoices] = useState<VoicesState | null>(null);
   const [profiles, setProfiles] = useState<Record<string, ProfileInfo>>({});
   const [steps, setSteps] = useState<StepInfo[]>([]);
@@ -122,7 +177,7 @@ export default function Settings() {
           setProviders(r.providers);
           setProviderOptions(r.provider_options);
         }),
-      api<Record<string, LocalModelsInfo>>("/settings/local-models").then(setLocalModels),
+      api<Record<string, ProviderModelsInfo>>("/settings/provider-models").then(setProviderModels),
       api<VoicesState>("/settings/voices").then(setVoices),
       api<Record<string, ProfileInfo>>("/settings/profiles").then(setProfiles),
       api<StepInfo[]>("/projects/steps").then(setSteps),
@@ -238,14 +293,16 @@ export default function Settings() {
     } catch (e: any) { flash(`delete failed: ${e.message}`, true); }
   }
 
-  async function saveSearch() {
-    if (!searchConfig) return;
+  // every control in Library intelligence saves on change (same self-saving
+  // behavior as the model matrix), so this takes the next config explicitly
+  async function saveSearchConfig(next: SearchConfig) {
+    setSearchConfig(next);
     try {
-      await api("/settings/search", { method: "PUT", body: JSON.stringify(searchConfig) });
+      await api("/settings/search", { method: "PUT", body: JSON.stringify(next) });
       setSearchStatus((current) => current && ({
         ...current,
-        semantic_enabled: searchConfig.semantic_enabled,
-        embedding_model: searchConfig.embedding_model,
+        semantic_enabled: next.semantic_enabled,
+        embedding_model: next.embedding_model,
       }));
       flash("library search settings saved");
     } catch (e: any) { flash(`save failed: ${e.message}`, true); }
@@ -400,6 +457,7 @@ export default function Settings() {
           config: cloudEdit,
           remote_base: cloud.remote_base,
           auto: cloud.auto,
+          mode: cloud.mode,
         }),
       });
       const refreshed = await api<CloudState>("/settings/cloud");
@@ -416,6 +474,22 @@ export default function Settings() {
     } catch (e: any) {
       flash(`sync failed: ${e.message}`, true);
     }
+  }
+
+  const refreshProviderModels = () =>
+    api<Record<string, ProviderModelsInfo>>("/settings/provider-models")
+      .then(setProviderModels).catch(() => {});
+
+  async function pullOllamaModel() {
+    const model = pullName.trim();
+    if (!model) return;
+    try {
+      await api("/settings/ollama/pull", {
+        method: "POST", body: JSON.stringify({ model }),
+      });
+      setPullName("");
+      flash(`installing ${model} — progress shows in Jobs; use ⟳ when it finishes`);
+    } catch (e: any) { flash(`install failed: ${e.message}`, true); }
   }
 
   // tag ops refresh only the tag list — a full load() would clobber unsaved
@@ -713,13 +787,18 @@ export default function Settings() {
 
       <h2>Model matrix</h2>
       <p className="meta">
-        Which model runs each pipeline function. Providers: <b>ollama</b> = local
-        (or a remote box via OLLAMA_BASE_URL), <b>openai_compat</b> = any local
-        OpenAI-compatible server — LM Studio, llama.cpp, vLLM, LocalAI — via
-        OPENAI_COMPAT_BASE_URL, <b>anthropic</b>/<b>gemini</b> = frontier APIs.
-        ASR providers: <b>faster-whisper</b> (local) or <b>gemini</b>. TTS providers:
-        <b> Piper</b>/<b>Kokoro</b> (local) or <b>gemini</b>. Each row only lists
-        providers that support that function; local rows suggest installed models.
+        Which model runs each pipeline function. A provider is a <i>kind of
+        server</i>, not a location: <b>ollama</b> talks to an Ollama server
+        (the bundled container, or any box via OLLAMA_BASE_URL);{" "}
+        <b>openai_compat</b> talks to an OpenAI-compatible server that{" "}
+        <i>isn't</i> OpenAI itself — LM Studio, llama.cpp, vLLM, LocalAI —
+        local or remote, via OPENAI_COMPAT_BASE_URL;{" "}
+        <b>anthropic</b>/<b>gemini</b>/<b>openai</b> are the vendors' cloud
+        APIs. The model dropdown lists what the selected provider actually
+        offers (installed models for local servers; the vendor's catalog for
+        cloud APIs) — or pick "custom…" to type any name. ASR providers:{" "}
+        <b>faster-whisper</b> (local) or <b>gemini</b>. TTS:{" "}
+        <b>Piper</b>/<b>Kokoro</b> (local) or <b>gemini</b>.
       </p>
       <table className="list">
         <thead><tr><th>Function</th><th>Provider</th><th>Model</th></tr></thead>
@@ -730,7 +809,13 @@ export default function Settings() {
               <td>
                 <select
                   value={cfg.provider}
-                  onChange={(e) => saveModel(fn, { ...cfg, provider: e.target.value })}
+                  onChange={(e) => {
+                    const provider = e.target.value;
+                    setFunctions((current) => ({
+                      ...current,
+                      [fn]: { provider, model: "" },
+                    }));
+                  }}
                 >
                   {[...new Set([...(providerOptions[fn] ?? providers), cfg.provider])].map((p) => (
                     <option key={p} value={p}>{p}</option>
@@ -738,37 +823,46 @@ export default function Settings() {
                 </select>
               </td>
               <td>
-                <input
+                <ModelPicker
+                  key={cfg.provider}
                   value={cfg.model}
-                  list={LOCAL_PROVIDERS.includes(cfg.provider)
-                    ? `local-models-${cfg.provider}` : undefined}
-                  onChange={(e) => setFunctions((current) => ({
-                    ...current, [fn]: { ...cfg, model: e.target.value },
+                  models={providerModels[cfg.provider]?.models ?? []}
+                  onCommit={(model) => void saveModel(fn, { ...cfg, model })}
+                  onDraft={(model) => setFunctions((current) => ({
+                    ...current, [fn]: { ...cfg, model },
                   }))}
-                  onBlur={(e) => void saveModel(fn, { ...cfg, model: e.target.value })}
                 />
               </td>
             </tr>
           ))}
         </tbody>
       </table>
-      {LOCAL_PROVIDERS.map((p) => (
-        <datalist id={`local-models-${p}`} key={p}>
-          {(localModels[p]?.models ?? []).map((m) => <option key={m} value={m} />)}
-        </datalist>
-      ))}
-      {Object.keys(localModels).length > 0 && (
-        <p className="meta">
-          Local servers:{" "}
-          {LOCAL_PROVIDERS.map((p) => {
-            const info = localModels[p];
-            if (!info) return null;
-            const status = !info.configured ? "not configured"
-              : info.ok ? `${info.models.length} model(s)` : `unreachable — ${info.detail}`;
-            return <span key={p}><b>{p}</b>: {status}{p === "ollama" ? " · " : ""}</span>;
-          })}
-        </p>
-      )}
+      <p className="meta">
+        {LOCAL_PROVIDERS.concat(["anthropic", "gemini", "openai"]).map((p) => {
+          const info = providerModels[p];
+          if (!info) return null;
+          const status = !info.configured ? "not configured"
+            : info.ok ? `${info.models.length} model(s)`
+            : `unreachable — ${info.detail.slice(0, 160)}`;
+          return <span key={p}><b>{p}</b>: {status} · </span>;
+        })}
+        <button type="button" className="linkish" title="Refresh model lists"
+          onClick={() => void refreshProviderModels()}>⟳ refresh</button>
+      </p>
+      <div className="row">
+        <input value={pullName} placeholder="Install an Ollama model, e.g. qwen3:8b"
+          onChange={(e) => setPullName(e.target.value)}
+          onKeyDown={(e) => { if (e.key === "Enter") void pullOllamaModel(); }} />
+        <button type="button" onClick={() => void pullOllamaModel()}>Install</button>
+      </div>
+      <p className="meta">
+        Ollama models must be downloaded before a step can use them. They come
+        from Ollama's registry — browse{" "}
+        <a href="https://ollama.com/library" target="_blank" rel="noreferrer">
+          ollama.com/library</a> for names and sizes ("name:tag", e.g.{" "}
+        <code>qwen3:8b</code>). Installs run as background jobs (see Jobs) and
+        land on whichever Ollama server OLLAMA_BASE_URL points at.
+      </p>
 
       <h2>Podcast voices</h2>
       <p className="meta">
@@ -872,14 +966,14 @@ export default function Settings() {
         <div className="knobs">
           <label className="checkline">
             <input type="checkbox" checked={searchConfig.semantic_enabled}
-              onChange={(event) => setSearchConfig({
+              onChange={(event) => void saveSearchConfig({
                 ...searchConfig, semantic_enabled: event.target.checked,
               })} />
             blend semantic similarity with exact text search
           </label>
           <label>Embedding provider
             <select value={searchConfig.embedding_provider}
-              onChange={(event) => setSearchConfig({
+              onChange={(event) => void saveSearchConfig({
                 ...searchConfig, embedding_provider: event.target.value,
               })}>
               <option value="ollama">ollama</option>
@@ -887,14 +981,14 @@ export default function Settings() {
             </select>
           </label>
           <label>Embedding model
-            <input value={searchConfig.embedding_model}
-              list={`local-models-${searchConfig.embedding_provider}`}
-              onChange={(event) => setSearchConfig({
-                ...searchConfig, embedding_model: event.target.value,
-              })} />
+            <ModelPicker
+              value={searchConfig.embedding_model}
+              models={providerModels[searchConfig.embedding_provider]?.models ?? []}
+              onCommit={(model) => void saveSearchConfig({ ...searchConfig, embedding_model: model })}
+              onDraft={(model) => setSearchConfig({ ...searchConfig, embedding_model: model })}
+            />
           </label>
           <div className="row">
-            <button type="button" onClick={() => void saveSearch()}>Save search settings</button>
             <button type="button" onClick={() => void rebuildSearchIndex()} disabled={reindexing}>
               {reindexing ? "Queuing…" : "Rebuild search index"}
             </button>
@@ -902,8 +996,13 @@ export default function Settings() {
           <p className="meta">Semantic search remains optional; exact full-text search always works.</p>
           {searchStatus && (
             <p className="meta">
-              {searchStatus.chunks.toLocaleString()} retrieval chunks · {searchStatus.embeddings.toLocaleString()} embedded
-              {searchStatus.semantic_enabled && searchStatus.embeddings < searchStatus.chunks
+              Artifacts: {searchStatus.chunks.toLocaleString()} chunks / {searchStatus.embeddings.toLocaleString()} embedded
+              {" · "}Repositories: {searchStatus.repository_chunks.toLocaleString()} evidence chunks
+              {" · "}Papers: {searchStatus.paper_chunks.toLocaleString()} evidence chunks / {searchStatus.paper_embeddings.toLocaleString()} embedded
+              {searchStatus.semantic_enabled && (
+                searchStatus.embeddings < searchStatus.chunks
+                || searchStatus.paper_embeddings < searchStatus.paper_chunks
+              )
                 ? " · rebuild pending or incomplete" : ""}
             </p>
           )}
@@ -1377,6 +1476,27 @@ export default function Settings() {
                     onChange={(e) => setCloud({ ...cloud, auto: e.target.checked })} />
                   auto-upload each artifact when it's produced
                 </label>
+                <label>Sync direction ("Sync everything now")
+                  <select value={cloud.mode}
+                    onChange={(e) => setCloud({ ...cloud, mode: e.target.value })}>
+                    <option value="push">One-way: local → cloud (default)</option>
+                    <option value="bisync">Two-way: local ↔ cloud (library only)</option>
+                  </select>
+                </label>
+                {cloud.mode === "bisync" && (
+                  <p className="meta">
+                    Two-way sync (rclone bisync) propagates edits <b>and
+                    deletions in both directions</b> for the library — deleting
+                    a document in your cloud folder deletes it here on the next
+                    sync (a run that would remove more than half of either side
+                    aborts as a safety stop). Conflicting edits keep the newer
+                    version; the older is kept renamed with a ".conflict"
+                    suffix. The first two-way run establishes a baseline, and
+                    every run finishes by rebuilding the search index from the
+                    vault. Archived media and per-artifact auto-upload remain
+                    one-way (push).
+                  </p>
+                )}
               </>
             )}
             <div className="row">
