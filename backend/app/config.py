@@ -29,6 +29,20 @@ class Settings(BaseSettings):
     gemini_api_key: str = ""
     elevenlabs_api_key: str = ""
     allow_private_urls: bool = False
+    # Exact browser origin for the frontend proxy and authenticated-media
+    # controls. Never derive this boundary from request Host headers.
+    synapse_public_origin: str = "http://localhost:8080"
+    # Optional concurrency-one Selenium sidecar used for interactive media
+    # login. WebDriver and noVNC remain private on the Compose network; the API
+    # exposes a short-lived, project-bound viewer relay.
+    auth_browser_webdriver_url: str = ""
+    auth_browser_view_url: str = "http://auth-browser:7900"
+    auth_browser_session_minutes: int = 30
+    # URL-driven yt-dlp traffic is routed through the same DNS-pinning,
+    # public-address-only boundary as the authentication browser. Compose sets
+    # this automatically; an empty value keeps non-Docker development working,
+    # but saved credentials then fail closed instead of being sent directly.
+    media_egress_proxy_url: str = ""
 
     library_dir: Path = Path("./data/library")
     media_dir: Path = Path("./data/media")

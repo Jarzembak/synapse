@@ -321,6 +321,7 @@ wcwidth==0.8.2
     # via prompt-toolkit
 websockets==16.1
     # via
+    #   -r requirements.txt
     #   google-genai
     #   uvicorn
 yt-dlp==2026.7.4

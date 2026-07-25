@@ -1,5 +1,5 @@
 import { lazy, Suspense } from "react";
-import { Link, NavLink, Route, Routes, useLocation } from "react-router-dom";
+import { Link, NavLink, Route, Routes, useLocation } from "react-router";
 import ErrorBoundary from "./components/ErrorBoundary";
 import JobTicker from "./components/JobTicker";
 import ThemeSelect from "./components/ThemeSelect";

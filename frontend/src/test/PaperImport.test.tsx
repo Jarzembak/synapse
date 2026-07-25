@@ -1,6 +1,6 @@
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter } from "react-router";
 import { describe, expect, it } from "vitest";
 import PaperImport from "../pages/PaperImport";
 
@@ -8,7 +8,7 @@ describe("PaperImport", () => {
   it("starts with safe dense-paper defaults and supports independent audience selection", async () => {
     const user = userEvent.setup();
     render(
-      <MemoryRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
+      <MemoryRouter>
         <PaperImport />
       </MemoryRouter>,
     );

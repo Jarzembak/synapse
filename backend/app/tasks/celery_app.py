@@ -68,12 +68,16 @@ def _reset_orphaned_jobs(**_kwargs):
 
     from ..db import get_session
     from ..models import Job, utcnow
+    from ..task_names import MEDIA_AUTH_LEASE_TASK
 
     try:
         with get_session() as session:
             owned_task = (
                 Job.task == "paper_extract" if PAPER_WORKER
-                else Job.task != "paper_extract"
+                else Job.task.not_in((
+                    "paper_extract",
+                    MEDIA_AUTH_LEASE_TASK,
+                ))
             )
             stale = session.exec(select(Job).where(
                 Job.status == "running", owned_task,
@@ -88,7 +92,11 @@ def _reset_orphaned_jobs(**_kwargs):
             # from durable queued Celery messages by their empty celery id.
             ghost_scope = (
                 Job.task == "paper_extract" if PAPER_WORKER
-                else Job.task.not_in(("run_all", "paper_extract"))
+                else Job.task.not_in((
+                    "run_all",
+                    "paper_extract",
+                    MEDIA_AUTH_LEASE_TASK,
+                ))
             )
             ghosts = session.exec(select(Job).where(
                 Job.status == "queued", ghost_scope, Job.celery_id == "",

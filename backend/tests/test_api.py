@@ -7,11 +7,21 @@ from app.main import app
 from app.db import get_session
 from app import library
 from app.models import Job, Project
+from app.trusted_origin import (
+    TRUSTED_ORIGIN_HEADER,
+    TRUSTED_REQUEST_HOST_HEADER,
+)
+
+
+TRUSTED_HEADERS = {
+    TRUSTED_ORIGIN_HEADER: "http://localhost:8080",
+    TRUSTED_REQUEST_HOST_HEADER: "localhost:8080",
+}
 
 
 @pytest.fixture(scope="module")
 def client():
-    with TestClient(app) as c:
+    with TestClient(app, headers=TRUSTED_HEADERS) as c:
         yield c
 
 
@@ -41,6 +51,31 @@ def test_health_and_seeded_tags(client):
     assert client.get("/api/health").json() == {"ok": True}
     tags = client.get("/api/tags").json()
     assert any(t["name"] == "nmap" for t in tags)
+
+
+def test_global_api_requires_trusted_frontend_and_canonical_host(client):
+    assert client.get(
+        "/api/health",
+        headers={
+            TRUSTED_ORIGIN_HEADER: "",
+            TRUSTED_REQUEST_HOST_HEADER: "",
+        },
+    ).json() == {"ok": True}
+    assert client.get(
+        "/api/projects",
+        headers={
+            TRUSTED_ORIGIN_HEADER: "",
+            TRUSTED_REQUEST_HOST_HEADER: "",
+        },
+    ).status_code == 403
+    assert client.get(
+        "/api/projects",
+        headers={
+            TRUSTED_ORIGIN_HEADER: "http://localhost:8080",
+            TRUSTED_REQUEST_HOST_HEADER: "attacker.example",
+        },
+    ).status_code == 403
+    assert client.get("/api/projects").status_code == 200
 
 
 def test_project_create_and_steps(client):
@@ -888,6 +923,82 @@ def test_reset_orphaned_jobs_unblocks_queue(client):
     with get_session() as session:
         job = session.get(Job, jid)
         assert job.status == "error" and "interrupted" in job.error
+
+
+def test_reset_orphaned_jobs_preserves_media_auth_leases(
+    client, monkeypatch,
+):
+    """Worker recovery must not release a live browser-auth concurrency lease."""
+    import uuid
+
+    from app import media_auth, repository
+    from app.models import Job, Project
+    from app.tasks import cloud, orchestrate
+    from app.tasks.celery_app import _reset_orphaned_jobs
+
+    # Keep this regression focused on row classification, not unrelated
+    # repository/cloud/run-all startup recovery.
+    monkeypatch.setattr(repository, "cleanup_repository_staging", lambda: None)
+    monkeypatch.setattr(cloud, "enqueue_pending_privacy_purges", lambda: None)
+    monkeypatch.setattr(orchestrate, "maybe_start_next_run_all", lambda: None)
+
+    suffix = uuid.uuid4().hex
+    with get_session() as session:
+        running_project = Project(
+            slug=f"auth-reset-running-{suffix}",
+            title="Running auth lease",
+            source="https://example.com/running",
+            source_type="url",
+        )
+        queued_project = Project(
+            slug=f"auth-reset-queued-{suffix}",
+            title="Queued auth lease",
+            source="https://example.com/queued",
+            source_type="url",
+        )
+        session.add(running_project)
+        session.add(queued_project)
+        session.commit()
+        session.refresh(running_project)
+        session.refresh(queued_project)
+        running = Job(
+            project_id=running_project.id,
+            task=media_auth.LEASE_TASK,
+            status="running",
+            celery_id="browser-auth-session",
+        )
+        queued = Job(
+            project_id=queued_project.id,
+            task=media_auth.LEASE_TASK,
+            status="queued",
+            celery_id="",
+        )
+        session.add(running)
+        session.add(queued)
+        session.commit()
+        session.refresh(running)
+        session.refresh(queued)
+        job_ids = (running.id, queued.id)
+
+    try:
+        _reset_orphaned_jobs()
+
+        with get_session() as session:
+            running = session.get(Job, job_ids[0])
+            queued = session.get(Job, job_ids[1])
+            assert running.status == "running"
+            assert running.error == ""
+            assert queued.status == "queued"
+            assert queued.error == ""
+    finally:
+        # Do not leave active lease fixtures that could affect later tests in
+        # this module's shared database.
+        with get_session() as session:
+            for job_id in job_ids:
+                job = session.get(Job, job_id)
+                if job:
+                    session.delete(job)
+            session.commit()
 
 
 def test_tag_text_sanitizes(client, monkeypatch):

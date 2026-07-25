@@ -11,6 +11,8 @@ from pathlib import Path
 from ..config import settings
 from ..db import get_session
 from .. import library, llm
+from ..media_auth import apply_download_auth
+from ..security import redact_url
 from .celery_app import celery
 from .common import auto_tag, get_project, pipeline_task, progress
 from .ingest import cookies_path, source_audio
@@ -70,17 +72,18 @@ def fetch_site_captions(url: str, project_slug: str) -> str | None:
         "noplaylist": True,  # captions for the submitted video only
         "socket_timeout": 30,
     }
-    ck = cookies_path(project_slug)
-    if ck.exists():
-        opts["cookiefile"] = str(ck)
+    effective_url = apply_download_auth(opts, project_slug, url)
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
-            ydl.download([url])
+            ydl.download([effective_url])
     except Exception as e:
         import logging
 
         logging.getLogger(__name__).info(
-            "no site captions for %s (falling back to ASR): %s", url, e)
+            "no site captions for %s (falling back to ASR; %s)",
+            redact_url(url),
+            type(e).__name__,
+        )
         return None
     vtts = sorted(wd.glob("captions*.vtt"))
     if not vtts:
@@ -229,7 +232,10 @@ def transcribe(job_id: int, project_id: int):
             type="transcript",
             title=f"Transcript — {project.title}",
             body=body,
-            extra_meta={"transcript_source": source, "source_url": project.source},
+            extra_meta={
+                "transcript_source": source,
+                "source_url": redact_url(project.source),
+            },
         )
         project.status = "transcribed"
         session.add(project)

@@ -56,6 +56,21 @@ export interface Project {
   paper?: PaperSource | null;
 }
 
+export interface MediaAuthStatus {
+  available: boolean;
+  applicable: boolean;
+  active: boolean;
+  cleanup_pending?: boolean;
+  browser_url?: string | null;
+  started_at?: string | null;
+  expires_at?: string | null;
+  cookies_present: boolean;
+  captured_at?: string | null;
+  authenticated_host?: string | null;
+  cookie_count?: number;
+  project_id: number;
+}
+
 export interface Artifact {
   id: number;
   project_id: number | null;

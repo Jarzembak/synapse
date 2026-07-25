@@ -1,7 +1,7 @@
 services:
   api:
     build: ./backend
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --no-access-log
     env_file: .env
     environment:
       - REDIS_URL=redis://redis:6379/0
@@ -14,6 +14,11 @@ services:
       - LOG_DIR=/data/logs
       - LOG_NAME=api
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - SYNAPSE_PUBLIC_ORIGIN=${SYNAPSE_PUBLIC_ORIGIN:-http://localhost:8080}
+      - AUTH_BROWSER_WEBDRIVER_URL=http://auth-bridge:4444
+      - AUTH_BROWSER_VIEW_URL=http://auth-bridge:7900
+      - AUTH_BROWSER_SESSION_MINUTES=${AUTH_BROWSER_SESSION_MINUTES:-30}
+      - MEDIA_EGRESS_PROXY_URL=http://auth-egress:8899
     volumes:
       - ./data/library:/data/library
       - ./data/media:/data/media
@@ -25,6 +30,12 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+      auth-egress:
+        condition: service_healthy
+    networks:
+      - default
+      - media-egress
+      - auth-control
     healthcheck:
       test:
         - CMD
@@ -35,6 +46,86 @@ services:
       timeout: 5s
       retries: 3
       start_period: 15s
+    restart: unless-stopped
+
+  # Fixed-port bridge is the browser network's only path back toward Synapse.
+  # It exposes WebDriver/noVNC to the API but cannot forward arbitrary traffic.
+  auth-bridge:
+    build: ./backend
+    command: python -m app.auth_bridge
+    user: "65534:65534"
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    networks:
+      - auth-control
+      - auth-browser
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    restart: unless-stopped
+
+  # The renderer is forced through this public-Internet-only proxy. DNS is
+  # resolved once here, every answer must be globally routable, and the socket
+  # connects to the vetted numeric IP to prevent DNS rebinding.
+  auth-egress:
+    build: ./backend
+    command: python -m app.auth_egress
+    user: "65534:65534"
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    environment:
+      - AUTH_EGRESS_PORT=8899
+      - AUTH_EGRESS_CONNECTION_TIMEOUT_SECONDS=${MEDIA_EGRESS_CONNECTION_TIMEOUT_SECONDS:-21600}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    expose:
+      - "8899"
+    networks:
+      - auth-browser
+      - media-egress
+      - auth-public
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import socket; s=socket.create_connection(('127.0.0.1',8899),3); s.close()
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+  # Disposable, concurrency-one browser used only when a URL project needs an
+  # interactive login. It can see only the filtered proxy and fixed bridge;
+  # its profile, X display, and viewer connections are discarded after one
+  # session by restarting the container.
+  auth-browser:
+    image: selenium/standalone-chromium:4.46.0-20260707@sha256:3400b92f1cddb2dfaaf358654e8f7d83d7be45192fb73c5f28c25faa28d36504
+    shm_size: 2gb
+    environment:
+      - SE_NODE_MAX_SESSIONS=1
+      - SE_NODE_SESSION_TIMEOUT=${AUTH_BROWSER_SESSION_SECONDS:-1800}
+      - SE_SESSION_REQUEST_TIMEOUT=5
+      - SE_DRAIN_AFTER_SESSION_COUNT=1
+      - SE_VNC_NO_PASSWORD=true
+      - SE_SCREEN_WIDTH=1440
+      - SE_SCREEN_HEIGHT=900
+      - SE_SCREEN_DEPTH=24
+    expose:
+      - "4444"
+      - "7900"
+    networks:
+      - auth-browser
+    depends_on:
+      auth-egress:
+        condition: service_healthy
     restart: unless-stopped
 
   worker:
@@ -54,6 +145,7 @@ services:
       - LOG_DIR=/data/logs
       - LOG_NAME=worker
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - MEDIA_EGRESS_PROXY_URL=http://auth-egress:8899
     volumes:
       - ./data/library:/data/library
       - ./data/media:/data/media
@@ -68,6 +160,11 @@ services:
         condition: service_healthy
       ollama:
         condition: service_healthy
+      auth-egress:
+        condition: service_healthy
+    networks:
+      - default
+      - media-egress
     restart: unless-stopped
 
   paper-worker:
@@ -173,6 +270,10 @@ services:
 
   frontend:
     build: ./frontend
+    environment:
+      - SYNAPSE_PUBLIC_ORIGIN=${SYNAPSE_PUBLIC_ORIGIN:-http://localhost:8080}
+      # Substitute only the trusted value, preserving nginx's own $variables.
+      - NGINX_ENVSUBST_FILTER=SYNAPSE_PUBLIC_ORIGIN
     ports:
       # Synapse has no authentication. Keep the default stack local-only;
       # setting SYNAPSE_BIND_ADDRESS=0.0.0.0 is an explicit LAN opt-in.
@@ -192,3 +293,12 @@ volumes:
   ollama-models:
   whisper-models:
   redis-data:
+
+networks:
+  auth-control:
+    internal: true
+  auth-browser:
+    internal: true
+  media-egress:
+    internal: true
+  auth-public:
