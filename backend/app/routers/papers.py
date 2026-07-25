@@ -1206,6 +1206,7 @@ class PaperPartPlanRequest(BaseModel):
     title: str = Field(min_length=1, max_length=300)
     focus: str = Field(default="", max_length=5000)
     target_minutes: int = Field(default=50, ge=40, le=60)
+    learning_objectives: list[str] | None = Field(default=None, max_length=50)
     topics: list[str] = Field(default_factory=list)
     evidence: list[EvidenceAssignmentRequest] = Field(default_factory=list)
     evidence_ids: list[str] = Field(default_factory=list)
@@ -1250,6 +1251,20 @@ def _part_assignment_signature(session, part: PaperSeriesPart) -> list[tuple]:
     return sorted(result)
 
 
+def _plan_learning_objectives(value) -> list[str]:
+    """Keep a bounded, text-only teaching-objective list in saved plan JSON."""
+    if not isinstance(value, list):
+        return []
+    output: list[str] = []
+    for item in value[:50]:
+        if not isinstance(item, str):
+            continue
+        rendered = item.strip()
+        if rendered and rendered not in output:
+            output.append(rendered[:1000])
+    return output
+
+
 @series_router.put("/{series_id}/plan")
 def update_paper_plan(series_id: int, req: PaperPlanUpdateRequest):
     with get_session() as session:
@@ -1262,6 +1277,7 @@ def update_paper_plan(series_id: int, req: PaperPlanUpdateRequest):
         active = _active_track_job(session, series.id)
         if active:
             raise HTTPException(409, "wait for the active track job before editing its plan")
+        prior_plan = _json_load(series.plan_json, {})
         hard_max = min(5, max(1, int(series.max_parts or 5)))
         if not 1 <= len(req.parts) <= hard_max:
             raise HTTPException(
@@ -1282,6 +1298,16 @@ def update_paper_plan(series_id: int, req: PaperPlanUpdateRequest):
             topic for topic in source_coverage.get("topics", [])
             if isinstance(topic, dict)
         ]
+        if not source_topics:
+            source_topics = [
+                topic for topic in prior_plan.get("topics", [])
+                if isinstance(topic, dict)
+            ]
+        known_topic_ids = {
+            str(topic.get("id") or topic.get("topic_id"))
+            for topic in source_topics
+            if topic.get("id") or topic.get("topic_id")
+        }
         evidence_importance: dict[str, str] = {}
         rank = {"supporting": 0, "major": 1, "critical": 2}
         for topic in source_topics:
@@ -1347,6 +1373,22 @@ def update_paper_plan(series_id: int, req: PaperPlanUpdateRequest):
             select(PaperSeriesPart).where(PaperSeriesPart.series_id == series.id)
         ).all()
         existing_by_id = {part.id: part for part in existing_parts}
+        existing_positions = {
+            part.id: part.position for part in existing_parts if part.id is not None
+        }
+        prior_plan_parts = [
+            item for item in prior_plan.get("parts", []) if isinstance(item, dict)
+        ]
+        prior_parts_by_id = {
+            int(item["id"]): item
+            for item in prior_plan_parts
+            if isinstance(item.get("id"), int)
+        }
+        prior_parts_by_position = {
+            int(item["position"]): item
+            for item in prior_plan_parts
+            if isinstance(item.get("position"), int)
+        }
         requested_ids = {part.id for part in req.parts if part.id is not None}
         foreign_ids = requested_ids - set(existing_by_id)
         if foreign_ids:
@@ -1359,6 +1401,21 @@ def update_paper_plan(series_id: int, req: PaperPlanUpdateRequest):
                 continue
             if not requested:
                 raise HTTPException(409, f"completed Part {existing.position} cannot be removed")
+            prior_part = prior_parts_by_id.get(existing.id)
+            if prior_part is None:
+                prior_part = prior_parts_by_position.get(existing.position)
+            prior_objectives = _plan_learning_objectives(
+                (prior_part or {}).get("learning_objectives")
+            )
+            if (
+                requested.learning_objectives is not None
+                and _plan_learning_objectives(requested.learning_objectives)
+                != prior_objectives
+            ):
+                raise HTTPException(
+                    409,
+                    f"completed Part {existing.position} is structurally locked",
+                )
             requested_signature = sorted((
                 item.evidence_id,
                 item.role,
@@ -1472,47 +1529,120 @@ def update_paper_plan(series_id: int, req: PaperPlanUpdateRequest):
                     part.stale = True
                     session.add(part)
 
+        # Re-read assignments after persistence so plan JSON cannot diverge
+        # from the authoritative PaperPartEvidence rows (especially for locked
+        # parts, whose assignments are intentionally not rewritten).
+        session.flush()
         plan_parts = []
         for part, requested in persisted:
-            assignments = assignments_by_position[requested.position]
-            requested_topics = list(dict.fromkeys(requested.topics))
+            assignment_payload = []
+            for assignment in session.exec(
+                select(PaperPartEvidence).where(PaperPartEvidence.part_id == part.id)
+            ).all():
+                chunk = session.get(PaperChunk, assignment.chunk_id)
+                if not chunk:
+                    continue
+                assignment_payload.append({
+                    "evidence_id": chunk.evidence_id,
+                    "role": assignment.role,
+                    "importance": assignment.importance,
+                    "reason": assignment.reason,
+                    "_chunk_index": chunk.chunk_index,
+                })
+            assignment_payload.sort(
+                key=lambda item: (
+                    int(item["_chunk_index"]),
+                    item["evidence_id"],
+                    item["role"],
+                )
+            )
+            for item in assignment_payload:
+                item.pop("_chunk_index", None)
+            requested_topics = list(dict.fromkeys(
+                str(topic_id).strip()
+                for topic_id in requested.topics if str(topic_id).strip()
+            ))
+            unknown_part_topics = sorted(set(requested_topics) - known_topic_ids)
+            if unknown_part_topics:
+                raise HTTPException(
+                    422,
+                    "unknown paper topic ID(s): "
+                    + ", ".join(unknown_part_topics[:10]),
+                )
             if not requested_topics:
-                assigned_ids = {item.evidence_id for item in assignments}
+                assigned_ids = {
+                    item["evidence_id"] for item in assignment_payload
+                    if item["role"] == "primary"
+                }
                 requested_topics = [
                     str(topic.get("id") or topic.get("topic_id"))
                     for topic in source_topics
                     if (topic.get("id") or topic.get("topic_id"))
                     and assigned_ids & {str(value) for value in topic.get("evidence_ids", [])}
                 ]
+            prior_part = prior_parts_by_id.get(part.id)
+            if prior_part is None and requested.id is not None:
+                prior_position = existing_positions.get(requested.id)
+                if prior_position is not None:
+                    prior_part = prior_parts_by_position.get(prior_position)
+            objectives = _plan_learning_objectives(
+                requested.learning_objectives
+                if requested.learning_objectives is not None
+                else (prior_part or {}).get("learning_objectives")
+            )
+            primary_evidence_ids = [
+                item["evidence_id"] for item in assignment_payload
+                if item["role"] == "primary"
+            ]
+            bridge_evidence_ids = [
+                item["evidence_id"] for item in assignment_payload
+                if item["role"] == "bridge"
+            ]
             plan_parts.append({
                 "id": part.id,
                 "position": part.position,
                 "title": part.title,
                 "focus": part.focus,
                 "target_minutes": part.target_minutes,
+                "duration_minutes": part.target_minutes,
+                "learning_objectives": objectives,
                 "topics": requested_topics,
-                "evidence": [item.model_dump() for item in assignments],
-                "evidence_ids": [item.evidence_id for item in assignments],
+                "evidence": assignment_payload,
+                "evidence_ids": [
+                    item["evidence_id"] for item in assignment_payload
+                ],
+                "primary_evidence_ids": primary_evidence_ids,
+                "bridge_evidence_ids": bridge_evidence_ids,
                 "user_guidance": part.user_guidance,
             })
-        omission_rows = []
-        for item in req.omissions:
-            row = item.model_dump()
-            # Choosing "omit" for a critical topic plus recording the required
-            # reason is the plan editor's explicit demotion action.
-            if row.get("importance") == "critical" and not row.get("demoted_from"):
-                row["demoted_from"] = "critical"
-            omission_rows.append(row)
-        prior_plan = _json_load(series.plan_json, {})
-        topic_inventory = source_topics or [
-            topic for topic in prior_plan.get("topics", [])
-            if isinstance(topic, dict)
-        ]
+
+        topic_inventory = source_topics
         topics_by_id = {
             str(topic.get("id") or topic.get("topic_id")): topic
             for topic in topic_inventory
             if topic.get("id") or topic.get("topic_id")
         }
+        omission_rows = []
+        for item in req.omissions:
+            row = item.model_dump()
+            evidence_id = str(row.get("evidence_id") or "").strip()
+            topic_id = str(row.get("topic_id") or "").strip()
+            if bool(evidence_id) == bool(topic_id):
+                raise HTTPException(
+                    422,
+                    "each omission must identify exactly one evidence ID or topic ID",
+                )
+            if evidence_id and evidence_id not in chunks_by_evidence:
+                raise HTTPException(422, f"unknown paper evidence ID: {evidence_id}")
+            if topic_id and topic_id not in topics_by_id:
+                raise HTTPException(422, f"unknown paper topic ID: {topic_id}")
+            row["evidence_id"] = evidence_id or None
+            row["topic_id"] = topic_id or None
+            # Choosing "omit" for a critical topic plus recording the required
+            # reason is the plan editor's explicit demotion action.
+            if row.get("importance") == "critical" and not row.get("demoted_from"):
+                row["demoted_from"] = "critical"
+            omission_rows.append(row)
         promoted_ids: set[str] = set()
         if req.critical_topics is not None:
             requested_ids = {
@@ -1528,6 +1658,14 @@ def update_paper_plan(series_id: int, req: PaperPlanUpdateRequest):
                     + ", ".join(unknown_topics[:10]),
                 )
             promoted_ids = requested_ids
+        else:
+            promoted_ids = {
+                str(topic.get("id") or topic.get("topic_id"))
+                for topic in prior_plan.get("critical_topics", [])
+                if isinstance(topic, dict)
+                and (topic.get("id") or topic.get("topic_id"))
+                and str(topic.get("id") or topic.get("topic_id")) in topics_by_id
+            }
         critical_topics = []
         for topic_id, topic in topics_by_id.items():
             if topic.get("importance") == "critical" or topic_id in promoted_ids:
@@ -1540,18 +1678,103 @@ def update_paper_plan(series_id: int, req: PaperPlanUpdateRequest):
                 topic for topic in prior_plan.get("critical_topics", [])
                 if isinstance(topic, dict)
             ]
+
+        next_title = (
+            req.title.strip() if req.title is not None and req.title.strip()
+            else series.title
+        )
+        next_target_minutes = (
+            req.target_minutes
+            if req.target_minutes is not None
+            else series.target_minutes
+        )
+        next_user_guidance = (
+            req.user_guidance.strip()
+            if req.user_guidance is not None
+            else series.user_guidance
+        )
+        primary_ids = {
+            item["evidence_id"]
+            for part in plan_parts
+            for item in part["evidence"]
+            if item["role"] == "primary"
+        }
+        omitted_ids = {
+            row["evidence_id"] for row in omission_rows if row.get("evidence_id")
+        }
+        demoted_critical_ids: set[str] = set()
+        demoted_major_ids: set[str] = set()
+        for row in omission_rows:
+            topic = topics_by_id.get(str(row.get("topic_id") or ""), {})
+            row_evidence_ids = {
+                str(value) for value in topic.get("evidence_ids", [])
+                if str(value) in chunks_by_evidence
+            }
+            if row.get("evidence_id"):
+                row_evidence_ids.add(str(row["evidence_id"]))
+            omitted_ids.update(row_evidence_ids)
+            if row.get("demoted_from") == "critical":
+                demoted_critical_ids.update(row_evidence_ids)
+            elif row.get("demoted_from") == "major":
+                demoted_major_ids.update(row_evidence_ids)
+        critical_ids = _critical_chunk_ids(chunks) | {
+            evidence_id for evidence_id, value in evidence_importance.items()
+            if value == "critical"
+        }
+        major_ids = {
+            evidence_id for evidence_id, value in evidence_importance.items()
+            if value == "major"
+        } - critical_ids
+        prior_coverage = prior_plan.get("coverage")
+        plan_coverage = dict(prior_coverage) if isinstance(prior_coverage, dict) else {}
+        covered_critical_ids = critical_ids & (
+            primary_ids | demoted_critical_ids
+        )
+        accounted_ids = primary_ids | omitted_ids
+        approval_complete = (
+            set(chunks_by_evidence) <= accounted_ids
+            and critical_ids <= (primary_ids | demoted_critical_ids)
+            and major_ids <= (primary_ids | demoted_major_ids)
+        )
+        plan_coverage.update({
+            "total_evidence_blocks": len(chunks_by_evidence),
+            "assigned_primary_blocks": len(primary_ids),
+            "omitted_evidence_blocks": len(omitted_ids - primary_ids),
+            "critical_total": len(critical_ids),
+            "critical_assigned": len(critical_ids & primary_ids),
+            "critical_omitted": len(
+                (critical_ids & demoted_critical_ids) - primary_ids
+            ),
+            "major_total": len(major_ids),
+            "major_assigned": len(major_ids & primary_ids),
+            "major_omitted": len(
+                (major_ids & demoted_major_ids) - primary_ids
+            ),
+            "complete_for_approval": approval_complete,
+            "percent": (
+                round(100 * len(covered_critical_ids) / len(critical_ids))
+                if critical_ids else 100
+            ),
+            "complete": len(covered_critical_ids) == len(critical_ids),
+        })
         plan = {
+            "schema": 2,
+            "audience": series.audience,
+            "title": next_title,
+            "target_minutes": next_target_minutes,
             "parts": plan_parts,
             "omissions": omission_rows,
-            "topics": source_topics or prior_plan.get("topics", []),
+            "topics": topic_inventory,
             "critical_topics": critical_topics,
+            "coverage": plan_coverage,
         }
+        if isinstance(prior_plan.get("rationale"), str) and prior_plan["rationale"].strip():
+            plan["rationale"] = prior_plan["rationale"].strip()
         if isinstance(prior_plan.get("analysis_lineage"), dict):
             plan["analysis_lineage"] = prior_plan["analysis_lineage"]
-        series.title = req.title.strip() if req.title is not None else series.title
-        series.target_minutes = req.target_minutes or series.target_minutes
-        if req.user_guidance is not None:
-            series.user_guidance = req.user_guidance.strip()
+        series.title = next_title
+        series.target_minutes = next_target_minutes
+        series.user_guidance = next_user_guidance
         series.plan_version += 1
         series.plan_json = json.dumps(plan, sort_keys=True)
         series.plan_hash = _canonical_hash({
