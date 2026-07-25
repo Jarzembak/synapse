@@ -17,6 +17,7 @@ from app.paper import (
     require_analysis_ready, validate_and_render_citations,
 )
 from app.tasks import paper as paper_tasks
+from app.tasks import prompts as task_prompts
 
 
 def _pdf(tmp_path, name: str = "fixture.pdf"):
@@ -337,13 +338,32 @@ def test_hierarchical_reduction_preserves_full_id_union(monkeypatch):
         })
     calls = []
     monkeypatch.setattr(llm, "resolve_model", lambda _function: ("ollama", "fixture"))
-    monkeypatch.setattr(llm, "complete_json", lambda *args, **kwargs: (
-        calls.append(args[2]) or {"summary": "bounded reduction"}))
+
+    def reduce_fixture(*args, **kwargs):
+        calls.append(args[2])
+        payload = json.loads(args[2])
+        allowed = sorted(paper_tasks._all_evidence_ids(payload))
+        source_item_ids = sorted(
+            paper_tasks._all_source_item_ids(payload)
+        )
+        return {
+            "summary": "bounded reduction",
+            "topics": [{
+                "text": "Semantically bounded reduction",
+                "importance": "major",
+                "evidence_ids": allowed,
+                "source_item_ids": source_item_ids,
+            }],
+        }
+
+    monkeypatch.setattr(llm, "complete_json", reduce_fixture)
     monkeypatch.setattr(paper_tasks, "_paper_analysis_settings", lambda: {
         "map_output_tokens": 1_000,
         "reduce_batch_tokens": 1_000,
         "reduce_output_tokens": 1_000,
-        "final_context_tokens": 180,
+        # Large enough to hold one complete canonical map, but small enough
+        # to force the dense source maps through at least one reduction level.
+        "final_context_tokens": 350,
         "synthesis_output_tokens": 1_000,
     })
 
@@ -352,6 +372,121 @@ def test_hierarchical_reduction_preserves_full_id_union(monkeypatch):
     assert calls
     assert paper_tasks._all_evidence_ids(context) == expected
     assert report["evidence_ids_preserved"] == len(expected)
+
+
+def test_active_paper_prompts_use_the_consumed_canonical_contract():
+    assert paper_tasks.PAPER_MAP_PROMPT == task_prompts.PAPER_MAP
+    assert paper_tasks.PAPER_REDUCE_PROMPT == task_prompts.PAPER_REDUCE
+    assert paper_tasks.PAPER_PLAN_PROMPT == task_prompts.PAPER_PLAN
+    for field in paper_tasks._STRUCTURED_FIELDS:
+        assert f'"{field}"' in task_prompts.PAPER_MAP
+    assert '"primary_evidence_ids"' in task_prompts.PAPER_PLAN
+    assert '"bridge_evidence_ids"' in task_prompts.PAPER_PLAN
+    assert '"duration_minutes"' in task_prompts.PAPER_PLAN
+    assert '"evidence_ids": [string]' not in task_prompts.PAPER_PLAN
+
+
+def test_leaf_map_recovers_dictionary_shaped_model_output():
+    evidence_id = "P0007-E07"
+    mapped = paper_tasks._sanitize_map(
+        {
+            "evidence_id": evidence_id,
+            "definitions": {
+                "Adaptive Gated Retrieval": (
+                    "Invokes the reranker below a confidence threshold of 0.62."
+                ),
+            },
+            "hypotheses": [{
+                "id": "H1",
+                "statement": "AGR reduces retrieval error without increasing latency.",
+            }],
+            "methods": {
+                "study_design": "Randomized 1:1 across four outpatient sites.",
+                "sample": {"enrolled": 240, "analyzed": 223},
+            },
+            "results": {
+                "primary_outcome": {
+                    "AGR_error_rate": "12.4%",
+                    "baseline_error_rate": "17.9%",
+                    "difference": "-5.5 percentage points",
+                    "confidence_interval_95": [-8.2, -2.8],
+                    "p_value": 0.001,
+                },
+            },
+            "limitations": {
+                "blinding": "Annotators could not be blinded.",
+            },
+            "referenced_visuals_tables_figures": {
+                "Figure_3": {
+                    "description": "Calibration plot",
+                    "interpretation_status": "Requires visual review.",
+                },
+            },
+        },
+        {evidence_id},
+        leaf=True,
+        fallback_summary="source excerpt",
+    )
+
+    assert mapped["summary"] == "source excerpt"
+    assert "confidence threshold of 0.62" in mapped["definitions"][0]["text"]
+    assert "AGR reduces retrieval error" in mapped["hypotheses"][0]["text"]
+    assert any("Randomized 1:1" in item["text"] for item in mapped["methods"])
+    assert any("12.4%" in item["text"] and "0.001" in item["text"]
+               for item in mapped["results"])
+    assert "could not be blinded" in mapped["limitations"][0]["text"]
+    assert "visual review" in mapped["referenced_visuals"][0]["text"]
+    structured = [
+        item
+        for field in paper_tasks._STRUCTURED_FIELDS
+        for item in mapped[field]
+    ]
+    assert structured
+    assert all(item["evidence_ids"] == [evidence_id] for item in structured)
+    assert not (
+        len(mapped["topics"]) == 1
+        and mapped["topics"][0]["text"] == "Paper evidence"
+    )
+
+
+def test_leaf_map_recovers_compound_legacy_keys_but_reducer_requires_ids():
+    evidence_id = "P0008-E08"
+    leaf = paper_tasks._sanitize_map(
+        {
+            "summary_and_role_in_paper": [{
+                "text": "Reports the primary result.",
+                "evidence_ids": [],
+            }],
+            "claims_and_hypotheses": [{
+                "text": "The intervention reduced error.",
+                "importance": "critical",
+                "evidence_ids": [],
+            }],
+            "results_effect_direction_magnitude_uncertainty_and_negative_findings": [{
+                "text": "The absolute difference was -5.5 points.",
+                "importance": "critical",
+                "evidence_ids": [],
+            }],
+            "topics_and_open_questions": [{
+                "text": "Whether the effect generalizes.",
+                "evidence_ids": [],
+            }],
+        },
+        {evidence_id},
+        leaf=True,
+    )
+    assert leaf["summary"] == "Reports the primary result."
+    assert leaf["claims"][0]["evidence_ids"] == [evidence_id]
+    assert leaf["results"][0]["evidence_ids"] == [evidence_id]
+    assert leaf["topics"][0]["evidence_ids"] == [evidence_id]
+
+    reduced = paper_tasks._sanitize_map(
+        {"claims": {"unsupported": "A reducer claim without citations."}},
+        {"P0001-E01", "P0002-E02"},
+        leaf=False,
+    )
+    assert reduced["claims"] == []
+    assert reduced["evidence_ids"] == ["P0001-E01", "P0002-E02"]
 
 
 def test_plan_normalization_assigns_every_late_block_once():
@@ -394,3 +529,53 @@ def test_plan_normalization_assigns_every_late_block_once():
         for part in plan["parts"]
     )
     assert plan["coverage"]["critical_assigned"] == 1
+
+
+def test_plan_normalization_accepts_legacy_and_object_shaped_ids():
+    chunks = [
+        SimpleNamespace(evidence_id=f"P000{index}-E0{index}", page_number=index)
+        for index in range(1, 5)
+    ]
+    known_ids = [chunk.evidence_id for chunk in chunks]
+    importance = {evidence_id: "major" for evidence_id in known_ids}
+    plan = paper_tasks._clean_plan(
+        {
+            "title": "Legacy-compatible arc",
+            "target_minutes": 250,
+            "parts": [
+                {
+                    "title": "Foundations",
+                    "evidence_ids": [
+                        known_ids[0],
+                        {"evidence_id": known_ids[1]},
+                    ],
+                },
+                {
+                    "title": "Results",
+                    "duration_minutes": 900,
+                    "primary_evidence_ids": [known_ids[2]],
+                    "bridge_evidence_ids": [
+                        {"evidence_id": known_ids[0]},
+                        {"evidence_id": "unknown"},
+                    ],
+                },
+            ],
+        },
+        audience="practitioner",
+        chunks=chunks,
+        importance=importance,
+        topics=[],
+    )
+
+    assert plan["target_minutes"] == 50
+    assert [part["duration_minutes"] for part in plan["parts"]] == [50, 50]
+    assert plan["parts"][0]["primary_evidence_ids"] == known_ids[:2]
+    assert plan["parts"][1]["primary_evidence_ids"] == known_ids[2:]
+    assert plan["parts"][1]["bridge_evidence_ids"] == [known_ids[0]]
+    primary = [
+        evidence_id
+        for part in plan["parts"]
+        for evidence_id in part["primary_evidence_ids"]
+    ]
+    assert primary == known_ids
+    assert len(primary) == len(set(primary))

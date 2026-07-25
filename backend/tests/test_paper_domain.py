@@ -220,6 +220,170 @@ def test_plan_is_versioned_and_critical_coverage_is_enforced(client):
     assert stale_write.status_code == 409
 
 
+def test_full_plan_update_preserves_safe_generated_metadata(client):
+    payload = _upload(client)
+    project_id = payload["project"]["id"]
+    with get_session() as session:
+        source = session.exec(select(PaperSource).where(
+            PaperSource.project_id == project_id
+        )).one()
+        source.status = "ready"
+        source.quality_grade = "GOOD"
+        source.quality_report = json.dumps({
+            "analysis_blocked": False,
+            "poor_pages": [],
+            "blocked_reasons": [],
+        })
+        primary_id = f"paper-{source.source_hash[:12]}-primary"
+        bridge_id = f"paper-{source.source_hash[:12]}-bridge"
+        source.coverage_report = json.dumps({
+            "topics": [{
+                "id": "T-primary",
+                "title": "Primary result",
+                "importance": "critical",
+                "evidence_ids": [primary_id],
+            }, {
+                "id": "T-context",
+                "title": "Supporting context",
+                "importance": "supporting",
+                "evidence_ids": [bridge_id],
+            }],
+        })
+        session.add(source)
+        session.add(PaperChunk(
+            source_id=source.id,
+            chunk_index=0,
+            evidence_id=primary_id,
+            page_number=1,
+            body="The primary result.",
+            body_hash="3" * 64,
+            flags=json.dumps({"critical": True}),
+        ))
+        session.add(PaperChunk(
+            source_id=source.id,
+            chunk_index=1,
+            evidence_id=bridge_id,
+            page_number=2,
+            body="Supporting context for a bounded callback.",
+            body_hash="4" * 64,
+        ))
+        session.commit()
+
+    created = client.post(f"/api/papers/{project_id}/series", json={
+        "audience": "expert",
+        "title": "Custom expert arc",
+        "target_minutes": 40,
+        "auto_plan": False,
+    })
+    assert created.status_code == 200, created.text
+    series_id = created.json()["id"]
+    first = client.put(f"/api/paper-series/{series_id}/plan", json={
+        "expected_version": 0,
+        "target_minutes": 40,
+        "parts": [{
+            "position": 1,
+            "title": "The result",
+            "focus": "Explain the result with a bounded context callback.",
+            "target_minutes": 40,
+            "topics": ["T-primary"],
+            "evidence": [{
+                "evidence_id": primary_id,
+                "role": "primary",
+                "importance": "critical",
+                "reason": "central result",
+            }, {
+                "evidence_id": bridge_id,
+                "role": "bridge",
+                "importance": "supporting",
+                "reason": "bounded callback",
+            }],
+        }],
+    })
+    assert first.status_code == 200, first.text
+    part_id = first.json()["parts"][0]["id"]
+
+    # Simulate a generated plan carrying useful teaching metadata plus stale
+    # duplicate assignment arrays. The update must retain only the former.
+    with get_session() as session:
+        series = session.get(PaperSeries, series_id)
+        plan = json.loads(series.plan_json)
+        plan.update({
+            "schema": 2,
+            "audience": "expert",
+            "title": "Custom expert arc",
+            "target_minutes": 40,
+            "rationale": "Move from the result to its practical context.",
+            "coverage": {
+                "cache": {"reused_leaf_maps": 2},
+                "assigned_primary_blocks": 999,
+            },
+            "analysis_lineage": {"analysis_config_signature": "fixture-analysis"},
+        })
+        plan["parts"][0].update({
+            "learning_objectives": [
+                "Interpret the primary result.",
+                "Use supporting context only as a callback.",
+            ],
+            "primary_evidence_ids": ["stale-primary"],
+            "bridge_evidence_ids": ["stale-bridge"],
+            "evidence_ids": ["stale-primary", "stale-bridge"],
+        })
+        series.plan_json = json.dumps(plan)
+        session.add(series)
+        session.commit()
+
+    updated = client.put(f"/api/paper-series/{series_id}/plan", json={
+        "expected_version": 1,
+        "parts": [{
+            "id": part_id,
+            "position": 1,
+            "title": "The result",
+            "focus": "Explain the result, uncertainty, and context callback.",
+            "target_minutes": 40,
+            "topics": ["T-primary"],
+            "evidence": [{
+                "evidence_id": primary_id,
+                "role": "primary",
+                "importance": "critical",
+                "reason": "central result",
+            }, {
+                "evidence_id": bridge_id,
+                "role": "bridge",
+                "importance": "supporting",
+                "reason": "bounded callback",
+            }],
+        }],
+    })
+    assert updated.status_code == 200, updated.text
+    body = updated.json()
+    saved = body["plan"]
+    assert saved["schema"] == 2
+    assert saved["audience"] == "expert"
+    assert saved["title"] == "Custom expert arc"
+    assert saved["target_minutes"] == 40
+    assert saved["rationale"].startswith("Move from the result")
+    assert saved["analysis_lineage"]["analysis_config_signature"] == "fixture-analysis"
+    assert saved["coverage"]["cache"]["reused_leaf_maps"] == 2
+    assert saved["coverage"]["total_evidence_blocks"] == 2
+    assert saved["coverage"]["assigned_primary_blocks"] == 1
+    assert saved["coverage"]["critical_assigned"] == 1
+
+    saved_part = saved["parts"][0]
+    assert saved_part["target_minutes"] == 40
+    assert saved_part["duration_minutes"] == 40
+    assert saved_part["learning_objectives"] == [
+        "Interpret the primary result.",
+        "Use supporting context only as a callback.",
+    ]
+    assert saved_part["primary_evidence_ids"] == [primary_id]
+    assert saved_part["bridge_evidence_ids"] == [bridge_id]
+    assert saved_part["evidence_ids"] == [primary_id, bridge_id]
+    assert [item["evidence_id"] for item in saved_part["evidence"]] == [
+        primary_id,
+        bridge_id,
+    ]
+
+
 def test_completed_part_structure_is_locked(client):
     payload = _upload(client)
     project_id = payload["project"]["id"]
