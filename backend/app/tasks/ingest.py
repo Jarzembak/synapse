@@ -7,14 +7,12 @@ from pathlib import Path
 
 from ..db import get_session
 from .. import library
+from ..media_auth import apply_download_auth, apply_media_egress, cookies_path
+from ..security import redact_url
 from ..settings_store import get_setting
 from .celery_app import celery
 from .common import auto_tag, get_project, pipeline_task, progress
 from . import media
-
-
-def cookies_path(project_slug: str) -> Path:
-    return media.workdir(project_slug) / "cookies.txt"
 
 
 def fetch_url_metadata(url: str, project_slug: str | None = None) -> dict:
@@ -24,13 +22,14 @@ def fetch_url_metadata(url: str, project_slug: str | None = None) -> dict:
 
     opts = {"quiet": True, "skip_download": True, "socket_timeout": 15,
             "noplaylist": True}
-    if project_slug:
-        ck = cookies_path(project_slug)
-        if ck.exists():
-            opts["cookiefile"] = str(ck)
     try:
+        effective_url = (
+            apply_download_auth(opts, project_slug, url)
+            if project_slug
+            else apply_media_egress(opts, url)
+        )
         with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False)
+            info = ydl.extract_info(effective_url, download=False)
         return {
             "title": info.get("title") or "",
             "uploader": (info.get("uploader") or info.get("channel")
@@ -39,7 +38,9 @@ def fetch_url_metadata(url: str, project_slug: str | None = None) -> dict:
     except Exception:
         import logging
 
-        logging.getLogger(__name__).info("metadata fetch failed for %s", url)
+        logging.getLogger(__name__).info(
+            "metadata fetch failed for %s", redact_url(url)
+        )
         return {}
 
 
@@ -78,11 +79,9 @@ def ingest(job_id: int, project_id: int):
             "noplaylist": True,
             "socket_timeout": 30,
         }
-        ck = cookies_path(project.slug)
-        if ck.exists():
-            opts["cookiefile"] = str(ck)
+        effective_source = apply_download_auth(opts, project.slug, project.source)
         with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(project.source, download=True)
+            info = ydl.extract_info(effective_source, download=True)
             title = combined_title({
                 "title": info.get("title"),
                 "uploader": info.get("uploader") or info.get("channel"),
@@ -170,11 +169,9 @@ def download(job_id: int, project_id: int):
         "noplaylist": True,  # archive only the submitted video, not its playlist
         "socket_timeout": 30,
     }
-    ck = cookies_path(project.slug)
-    if ck.exists():
-        opts["cookiefile"] = str(ck)
+    effective_source = apply_download_auth(opts, project.slug, project.source)
     with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(project.source, download=True)
+        info = ydl.extract_info(effective_source, download=True)
 
     videos = sorted(wd.glob("source_video.*"))
     if not videos:
@@ -195,7 +192,7 @@ def download(job_id: int, project_id: int):
             media.extract_audio(video, audio)
 
     source_meta = {
-        "source_url": project.source,
+        "source_url": redact_url(project.source),
         "uploader": info.get("uploader"),
         "upload_date": info.get("upload_date"),
         "duration_seconds": info.get("duration"),
@@ -207,7 +204,7 @@ def download(job_id: int, project_id: int):
             project_slug=project.slug,
             type="source_video",
             title=f"Source video — {project.title}",
-            body=f"Archived video download of `{project.source}`.",
+            body=f"Archived video download of `{redact_url(project.source)}`.",
             rel_path=f"projects/{project.slug}/source_video.md",
             media_rel=f"media:{project.slug}/{video.name}",
             extra_meta={
@@ -223,7 +220,7 @@ def download(job_id: int, project_id: int):
             project_slug=project.slug,
             type="source_audio",
             title=f"Source audio — {project.title}",
-            body=f"Archived audio-only copy of `{project.source}`.",
+            body=f"Archived audio-only copy of `{redact_url(project.source)}`.",
             rel_path=f"projects/{project.slug}/source_audio.md",
             media_rel=f"media:{project.slug}/{audio.name}",
             extra_meta={**source_meta, "filesize_bytes": audio.stat().st_size},

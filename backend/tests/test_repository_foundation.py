@@ -24,11 +24,21 @@ from app.models import (
     Setting,
 )
 from app import repository
+from app.trusted_origin import (
+    TRUSTED_ORIGIN_HEADER,
+    TRUSTED_REQUEST_HOST_HEADER,
+)
 
 
 @pytest.fixture(scope="module")
 def client():
-    with TestClient(app) as test_client:
+    with TestClient(
+        app,
+        headers={
+            TRUSTED_ORIGIN_HEADER: "http://localhost:8080",
+            TRUSTED_REQUEST_HOST_HEADER: "localhost:8080",
+        },
+    ) as test_client:
         yield test_client
 
 

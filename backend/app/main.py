@@ -17,11 +17,17 @@ from .routers import (  # noqa: E402
     search, system, papers,
 )
 from .routers.settings import router as settings_router, tags_router  # noqa: E402
+from .media_auth_view import router as media_auth_view_router  # noqa: E402
+from .trusted_origin import (  # noqa: E402
+    TrustedFrontendMiddleware,
+    validate_public_origin,
+)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     validate_storage_roots()
+    validate_public_origin()
     settings.library_dir.mkdir(parents=True, exist_ok=True)
     settings.media_dir.mkdir(parents=True, exist_ok=True)
     settings.repository_dir.mkdir(parents=True, exist_ok=True)
@@ -44,7 +50,9 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Synapse", lifespan=lifespan)
+app.add_middleware(TrustedFrontendMiddleware)
 app.include_router(projects.router)
+app.include_router(media_auth_view_router)
 app.include_router(repositories.router)
 app.include_router(papers.router)
 app.include_router(papers.series_router)

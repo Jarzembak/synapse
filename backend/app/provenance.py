@@ -14,6 +14,7 @@ from sqlmodel import Session, select
 
 from .config import advanced
 from .models import Artifact, Project
+from .security import redact_url
 from .settings_store import get_setting, set_setting
 
 ARTIFACT_STEP = {
@@ -163,6 +164,17 @@ def _body_hash(artifact: Artifact) -> str:
 
 
 def _source_signature(project: Project) -> dict:
+    if project.source_type == "url":
+        # Signed URLs are inputs, but their bearer credentials must not become
+        # durable provenance. Hash the complete value so a token/link change
+        # still invalidates affected steps, and retain only a display-safe URL.
+        return {
+            "source": redact_url(project.source),
+            "source_digest": hashlib.sha256(
+                project.source.encode("utf-8")
+            ).hexdigest(),
+            "source_type": project.source_type,
+        }
     value = {"source": project.source, "source_type": project.source_type}
     if project.source_type == "github":
         try:

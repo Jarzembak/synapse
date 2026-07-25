@@ -7,7 +7,7 @@ import tempfile
 import uuid
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException, Request, UploadFile
+from fastapi import APIRouter, HTTPException, Request, Response, UploadFile
 from pydantic import BaseModel, Field
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import select, text
@@ -17,11 +17,13 @@ from ..models import (
     Artifact, Job, PaperChunk, PaperChunkEmbedding, PaperMemoryRevision,
     PaperPartEvidence, PaperSeries, PaperSeriesPart, PaperSource,
     PaperSynthesisCache, Project, RepositoryChunk, RepositoryFile,
-    RepositorySnapshot, RepositorySource,
+    RepositorySnapshot, RepositorySource, utcnow,
 )
 from .. import library
 from ..config import settings
-from ..security import validate_source_url
+from .. import media_auth
+from ..security import redact_url, validate_source_url
+from ..trusted_origin import require_trusted_frontend
 from ..tasks import media
 from ..tasks.celery_app import celery
 from ..tasks.ingest import cookies_path
@@ -140,7 +142,7 @@ def create_project(req: ProjectCreate):
     if resolved:
         title = slug_seed = resolved
     elif req.source_type == "url":
-        title = f"(pending: {source[:60]})"
+        title = f"(pending: {redact_url(source)[:60]})"
         slug_seed = source.rsplit("/", 1)[-1].rsplit("?", 1)[0] or "video"
     else:
         title = slug_seed = source.rsplit("/", 1)[-1]
@@ -275,6 +277,7 @@ def list_projects():
         for job in session.exec(select(Job).where(
                 Job.paper_series_id == None,  # noqa: E711
                 Job.paper_part_id == None,  # noqa: E711
+                Job.task != media_auth.LEASE_TASK,
         ).order_by(Job.updated)).all():
             jobs_by_pid[job.project_id].append(job)
         return [
@@ -346,7 +349,9 @@ def get_project(project_id: int):
         any_active = bool(session.exec(select(Job.id).where(
             Job.project_id == project_id,
             Job.status.in_(("queued", "running")),
+            Job.task != media_auth.LEASE_TASK,
         )).first())
+        media_auth_active = bool(_active_media_auth_lease(session, project_id))
         return {
             "project": project,
             "artifacts": artifacts,
@@ -355,6 +360,7 @@ def get_project(project_id: int):
             "run_all_active": run_all_job is not None,
             "run_all_state": run_all_job.status if run_all_job else None,
             "any_active": any_active,
+            "media_auth_active": media_auth_active,
             "profiles": pipeline_profiles(project),
         }
 
@@ -375,6 +381,14 @@ def run_step(project_id: int, step: str):
             raise HTTPException(409, "project is being deleted")
         if step not in applicable_steps(project):
             raise HTTPException(409, f"{step} does not apply to this project")
+        if (
+            project.source_type == "url"
+            and _active_media_auth_lease(session, project_id)
+        ):
+            raise HTTPException(
+                409,
+                "finish or cancel the interactive source login before starting project work",
+            )
         running = session.exec(
             select(Job).where(Job.project_id == project_id, Job.task == step,
                               Job.paper_series_id == None,  # noqa: E711
@@ -474,6 +488,14 @@ def run_all(project_id: int, req: RunAllRequest | None = None):
             raise HTTPException(404)
         if project.deleting:
             raise HTTPException(409, "project is being deleted")
+        if (
+            project.source_type == "url"
+            and _active_media_auth_lease(session, project_id)
+        ):
+            raise HTTPException(
+                409,
+                "finish or cancel the interactive source login before starting the pipeline",
+            )
         existing = session.exec(
             select(Job).where(Job.project_id == project_id, Job.task == "run_all",
                               Job.paper_series_id == None,  # noqa: E711
@@ -556,7 +578,8 @@ def reset_jobs(project_id: int):
             raise HTTPException(404)
         stuck = session.exec(
             select(Job).where(Job.project_id == project_id,
-                              Job.status.in_(("queued", "running")))
+                              Job.status.in_(("queued", "running")),
+                              Job.task != media_auth.LEASE_TASK)
         ).all()
         for job in stuck:
             transition_job(session, job.id, {"queued", "running"}, "canceled",
@@ -572,30 +595,282 @@ def reset_jobs(project_id: int):
         return {"reset": len(stuck), "canceled": len(stuck)}
 
 
-@router.post("/{project_id}/cookies")
-async def upload_cookies(project_id: int, file: UploadFile):
+def _url_media_project(project_id: int) -> Project:
     with get_session() as session:
         project = session.get(Project, project_id)
         if not project:
             raise HTTPException(404)
         if project.deleting:
             raise HTTPException(409, "project is being deleted")
+        if project.source_type != "url":
+            raise HTTPException(409, "interactive login applies only to URL media projects")
+        return project
+
+
+def _active_media_auth_lease(session, project_id: int) -> Job | None:
+    return session.exec(select(Job).where(
+        Job.project_id == project_id,
+        Job.task == media_auth.LEASE_TASK,
+        Job.status.in_(("queued", "running")),
+        Job.paper_series_id == None,  # noqa: E711
+        Job.paper_part_id == None,  # noqa: E711
+    )).first()
+
+
+def _media_auth_lease_operation(job: Job) -> str:
+    try:
+        value = json.loads(job.options or "{}")
+    except (TypeError, ValueError):
+        return ""
+    return str(value.get("operation") or "") if isinstance(value, dict) else ""
+
+
+def _begin_media_auth_lease(
+    project_id: int,
+    operation: str,
+    *,
+    browser: bool = False,
+) -> tuple[Project, Job]:
+    """Fence source-access mutation and job enqueue under one writer lease."""
+    with get_session() as session:
+        session.exec(text("BEGIN IMMEDIATE"))
+        project = session.get(Project, project_id)
+        if not project:
+            raise HTTPException(404)
+        if project.deleting:
+            raise HTTPException(409, "project is being deleted")
+        if project.source_type != "url":
+            raise HTTPException(
+                409, "interactive login applies only to URL media projects"
+            )
+        existing = _active_media_auth_lease(session, project_id)
+        if existing:
+            raise HTTPException(
+                409, "finish the current source-access operation first"
+            )
+        active = session.exec(select(Job.id).where(
+            Job.project_id == project_id,
+            Job.status.in_(("queued", "running")),
+            Job.task != media_auth.LEASE_TASK,
+        )).first()
+        if active:
+            raise HTTPException(
+                409, "wait for active project jobs before changing source access"
+            )
+        if browser:
+            global_browser = session.exec(select(Job).where(
+                Job.task == media_auth.LEASE_TASK,
+                Job.status.in_(("queued", "running")),
+            )).all()
+            if any(
+                _media_auth_lease_operation(item) == "browser"
+                for item in global_browser
+            ):
+                raise HTTPException(
+                    409, "another project's interactive login is already open"
+                )
+        lease = Job(
+            project_id=project_id,
+            task=media_auth.LEASE_TASK,
+            status="running",
+            progress=operation,
+            options=json.dumps({"operation": operation}),
+            started=utcnow(),
+        )
+        session.add(lease)
+        try:
+            session.commit()
+        except IntegrityError:
+            session.rollback()
+            raise HTTPException(
+                409, "source access changed concurrently; try again"
+            )
+        session.refresh(project)
+        session.refresh(lease)
+        return project, lease
+
+
+def _require_media_auth_lease(project_id: int) -> tuple[Project, Job]:
+    with get_session() as session:
+        session.exec(text("BEGIN IMMEDIATE"))
+        project = session.get(Project, project_id)
+        if not project:
+            raise HTTPException(404)
+        if project.deleting:
+            raise HTTPException(409, "project is being deleted")
+        if project.source_type != "url":
+            raise HTTPException(
+                409, "interactive login applies only to URL media projects"
+            )
+        lease = _active_media_auth_lease(session, project_id)
+        if not lease:
+            # Recover an older/orphaned durable session after an API restart or
+            # upgrade. The new lease is created under the same writer fence
+            # before complete/cancel is allowed to touch its files.
+            if not media_auth.auth_session_path(project.slug).exists():
+                raise HTTPException(409, "no interactive login is active")
+            lease = Job(
+                project_id=project_id,
+                task=media_auth.LEASE_TASK,
+                status="running",
+                progress="recovering interactive sign-in",
+                options=json.dumps({"operation": "browser", "recovered": True}),
+                started=utcnow(),
+            )
+            session.add(lease)
+            session.commit()
+            session.refresh(project)
+            session.refresh(lease)
+        return project, lease
+
+
+def _finish_media_auth_lease(
+    lease_id: int,
+    status: str,
+    error: str = "",
+) -> None:
+    with get_session() as session:
+        session.exec(text("BEGIN IMMEDIATE"))
+        lease = session.get(Job, lease_id)
+        if lease and lease.status in ("queued", "running"):
+            lease.status = status
+            lease.error = error
+            lease.progress = ""
+            lease.finished = utcnow()
+            lease.updated = utcnow()
+            session.add(lease)
+            session.commit()
+
+
+def _media_auth_http_error(exc: media_auth.MediaAuthError) -> HTTPException:
+    if isinstance(exc, media_auth.MediaAuthUnavailable):
+        return HTTPException(503, str(exc))
+    if isinstance(exc, media_auth.MediaAuthBusy):
+        return HTTPException(409, str(exc))
+    if isinstance(exc, media_auth.MediaAuthSessionMissing):
+        return HTTPException(409, str(exc))
+    return HTTPException(502, str(exc))
+
+
+@router.get("/{project_id}/auth")
+def source_auth_status(project_id: int, request: Request, response: Response):
+    require_trusted_frontend(request)
+    response.headers["Cache-Control"] = "no-store"
+    project = _url_media_project(project_id)
+    try:
+        status = media_auth.auth_status(
+            project.id, project.slug, project.source_type
+        )
+    except media_auth.MediaAuthError as exc:
+        raise _media_auth_http_error(exc) from exc
+    if not status["active"]:
+        with get_session() as session:
+            lease = _active_media_auth_lease(session, project_id)
+        if lease:
+            # A lease is created before the remote browser so job enqueue can
+            # never win the race. Keep the operation cancelable while startup
+            # is in progress—or after a crash left cleanup pending.
+            status["active"] = True
+            status["cleanup_pending"] = True
+            status["browser_url"] = None
+    return status
+
+
+@router.post("/{project_id}/auth/browser")
+def start_source_auth(project_id: int, request: Request):
+    require_trusted_frontend(request, state_changing=True)
+    project, lease = _begin_media_auth_lease(
+        project_id, "waiting for interactive sign-in", browser=True
+    )
+    try:
+        return media_auth.start_browser_auth(
+            project.id, project.slug, project.source
+        )
+    except media_auth.MediaAuthError as exc:
+        # Keep the database lease when cleanup is still retryable; it is the
+        # transactional fence and durable handle preventing a download race.
+        if not media_auth.auth_session_path(project.slug).exists():
+            _finish_media_auth_lease(lease.id, "error", str(exc))
+        raise _media_auth_http_error(exc) from exc
+
+
+@router.post("/{project_id}/auth/browser/complete")
+def complete_source_auth(project_id: int, request: Request):
+    require_trusted_frontend(request, state_changing=True)
+    project, lease = _require_media_auth_lease(project_id)
+    try:
+        status = media_auth.complete_browser_auth(
+            project.id, project.slug, project.source
+        )
+    except media_auth.MediaAuthError as exc:
+        raise _media_auth_http_error(exc) from exc
+    _finish_media_auth_lease(lease.id, "done")
+    return status
+
+
+@router.delete("/{project_id}/auth/browser")
+def cancel_source_auth(project_id: int, request: Request):
+    require_trusted_frontend(request, state_changing=True)
+    project, lease = _require_media_auth_lease(project_id)
+    try:
+        media_auth.cancel_browser_auth(project.slug)
+    except media_auth.MediaAuthError as exc:
+        raise _media_auth_http_error(exc) from exc
+    _finish_media_auth_lease(lease.id, "canceled", "interactive sign-in canceled")
+    return media_auth.auth_status(
+        project.id, project.slug, project.source_type
+    )
+
+
+@router.delete("/{project_id}/cookies")
+def clear_source_auth(project_id: int, request: Request):
+    require_trusted_frontend(request, state_changing=True)
+    project, lease = _begin_media_auth_lease(
+        project_id, "clearing saved source access"
+    )
+    try:
+        media_auth.clear_saved_auth(project.slug)
+    except media_auth.MediaAuthError as exc:
+        _finish_media_auth_lease(lease.id, "error", str(exc))
+        raise _media_auth_http_error(exc) from exc
+    _finish_media_auth_lease(lease.id, "done")
+    return media_auth.auth_status(
+        project.id, project.slug, project.source_type
+    )
+
+
+@router.post("/{project_id}/cookies")
+async def upload_cookies(project_id: int, request: Request, file: UploadFile):
+    require_trusted_frontend(request, state_changing=True)
+    _url_media_project(project_id)
     payload = await file.read(2_000_001)
     if len(payload) > 2_000_000:
         raise HTTPException(413, "cookies.txt must be 2 MB or smaller")
     text_payload = payload.decode("utf-8", errors="replace")
     if "# Netscape HTTP Cookie File" not in text_payload and "\t" not in text_payload:
         raise HTTPException(400, "expected a Netscape-format cookies.txt file")
-    dest = cookies_path(project.slug)
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dest.with_suffix(f".tmp.{os.getpid()}")
-    tmp.write_bytes(payload)
+
+    project, lease = _begin_media_auth_lease(
+        project_id, "replacing source cookies"
+    )
     try:
-        tmp.chmod(0o600)
-        tmp.replace(dest)
-        dest.chmod(0o600)
-    finally:
-        tmp.unlink(missing_ok=True)
+        dest = cookies_path(project.slug)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dest.with_suffix(f".tmp.{os.getpid()}.{lease.id}")
+        tmp.write_bytes(payload)
+        try:
+            tmp.chmod(0o600)
+            tmp.replace(dest)
+            dest.chmod(0o600)
+        finally:
+            tmp.unlink(missing_ok=True)
+        # A manual jar applies to the submitted URL. Do not silently keep a
+        # final token URL captured by an older browser-auth session.
+        media_auth.auth_context_path(project.slug).unlink(missing_ok=True)
+    except OSError as exc:
+        _finish_media_auth_lease(lease.id, "error", "cookie storage failed")
+        raise HTTPException(500, "could not store cookies.txt") from exc
+    _finish_media_auth_lease(lease.id, "done")
     return {"ok": True}
 
 
@@ -607,6 +882,7 @@ def delete_project(project_id: int):
     from sqlmodel import text
 
     with get_session() as session:
+        session.exec(text("BEGIN IMMEDIATE"))
         project = session.get(Project, project_id)
         if not project:
             raise HTTPException(404)
@@ -640,6 +916,28 @@ def delete_project(project_id: int):
         session.add(project)
         session.commit()
         slug = project.slug
+
+    # The browser has no project files mounted, but deleting a project should
+    # still terminate its temporary login profile immediately rather than wait
+    # for Selenium's timeout.
+    try:
+        media_auth.cancel_browser_auth(slug)
+    except media_auth.MediaAuthError as exc:
+        # Keep every file and row intact, but release the deletion fence so the
+        # user can retry browser cleanup. Never orphan a credential-bearing
+        # session by deleting its only local handle.
+        with get_session() as session:
+            session.exec(text("BEGIN IMMEDIATE"))
+            current = session.get(Project, project_id)
+            if current:
+                current.deleting = False
+                session.add(current)
+                session.commit()
+        raise HTTPException(
+            503,
+            "the authentication browser could not be destroyed; cancel source "
+            "access and retry project deletion",
+        ) from exc
 
     paths = [
         settings.library_dir / "projects" / slug,

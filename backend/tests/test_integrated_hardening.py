@@ -30,11 +30,21 @@ from app.models import (
 )
 from app.settings_store import get_setting, set_setting
 from app.tasks.common import pipeline_task, transition_job
+from app.trusted_origin import (
+    TRUSTED_ORIGIN_HEADER,
+    TRUSTED_REQUEST_HOST_HEADER,
+)
 
 
 @pytest.fixture(scope="module")
 def client():
-    with TestClient(app) as test_client:
+    with TestClient(
+        app,
+        headers={
+            TRUSTED_ORIGIN_HEADER: "http://localhost:8080",
+            TRUSTED_REQUEST_HOST_HEADER: "localhost:8080",
+        },
+    ) as test_client:
         yield test_client
 
 

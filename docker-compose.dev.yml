@@ -2,5 +2,7 @@
 # internal network; Vite's local /api proxy needs an explicit host port.
 services:
   api:
+    environment:
+      - SYNAPSE_PUBLIC_ORIGIN=${SYNAPSE_DEV_PUBLIC_ORIGIN:-http://localhost:5173}
     ports:
       - "${SYNAPSE_API_BIND_ADDRESS:-127.0.0.1}:8000:8000"

@@ -8,6 +8,7 @@ from sse_starlette.sse import EventSourceResponse
 from sqlmodel import select
 
 from ..db import get_session
+from ..media_auth import LEASE_TASK
 from ..models import Job, Project
 from ..tasks.celery_app import celery
 from ..tasks.common import transition_job
@@ -53,7 +54,12 @@ def _serialize(job: Job, titles: dict[int, str]) -> dict:
 def list_jobs(project_id: int | None = None, limit: int = 100):
     with get_session() as session:
         titles = _project_titles(session)
-        q = select(Job).order_by(Job.created.desc()).limit(max(1, min(limit, 1000)))
+        q = (
+            select(Job)
+            .where(Job.task != LEASE_TASK)
+            .order_by(Job.created.desc())
+            .limit(max(1, min(limit, 1000)))
+        )
         if project_id is not None:
             q = q.where(Job.project_id == project_id)
         return [_serialize(j, titles) for j in session.exec(q).all()]
@@ -89,6 +95,10 @@ def cancel_job(job_id: int):
             raise HTTPException(404)
         if job.status not in ("queued", "running"):
             raise HTTPException(409, f"job is already {job.status}")
+        if job.task == LEASE_TASK:
+            raise HTTPException(
+                409, "finish or cancel this login from the project's Source access card"
+            )
         # Fence database state before revocation so a task picked up in the
         # small race window sees a terminal state and exits without publishing.
         transition_job(session, job.id, {"queued", "running"}, "canceled",
@@ -118,12 +128,18 @@ async def stream_jobs(project_id: int | None = None):
         while True:
             with get_session() as session:
                 titles = _project_titles(session)
-                aq = select(Job).where(Job.status.in_(("queued", "running"))) \
+                aq = select(Job).where(
+                    Job.status.in_(("queued", "running")),
+                    Job.task != LEASE_TASK,
+                ) \
                     .order_by(Job.created)
                 if project_id is not None:
                     aq = aq.where(Job.project_id == project_id)
                 active = [_serialize(j, titles) for j in session.exec(aq).all()]
-                rq = select(Job).where(Job.status.in_(("done", "error", "canceled"))) \
+                rq = select(Job).where(
+                    Job.status.in_(("done", "error", "canceled")),
+                    Job.task != LEASE_TASK,
+                ) \
                     .order_by(Job.updated.desc()).limit(25)
                 if project_id is not None:
                     rq = rq.where(Job.project_id == project_id)

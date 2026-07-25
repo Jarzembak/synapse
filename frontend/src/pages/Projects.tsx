@@ -1,6 +1,19 @@
 import { FormEvent, useEffect, useRef, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
-import { api, fmtDate, fmtDateTime, isPaperProject, isRepositoryProject, PipelineStatus, Project } from "../api";
+import {
+  api,
+  fmtDate,
+  fmtDateTime,
+  isPaperProject,
+  isRepositoryProject,
+  MediaAuthStatus,
+  PipelineStatus,
+  Project,
+} from "../api";
+import {
+  navigateAuthenticationWindow,
+  openAuthenticationWindow,
+} from "../components/MediaAuthentication";
 import { useEventSource } from "../useEventSource";
 
 // derived pipeline status → chip label + the CSS class it borrows from .jobstatus
@@ -39,7 +52,9 @@ export default function Projects() {
   const [sourceType, setSourceType] = useState<"url" | "local" | "upload">("url");
   const [uploadedFile, setUploadedFile] = useState<File | null>(null);
   const [title, setTitle] = useState("");
+  const [requiresLogin, setRequiresLogin] = useState(false);
   const [error, setError] = useState("");
+  const [createdAfterAuthFailure, setCreatedAfterAuthFailure] = useState<Project | null>(null);
   const [creating, setCreating] = useState(false);
   const [uploadProgress, setUploadProgress] = useState<number | null>(null);
   const nav = useNavigate();
@@ -109,8 +124,17 @@ export default function Projects() {
 
   async function create(e: FormEvent) {
     e.preventDefault();
+    const startAuthentication = sourceType === "url" && requiresLogin;
+    const authenticationWindow = startAuthentication
+      ? openAuthenticationWindow()
+      : null;
+    if (startAuthentication && !authenticationWindow) {
+      setError("Allow pop-ups for Synapse before creating a source that requires sign-in.");
+      return;
+    }
     setCreating(true);
     setError("");
+    setCreatedAfterAuthFailure(null);
     try {
       let p: Project;
       if (sourceType === "upload") {
@@ -123,8 +147,31 @@ export default function Projects() {
           body: JSON.stringify({ source, source_type: sourceType, title: title || null }),
         });
       }
+      if (startAuthentication && authenticationWindow) {
+        try {
+          const auth = await api<MediaAuthStatus>(
+            `/projects/${p.id}/auth/browser`,
+            { method: "POST" },
+          );
+          if (!auth.browser_url) {
+            throw new Error("The authentication browser did not provide a view URL.");
+          }
+          navigateAuthenticationWindow(authenticationWindow, auth.browser_url);
+        } catch (authError) {
+          authenticationWindow.close();
+          setCreatedAfterAuthFailure(p);
+          setError(
+            `The project was created, but its sign-in browser could not start: ${
+              authError instanceof Error ? authError.message : "unexpected error"
+            }`,
+          );
+          reload();
+          return;
+        }
+      }
       nav(`/projects/${p.id}`);
     } catch (err: any) {
+      authenticationWindow?.close();
       setError(err.message);
     } finally {
       setCreating(false);
@@ -181,7 +228,11 @@ export default function Projects() {
       <form onSubmit={create} className="newproject">
         <label className="sr-only" htmlFor="source-kind">Source type</label>
         <select id="source-kind" value={sourceType}
-          onChange={(e) => setSourceType(e.target.value as typeof sourceType)}>
+          onChange={(e) => {
+            const next = e.target.value as typeof sourceType;
+            setSourceType(next);
+            if (next !== "url") setRequiresLogin(false);
+          }}>
           <option value="url">URL</option>
           <option value="upload">Upload a file</option>
           <option value="local">Local file</option>
@@ -216,6 +267,16 @@ export default function Projects() {
         <label className="sr-only" htmlFor="project-title-draft">Project title</label>
         <input id="project-title-draft" placeholder="Title (optional — auto-named from the URL)"
                value={title} onChange={(e) => setTitle(e.target.value)} />
+        {sourceType === "url" && (
+          <label className="source-login-option">
+            <input
+              type="checkbox"
+              checked={requiresLogin}
+              onChange={(event) => setRequiresLogin(event.target.checked)}
+            />
+            Open an isolated sign-in browser after creating
+          </label>
+        )}
         <button type="submit" disabled={creating}>
           {creating && sourceType === "upload"
             ? uploadProgress !== null && uploadProgress > 0
@@ -234,6 +295,13 @@ export default function Projects() {
         <p className="hint">The file is stored privately with the project and removed when the project is deleted.</p>
       )}
       {error && <p className="error" role="alert">{error}</p>}
+      {createdAfterAuthFailure && (
+        <p>
+          <Link to={`/projects/${createdAfterAuthFailure.id}`}>
+            Open {createdAfterAuthFailure.title} and retry source sign-in
+          </Link>
+        </p>
+      )}
 
       <h2>Projects</h2>
       <div className="table-scroll" tabIndex={0} aria-label="Projects table; scroll horizontally if needed">

@@ -605,6 +605,14 @@ def write_artifact(
         if media_rel:
             meta["media"] = media_rel
         meta.update(extra_meta or {})
+        if project_id is not None and project.source_type == "url":
+            # A caller may supply richer download metadata, but never let it
+            # replace the canonical safe form with a signed/authenticated URL.
+            # Keep this after extra_meta so every URL-project Markdown writer
+            # receives the same protection.
+            from .security import redact_url
+
+            meta["source_url"] = redact_url(project.source)
         meta = {k: v for k, v in meta.items() if v is not None}
         _write_doc(rel_path, meta, body)
         document_written = True

@@ -16,6 +16,7 @@ import {
 } from "../api";
 import { useEventSource } from "../useEventSource";
 import { StreamStatus, useStreamStatus } from "../useStreamStatus";
+import MediaAuthentication from "../components/MediaAuthentication";
 import PaperProjectPanel from "../components/PaperProjectPanel";
 
 interface DetailStep extends Step {
@@ -41,6 +42,7 @@ interface Detail {
   run_all_active: boolean;
   run_all_state: "queued" | "running" | null;
   any_active: boolean;
+  media_auth_active?: boolean;
   profiles: Record<string, PipelineProfile>;
   repository?: RepositoryDetail | null;
 }
@@ -113,8 +115,6 @@ export default function ProjectDetail() {
   const [renaming, setRenaming] = useState(false);
   const [renamePending, setRenamePending] = useState(false);
   const [titleDraft, setTitleDraft] = useState("");
-  const [cookieFile, setCookieFile] = useState<File | null>(null);
-  const [uploadingCookies, setUploadingCookies] = useState(false);
   const [resetting, setResetting] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [selectedProfile, setSelectedProfile] = useState("full");
@@ -123,7 +123,6 @@ export default function ProjectDetail() {
   const [streamConnected, setStreamConnected] = useState(false);
   const [hasStreamSnapshot, setHasStreamSnapshot] = useState(false);
   const loadAbort = useRef<AbortController | null>(null);
-  const fileRef = useRef<HTMLInputElement>(null);
   const isCurrentRoute = useCallback(
     () => routeState.current.version === routeVersion,
     [routeVersion],
@@ -200,8 +199,6 @@ export default function ProjectDetail() {
     setRenaming(false);
     setRenamePending(false);
     setTitleDraft("");
-    setCookieFile(null);
-    setUploadingCookies(false);
     setResetting(false);
     setDeleting(false);
     setSelectedProfile("full");
@@ -296,44 +293,6 @@ export default function ProjectDetail() {
       else next.add(step);
       return next;
     });
-  }
-
-  async function uploadCookies() {
-    if (!cookieFile) {
-      setActionError("Choose a cookies.txt file before uploading.");
-      return;
-    }
-
-    beginAction();
-    setUploadingCookies(true);
-    const form = new FormData();
-    form.append("file", cookieFile);
-
-    try {
-      const response = await fetch(`/api/projects/${id}/cookies`, {
-        method: "POST",
-        body: form,
-      });
-      if (!response.ok) {
-        let message = response.statusText;
-        try {
-          message = (await response.json()).detail ?? message;
-        } catch {
-          // The status text is still useful when an upstream proxy returns HTML.
-        }
-        throw new Error(message);
-      }
-      if (!isCurrentRoute()) return;
-      setCookieFile(null);
-      if (fileRef.current) fileRef.current.value = "";
-      setNotice("cookies.txt uploaded. It will be used for authenticated media sources.");
-    } catch (caught) {
-      if (isCurrentRoute()) {
-        setActionError(`Cookies upload failed: ${errorMessage(caught)}`);
-      }
-    } finally {
-      if (isCurrentRoute()) setUploadingCookies(false);
-    }
   }
 
   async function saveRename() {
@@ -732,6 +691,13 @@ export default function ProjectDetail() {
           </div>
         </div>
       )}
+      {detail.project.source_type === "url" && (
+        <MediaAuthentication
+          projectId={detail.project.id}
+          disabled={detail.any_active}
+          onPipelineChanged={load}
+        />
+      )}
       <div className="board-toolbar">
         <label className="profile-picker" htmlFor="pipeline-profile">
           Pipeline
@@ -739,7 +705,7 @@ export default function ProjectDetail() {
             id="pipeline-profile"
             value={selectedProfile}
             onChange={(event) => setSelectedProfile(event.target.value)}
-            disabled={detail.run_all_active || runAllPending}
+            disabled={detail.run_all_active || runAllPending || detail.media_auth_active}
           >
             {profileEntries.map(([key, profile]) => (
               <option key={key} value={key}>{profile.label}</option>
@@ -750,7 +716,12 @@ export default function ProjectDetail() {
           type="button"
           className="runall"
           onClick={() => void runAll()}
-          disabled={detail.run_all_active || runAllPending || profileWork === 0}
+          disabled={
+            detail.run_all_active ||
+            runAllPending ||
+            Boolean(detail.media_auth_active) ||
+            profileWork === 0
+          }
           title={activeProfile?.description ?? "Queues missing or stale steps in this profile."}
         >
           {detail.run_all_state === "running"
@@ -767,28 +738,6 @@ export default function ProjectDetail() {
         {activeProfile?.description && (
           <span className="meta profile-description">{activeProfile.description}</span>
         )}
-
-        {!repositoryProject && <div className="cookies">
-          <label htmlFor="cookies-file">cookies.txt:</label>
-          <input
-            id="cookies-file"
-            type="file"
-            accept=".txt,text/plain"
-            ref={fileRef}
-            onChange={(event) => setCookieFile(event.target.files?.[0] ?? null)}
-            aria-describedby="cookies-help"
-          />
-          <button
-            type="button"
-            onClick={() => void uploadCookies()}
-            disabled={!cookieFile || uploadingCookies}
-          >
-            {uploadingCookies ? "Uploading..." : "Upload"}
-          </button>
-          <span id="cookies-help" className="sr-only">
-            Used for authenticated media sources such as Udemy.
-          </span>
-        </div>}
 
         {detail.any_active && (
           <button
@@ -868,6 +817,7 @@ export default function ProjectDetail() {
                           status === "running" ||
                           status === "queued" ||
                           (step.blocked && !step.done) ||
+                          Boolean(detail.media_auth_active) ||
                           rerunningStep !== ""
                         }
                       >
@@ -878,7 +828,11 @@ export default function ProjectDetail() {
                           type="button"
                           className={step.stale ? "" : "linkish"}
                           onClick={() => void rerunAffected(step.name)}
-                          disabled={detail.any_active || rerunningStep !== ""}
+                          disabled={
+                            detail.any_active ||
+                            Boolean(detail.media_auth_active) ||
+                            rerunningStep !== ""
+                          }
                           title="Rebuild this output and every later output that consumes it"
                         >
                           {rerunningStep === step.name ? "Queuing..." : "Re-run downstream"}

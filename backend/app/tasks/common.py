@@ -12,6 +12,7 @@ from ..db import get_session
 from ..context import current_job_id
 from ..models import Artifact, Job, Project, utcnow
 from .. import library
+from ..security import redact_urls
 
 log = logging.getLogger("synapse.pipeline")
 TERMINAL_JOB_STATES = {"done", "error", "canceled"}
@@ -19,6 +20,10 @@ TERMINAL_JOB_STATES = {"done", "error", "canceled"}
 
 class JobCanceled(RuntimeError):
     pass
+
+
+class PipelineTaskError(RuntimeError):
+    """A worker-safe failure containing only sanitized display text."""
 
 
 def set_job(session: Session, job_id: int, *, force: bool = False, **fields) -> bool:
@@ -100,6 +105,7 @@ def pipeline_task(fn):
                 log.info("step %s skipped: job=%s is no longer queued",
                          fn.__name__, job_id)
                 return None
+        sanitized_failure: PipelineTaskError | None = None
         try:
             local_only_policy: bool | None = None
             with get_session() as policy_session:
@@ -161,14 +167,35 @@ def pipeline_task(fn):
             log.info("step %s done (job=%s project=%s)", fn.__name__, job_id, project_id)
             return result
         except Exception as e:
-            log.exception("step %s failed (job=%s project=%s)",
-                          fn.__name__, job_id, project_id)
+            safe_error = redact_urls(str(e))
+            # Redact before truncating.  Truncating first could cut off a URL's
+            # scheme/host and leave a signed query tail that no longer matches
+            # the URL scrubber.
+            safe_traceback = redact_urls(traceback.format_exc())[-2000:]
+            log.error(
+                "step %s failed (job=%s project=%s): %s\n%s",
+                fn.__name__,
+                job_id,
+                project_id,
+                safe_error,
+                safe_traceback,
+            )
             with get_session() as session:
                 transition_job(
                     session, job_id, {"queued", "running"}, "error",
-                    error=f"{e}\n{traceback.format_exc()[-2000:]}",
+                    error=f"{safe_error}\n{safe_traceback}",
                 )
-            raise
+            sanitized_failure = PipelineTaskError(
+                safe_error or f"{fn.__name__} failed"
+            )
+
+        # Raise after leaving the original exception handler.  This prevents
+        # the raw provider exception from becoming this exception's context,
+        # while ``from None`` also keeps worker tracebacks/result serialization
+        # limited to the sanitized message above.
+        if sanitized_failure is None:  # pragma: no cover - success returns above
+            sanitized_failure = PipelineTaskError(f"{fn.__name__} failed")
+        raise sanitized_failure from None
 
     return wrapper
 

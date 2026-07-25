@@ -1,857 +1,136 @@
 # Synapse
 
-A self-hosted, containerized web app for turning any video or audio source — a
-local file, or a URL from YouTube, Vimeo, Udemy, or similar — into a permanent,
-searchable knowledge library. Point it at a talk once; it produces a transcript,
-a corrected transcript, a summary, two independent deep dives that get merged
-into one, a growing set of quick-reference docs (tools, techniques, concepts,
-technologies, or categories you define yourself), a two-host podcast script
-with generated audio, a trimmed audio-only copy, and an interactive mind map.
-Everything accumulates in one browsable, taggable library with exact and
-semantic search, source-grounded Q&A, timestamp playback links, and an optional
-push to your own cloud storage instead of living as scattered files.
+Synapse is a self-hosted knowledge-production studio for media, software
+repositories, and research papers. Give it a talk, a codebase, or a dense PDF
+and it creates source-grounded learning material: transcripts, summaries,
+deep dives, study guides, quick references, podcasts, mind maps, and searchable
+Q&A.
 
-It also accepts public or private GitHub repositories and produces a pinned,
-file-and-line-cited codebase study: overview, setup guide, architecture map,
-required knowledge, dependencies, deep dives, quick-references, podcast, mind
-map, and repository-grounded Q&A.
+The application runs in Docker and keeps a browsable Markdown library on your
+machine. You can use bundled local models, connect another local model server,
+or assign Anthropic, Gemini, and OpenAI models independently to different
+pipeline steps.
 
-PDF research papers and white papers have their own evidence-first pipeline:
-offline layout/OCR extraction, page-grounded claims and search, shared analysis,
-and independently approved Generalist, Practitioner, and Expert podcast series.
+## What Synapse can process
 
-Vibe coded by Fable and Sol and inspired by Jeff McJunkin's methodology.
+- **Video and audio** — browser uploads, mounted local files, and URLs supported
+  by [yt-dlp](https://github.com/yt-dlp/yt-dlp), including authenticated sources
+  when you provide a valid browser session or cookies.
+- **GitHub repositories** — public or private repositories pinned to an exact
+  commit, analyzed without executing repository code, with file-and-line
+  citations.
+- **Research papers** — PDF extraction with local OCR, page-grounded evidence,
+  quality review, paper Q&A, and independently planned Generalist,
+  Practitioner, and Expert multipart series.
 
-It supports both local models — the bundled Ollama (CPU-friendly by default)
-or any OpenAI-compatible server you already run, like LM Studio, llama.cpp,
-or vLLM — and frontier APIs (Claude, Gemini, OpenAI), configurable **per
-pipeline step**, so you can run cheaply on local hardware and reserve API
-spend for the steps that need it.
-Nearly every behavior — the prompts each step sends its model, generation
-temperature, audio pacing, tagging rules — is tunable from **Settings → Advanced**
-without touching code.
+## Highlights
 
-## Starting the stack — quick reference
-
-First-time setup lives in [Quick start](#quick-start). Day to day:
-
-| To run… | Use |
-|---|---|
-| CPU-only (default) | `docker compose up -d` (add `--build` after code changes) |
-| With an NVIDIA GPU | `docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build` |
-
-**Make GPU mode the default** so a plain `docker compose up` — and anything
-else that runs one — includes the overlay, by adding to `.env`:
-
-```bash
-# Windows (Docker Desktop) — note the semicolon separator:
-COMPOSE_FILE=docker-compose.yml;docker-compose.gpu.yml
-COMPOSE_PATH_SEPARATOR=;
-# Linux/macOS use a colon instead:
-# COMPOSE_FILE=docker-compose.yml:docker-compose.gpu.yml
-```
-
-**Docker Desktop's ▶ button doesn't choose a mode** — it restarts the
-containers exactly as they were last *created*. Overlays are applied when a
-`docker compose … up` command runs, so to switch between CPU and GPU stacks,
-re-run the appropriate command above (Compose recreates only what changed);
-after that, the ▶ button keeps starting that mode. To check which mode is
-live, from the project directory: `docker compose exec ollama nvidia-smi` —
-GPU details means the GPU stack, an error means CPU.
-
----
-
-- [How it works](#how-it-works)
-- [Quick start](#quick-start)
-- [Using the app](#using-the-app)
-- [GitHub repository analysis](#github-repository-analysis)
-- [Research paper analysis](#research-paper-analysis)
-- [Themes](#themes)
-- [Advanced settings](#advanced-settings)
-- [Cloud storage](#cloud-storage)
-- [Backups and encryption](#backups-and-encryption)
-- [The library on disk](#the-library-on-disk)
-- [Configuring models](#configuring-models)
-- [Local files, cookies, and remote GPUs](#local-files-cookies-and-remote-gpus)
-- [Network exposure](#network-exposure)
-- [Development](#development)
-- [Logging](#logging)
-- [Troubleshooting](#troubleshooting)
-- [Current limitations](#current-limitations)
-
-## How it works
-
-### Architecture
-
-Seven containers, orchestrated by `docker-compose.yml`:
-
-| Service | Role |
-|---|---|
-| `frontend` | nginx serving the built React SPA; proxies `/api` to `api` |
-| `api` | FastAPI — REST endpoints, SSE job stream, reads/writes the library |
-| `worker` | Celery worker — runs every pipeline step (this is where yt-dlp, ffmpeg, faster-whisper, Kokoro/Piper, and all LLM calls actually execute) |
-| `paper-worker` | concurrency-one, CPU-only Docling/Tesseract worker — extracts PDF layout, reading order, tables, formulas, OCR, provenance, and quality using models baked into its image |
-| `beat` | Celery scheduler — checks hourly whether a configured backup is due |
-| `redis` | Celery broker + result backend |
-| `ollama` | Local model server for any step configured to use a local model (Synapse can also use an OpenAI-compatible server you run yourself — see [Configuring models](#configuring-models)) |
-
-`api`, `worker`, and `beat` share the same backend image and codebase; `api`
-serves HTTP/SSE, `worker` consumes jobs, and `beat` only schedules periodic
-checks, so a slow transcription or LLM call never blocks the UI. The parser
-worker has a smaller dedicated image and consumes only the `paper` queue.
-
-### The media pipeline
-
-A media project is one video/audio source. Its pipeline is thirteen independent
-steps, run in order from the project's pipeline board — each writes an
-artifact you can open immediately, and each can be re-run on its own (e.g. if
-you edit the glossary and want to re-run correction, or swap the deep-dive
-model and regenerate just that step):
-
-1. **Ingest** — downloads the source with `yt-dlp` (best audio track) or copies/extracts audio from a local file.
-2. **Download & keep media** *(optional, URL sources only)* — archives the source permanently: the full video (best quality up to your configured resolution cap, merged to mp4) **and** an audio-only copy. Both are stored under `data/media/<project>/` and registered as library artifacts, so they're searchable, playable in the browser (the video player supports seeking), and downloadable. Local-file projects show "already local" instead.
-3. **Transcript** — tries the site's own captions first (manual subtitles preferred, auto-captions as fallback, parsed from WebVTT with rolling-caption dedup). If none exist, falls back to ASR: **faster-whisper** locally on CPU, or Gemini's native audio transcription if you've configured that step to use Gemini.
-4. **Correction pass** — an LLM re-reads the transcript and fixes transcription errors only (misheard words, mangled shell commands, wrong acronyms, garbled product names) using your glossary of known-correct terms. It does not summarize or edit for style — meaning and structure are preserved.
-5. **Summary** — a short (150–250 word) summary of the video.
-6. **Deep dive (Claude)** and **7. Deep dive (Gemini)** — two independent, structured deep-dive documents generated from the corrected transcript. Both are instructed to focus on **core concepts, tools, and technologies**, and critically: any procedural content in the source (a step-by-step tutorial, a walkthrough of a methodology, a config recipe) must be captured **in full** — every step, every command, the reasoning behind it, and the expected result — never compressed into a summary sentence.
-8. **Merge** — an LLM combines both deep dives into one unified document: redundant material is deduplicated (keeping the clearer telling of each point), unique content from each is folded in, and the **union of all procedures is preserved** — two procedures are only merged if they describe the literal same steps.
-9. **Quick-references** — reads the merged deep dive, identifies every entity discussed in substance under one of four built-in kinds — **tool**, **technique**, **concept**, **technology** — or any category you've defined yourself (see [Quick-refs categories](#using-the-app) below), and for each one either creates a new quick-reference doc or **merges new material into an existing one** if it has appeared before (matching handles name variants — e.g. "Nmap", "nmap NSE" — by showing the LLM the existing doc index and letting it match or justify a new entry; matched variants are recorded as aliases). Each kind gets a deliberately different document shape: a **tool** doc is a user-friendly instruction manual (what it is, getting started, core usage, examples, gotchas) for something you actually run; a **technique** doc is a step-by-step recipe for one specific task (goal, prerequisites, numbered steps with exact commands, verification); a **concept** doc is a crisp explainer for an idea or principle you understand rather than execute (definition, why it matters, how it works, related tools/techniques); a **technology** doc is a primer on a platform/protocol/standard (what it is, key pieces, how it works, how it's worked with). Custom categories use the doc prompt you write for them. Before any merge, the previous version of the doc is snapshotted so you can view or revert it later.
-10. **Podcast script** — a long two-host script (`HOST_A` / `HOST_B`) covering the merged deep dive, written as an outline first (so it has real structure and covers every segment) then expanded segment by segment for natural, technically accurate dialogue.
-11. **Podcast audio** — text-to-speech of that script. Two local providers: **Piper** (fast, CPU-friendly, recommended default) and **Kokoro** (also CPU today — see [Current limitations](#current-limitations)); each renders line-by-line, optionally in parallel, then stitches with ffmpeg. Gemini's native multi-speaker TTS is available as a cloud alternative.
-12. **Trim audio** — takes the original source audio, has an LLM identify off-topic spans from the timestamped transcript (intro chatter, sponsor reads, subscribe requests, tangents — conservatively, keeping anything it's unsure about), cuts those spans out with ffmpeg, and removes silence.
-13. **Mind map** — an LLM turns the merged deep dive into a topic graph (concepts, tools, techniques, technologies as nodes, with labeled relationships), rendered as a clickable, pannable diagram; clicking a node shows its description and links straight to its quick-reference doc if one exists.
-
-Every artifact is also **auto-tagged** from a shared, editable vocabulary.
-Tagging is project-level: one LLM call reads the project's richest document
-(the merged deep dive once it exists, else the corrected/raw transcript) and
-the resulting tag set is propagated to *all* of that project's artifacts —
-so metadata-only artifacts like the archived video or the podcast MP3 inherit
-accurate tags instead of being guessed at from their (nearly empty) own
-content. The set is recomputed automatically when a richer document appears.
-Quick-reference docs are the exception: they're cross-project and are tagged
-individually from their own content. Proposed tags are automatically
-sanitized before they reach the vocabulary — a small local model occasionally
-loops a token (`apis-apis-apis…`) or emits a run-on phrase; degenerate
-repeats are collapsed and over-long/multi-word junk is dropped, while
-existing tags you created on purpose are always trusted as-is.
-
-Every generated artifact also records the exact upstream content signature,
-model, prompt, and relevant settings that produced it. If a source, glossary,
-prompt, model, voice, or tuning value changes, the project board marks affected
-outputs **update available** all the way down the dependency graph. A profile
-run automatically rebuilds only missing or stale work. Built-in profiles cover
-Full production, Research library, Quick notes, and Audio edition; custom
-profiles can be assembled in Settings. “Re-run downstream” deliberately
-rebuilds one step and every output that consumes it. Summary/deep-dive prompts
-preserve `[HH:MM:SS]` source citations and label model-added background context.
+- A staged, resumable pipeline with live progress and targeted regeneration.
+- Exact SQLite FTS5 search plus optional semantic retrieval.
+- Answers grounded in timestamped media, repository lines, or PDF pages.
+- Cross-project quick-reference documents that improve as new sources arrive.
+- Two-host podcast scripts and local or cloud text-to-speech.
+- Per-step provider, model, prompt, temperature, and output-token controls.
+- Local Ollama and OpenAI-compatible servers such as LM Studio, llama.cpp,
+  vLLM, LocalAI, and Jan.
+- Optional Anthropic, Gemini, and OpenAI providers.
+- Markdown-first storage that can also be opened as an Obsidian vault.
+- Encrypted backups and optional S3, WebDAV, Google Drive, Dropbox, or OneDrive
+  synchronization.
+- Local-only privacy boundaries for repository projects and eligible paper
+  projects.
 
 ## Quick start
 
-Requires Docker (Docker Desktop on Windows/Mac, or Docker Engine on Linux) —
-everything else runs inside containers.
+You only need Docker Desktop on Windows or macOS, or Docker Engine with Compose
+on Linux.
 
 ```bash
+git clone https://github.com/Jarzembak/synapse.git
+cd synapse
 cp .env.example .env
-```
-
-Edit `.env`:
-
-```bash
-ANTHROPIC_API_KEY=sk-ant-...      # needed for the Claude deep dive, merge, quick-refs, podcast script, mind map (defaults)
-GEMINI_API_KEY=...                # needed for the Gemini deep dive (default), optional Gemini ASR/TTS
-```
-
-Both keys are optional independently — if you leave a key blank, just don't
-run the steps assigned to that provider (or reassign those steps to your local
-Ollama model in **Settings**; see [Configuring models](#configuring-models)).
-
-```bash
 docker compose up --build
 ```
 
-First-time setup, in another terminal, once the containers are up:
+In another terminal, install the default local chat model:
 
 ```bash
-# pull the default local model (also required for repository analysis)
 docker compose exec ollama ollama pull qwen3:8b
-# optional: enable meaning-based Hybrid search in Settings, then pull its model
+```
+
+For optional semantic search, also install the default embedding model:
+
+```bash
 docker compose exec ollama ollama pull nomic-embed-text
 ```
 
-(No terminal required for this step if you prefer the browser: once the app
-is up, **Settings → Model matrix → "Install an Ollama model"** does the same
-thing as a background job — see
-[Where Ollama models come from](#where-ollama-models-come-from).)
+Open [http://localhost:8080](http://localhost:8080). You can also install Ollama
+models later from **Settings → Model matrix**.
 
-Open **http://localhost:8080**.
+API keys are optional. Add only the providers you intend to use to `.env`, then
+assign their models in **Settings → Model matrix**:
 
-The default Compose stack binds the web app to loopback only. Synapse has no
-authentication, so it is not reachable from other devices unless you
-explicitly opt in; see [Network exposure](#network-exposure).
-
-That's it — everything else (the TTS provider's voice files, whether Piper or
-Kokoro; faster-whisper's ASR model) downloads automatically on first use of
-that step and is cached, so subsequent runs are fast.
-
-## Using the app
-
-**Projects** is where you start: paste a URL (YouTube, Vimeo, Udemy, or
-anything [yt-dlp supports](https://github.com/yt-dlp/yt-dlp)), upload an audio
-or video file directly in the browser, or give a mounted local-file path. The
-projects list shows each one's
-**derived pipeline status** — a colored chip (New / Partial / Running /
-Complete / Failed / Canceled), a `done/total` step count with a thin progress
-bar, the active or failed step's name, and last-activity time — computed live
-from the step graph rather than a static field, and refreshed automatically
-over the job stream. Opening a project shows its **pipeline board** —
-thirteen step cards you run in order (each is disabled while running/queued;
-a card turns green once its artifact exists, red on error with the full error
-message expandable inline). Choose a built-in or custom pipeline profile at
-the top; completed cards show when an update is available after their inputs
-or settings change, and can rebuild only themselves or their entire downstream
-branch. Progress updates live via server-sent events, so
-you can watch "transcribing 43%" or "writing segment 4/11" without
-refreshing. Each completed step links straight to its artifact.
-
-**Library** is the home page and the point of the whole app: every artifact
-from every project, in a server-paginated, sortable, filterable list without a
-silent result ceiling. **Exact** mode uses SQLite FTS5, so commands and quoted
-transcript phrases work, not just titles. **Hybrid** mode retrieves line-aware
-excerpts and optionally blends exact ranking with local Ollama embeddings, so
-conceptual searches can find relevant passages that use different wording.
-Query, mode, type/tag/project filters, ordering, and page are stored in the URL,
-making a filtered view bookmarkable. The **Ask your library** panel retrieves
-supporting excerpts first and requires the configured answer model to cite
-them as `[S1]`, `[S2]`, etc.; it refuses to fill gaps from general knowledge.
-Every citation keeps the excerpt visible, and timestamped sources offer a
-**play @ HH:MM:SS** link that opens the project's source media at that moment.
-
-**Quick-refs** is the accumulating tool/technique/concept/technology
-library — separate from the per-project pipeline because these documents are
-*cross-project*: the nmap quick-ref started from your first networking video
-keeps growing every time nmap comes up again. The left sidebar holds the
-controls — a search box (matches name, alias, or tag), toggle buttons per
-category, a sort dropdown (name / recently updated / most sources), and a tag
-cloud with counts (documents are tagged the same way library artifacts are).
-The main area lays out **one column per category** side by side (🔧 Tools /
-🎯 Techniques / 💡 Concepts / ⚙️ Technologies, plus any custom categories you
-add), so you see everything at a glance instead of scrolling one long list.
-Clicking a doc swaps the columns for its detail view — contributing videos,
-alias list, tags, version history (view or one-click revert any prior
-snapshot), and a delete-doc action — with a back button to return to the
-columns.
-
-You aren't limited to the four built-in kinds: **Settings → Quick-ref
-categories** lets you define your own (a custom label/icon/library-folder,
-a description that tells the entity-extraction step what belongs in it, and
-a doc-writing prompt of your own). New categories are picked up automatically
-by extraction; adding one shows a reminder banner naming the other prompts —
-deep dive, entity extraction, mind map — worth reviewing in the prompt editor
-so they actually surface that kind of material. A category's key and folder
-are fixed once created (existing docs never orphan), and one with existing
-docs can't be deleted until those docs are removed first.
-
-**Jobs** is a live view of the whole job queue across every project: what's
-running, what's queued, and recent history, all streamed over SSE. Whole-
-project "run all" jobs execute one at a time and auto-chain to the next
-queued project; individual steps run concurrently as worker capacity frees
-up. Any queued or running job can be canceled. Cancellation is fenced in the
-database before worker revocation, so a late provider response cannot publish
-or resurrect canceled work. On worker restart, orphaned rows are marked
-interrupted and the oldest durable whole-project run resumes automatically;
-**Continue queue** remains as a manual recovery control.
-
-**System** combines the live resource monitor (CPU, memory, library disk,
-active jobs, GPU/VRAM, and resident Ollama models) with operational checks.
-It tests the database, broker, worker, media tools, Ollama/embedding model,
-optional provider keys, and free space; shows local per-function model-call
-counts, errors, tokens and duration; reports vault/index integrity; can rebuild
-the SQLite search layer from Markdown; and creates, verifies, downloads, and
-lists backup snapshots.
-
-**Logs** tails the api/worker log files in the browser — no `docker compose
-logs` needed. Toggle between services, filter by minimum level (all / info+ /
-warning+ / error-only — multi-line tracebacks stay grouped under their
-error), filter by text, choose how many lines to tail, watch it live (polls
-every 2s) or freeze it, and download the current tail.
-
-**Settings** holds everything that changes how the pipeline behaves:
-provider-compatible per-function model selection, Piper/Kokoro/Gemini host
-voices, built-in and custom pipeline profiles, optional semantic indexing,
-backup schedule/retention/media policy, desktop completion notifications, the
-correction glossary, download resolution, tag vocabulary, quick-ref categories,
-and an **Advanced** section covering prompts, generation parameters,
-audio/pipeline/ASR/compute tuning, and cloud storage — see below.
-
-## GitHub repository analysis
-
-Choose **Projects -> GitHub repository** to turn a GitHub.com codebase into a
-source-grounded learning project. Synapse resolves the selected branch, tag, or
-commit to an immutable commit SHA, downloads that exact archive in the worker,
-and performs static analysis only. It never runs repository hooks, installs
-packages, initializes submodules, downloads Git LFS objects, builds, tests, or
-executes repository code.
-
-The repository pipeline creates:
-
-- a deterministic inventory and coverage report;
-- a plain-language repository overview;
-- setup and usage instructions based on commands actually found in the repo;
-- an architecture and code map;
-- a required-knowledge guide and suggested learning order;
-- a dependency and environment guide;
-- two independent deep dives, a merged study guide, quick-references, a podcast
-  script and local audio, and a repository-aware mind map.
-
-Repository claims cite exact file and line ranges at the analyzed commit. The
-retained snapshot also feeds project-filtered Library search and **Ask this
-repository**, so answers can link directly to the code that supports them.
-
-### Local-only processing and private repositories
-
-Open **Settings -> GitHub access** and enter a fine-grained personal access
-token limited to the repositories you choose with read-only **Contents**
-permission. The token is encrypted in Synapse's settings store, masked after it
-is saved, and never written to a project, artifact, command, URL, or log.
-
-All repository analysis is hard-restricted to local processing in this first
-release, whether the GitHub repository is public or private. Every chat-model
-step is forced through the configured repository Ollama model, podcast audio is
-forced through local Piper TTS, and every repository-derived artifact is
-excluded from cloud sync. Repository excerpts never leave the host. For that guarantee,
-`OLLAMA_BASE_URL` must resolve to the bundled `ollama` service, localhost, or a
-loopback address; Synapse refuses repository processing against a remote Ollama
-endpoint and bypasses environment HTTP proxies for those requests. Compose
-requests a 65,536-token Ollama context allocation; each model may cap that at
-its native context window (the default `qwen3:8b` is lower), while Synapse's
-bounded hierarchical prompts fit within the supported default. The daemon also sets
-`OLLAMA_NO_CLOUD=1`, and repository model names containing a `cloud` token are
-rejected so a loopback request cannot be transparently offloaded.
-If you supply your own loopback Ollama daemon, launch it with
-`OLLAMA_NO_CLOUD=1`; that server-side setting is mandatory for the same boundary.
-
-Plan capacity as well as software: the default model download is roughly 5 GB
-before runtime and context-cache overhead, CPU-only full-repository generation
-can take hours, and each retained commit may use up to the configured 512 MB
-compressed / 1 GB expanded snapshot limits. A compatible GPU is optional but
-substantially improves local analysis; adequate RAM and disk are required.
-The **System → Startup checks** panel reports whether the configured repository
-model is installed; once a repository project exists, that check is required.
-
-Repository origin is sticky even if a project is later deleted or a derived
-quick-reference is merged. This prevents a later full cloud sync from
-reclassifying retained repository material as public. Because exact source
-excerpts and derived guides are stored locally, `BACKUP_ENCRYPTION_KEY` is
-required before Synapse will create a backup while any repository analysis
-exists.
-Raw repository snapshots are excluded from backups by default and have a
-separate opt-in setting; enabling that opt-in always requires encrypted backups,
-because source trees can contain undiscovered credentials.
-
-### Scope and updates
-
-The import screen supports a whole repository, one folder, or explicit include
-and exclude paths. Generated, vendored, cached, binary, secret-prone, minified,
-and oversized files are catalogued or excluded under configurable limits;
-manifests are parsed for dependency evidence, while lockfiles are catalogued
-and exposed as bounded supporting evidence. The coverage report
-always says what was omitted instead of silently truncating analysis.
-
-A project follows the branch or ref you selected but never updates silently.
-Use **Check for updates** to compare its pinned commit with GitHub, then
-**Update analysis** to queue a new snapshot and rebuild affected artifacts.
-Unchanged evidence summaries are reused by content/configuration hash.
-
-## Research paper analysis
-
-Choose **Projects -> Research paper** to upload a PDF in the browser or import
-one from the read-only `/host-media` mount. V1 admits PDFs up to 250 MiB, 500
-pages, and five million extracted characters. English, Spanish, French, and
-German OCR can be selected per import. The source PDF is copied immutably into
-the project's library folder, retained for citations and backups, and always
-excluded from cloud sync. A revised PDF is a new project.
-
-Extraction runs locally in the concurrency-one `paper-worker`. It records every
-admitted prose, heading, definition, equation, table, caption, footnote, and
-reference block with a stable evidence ID, page, section path, bounding box,
-method, and quality metadata. There is no representative sampling or prefix
-truncation. Tables and formulas are structurally extracted and flagged when
-unreliable; charts and diagrams retain their captions and page locations but
-are marked for visual review rather than interpreted. A POOR document or
-nontrivial page blocks analysis until you replace the PDF or acknowledge the
-named page with a reason. Acknowledged gaps remain visible and cannot solely
-support a critical claim.
-
-After review, complete leaf maps and recursive, evidence-preserving reductions
-produce a coverage report, argument map, whole-paper mind map, quick references,
-and paper-grounded Library search/Q&A. The pipeline then drafts any selected
-Generalist, Practitioner, and Expert tracks and stops for approval. Each track
-is independent and contains one to five sequential 40–60 minute parts (50
-minutes by default). The plan editor requires every evidence block to have one
-primary part or a reasoned omission and prevents mapped critical topics from
-being silently demoted.
-
-An approved track generates its audience overview, methods/reproducibility,
-evidence/results, prerequisites/terminology, limitations/critique, explanatory
-and methodology deep dives, and definitive study guide. Each part adds cited
-show notes, a two-host script, and audio. Spoken dialogue contains no page
-citations; its segments keep validated evidence ledgers and clickable PDF page
-links outside the dialogue. Finalized scripts create immutable series-memory
-revisions for terminology, covered/deferred topics, claims, examples, stories,
-open questions, callbacks, and handoffs. Regenerating a script preserves but
-marks following scripts/audio stale and offers an explicit rebuild-following
-action; audio-only reruns do not change memory.
-
-Paper processing is local-only by default, covering LLMs, embeddings, tagging,
-Q&A, TTS, and cloud sync. Encrypted backups are required while a local-only
-paper exists. Cloud-enabled projects may use configured model providers and
-merge eligible quick references into the cross-project library, but their raw
-PDF still never syncs. V1 performs no external scholarly lookup or generative
-visual interpretation, and multipart GitHub generation remains a later release.
-
-## Themes
-
-A dropdown in the top-right corner of the nav bar switches the whole UI
-between six themes: **Light**, **Dark**, **Cyberpunk** (neon magenta/cyan on
-near-black), **Synthwave** (purple/pink/orange), **Terminal** (green CRT with
-scanlines), and **Amber CRT**. Your choice is saved in the browser
-(`localStorage`) and applied instantly with no reload; the mind map, markdown
-rendering, and code blocks all follow the active theme.
-
-## Advanced settings
-
-**Settings → Advanced** exposes seven collapsible groups for fine-tuning
-pipeline behavior beyond the model matrix:
-
-- **Prompt editor** — the exact system prompt sent to the model for every
-  pipeline step (correction, both deep-dive generators, the merge, entity
-  extraction, each quick-ref template including any custom category's own
-  prompt, podcast outline/segments, trim-span detection, mind map, tagging)
-  in an editable textarea. A "modified" badge marks any prompt you've changed
-  from the shipped default; "reset to default" clears your edit and reverts
-  instantly. Edits take effect the next time that step runs — nothing needs
-  restarting.
-- **Generation parameters** — per-function temperature and max-output-tokens
-  overrides, for when you want a specific step more deterministic (lower
-  temperature) or more creative, or need to raise the output ceiling for an
-  unusually long transcript.
-- **Audio tuning** — TTS speaking speed and the pause length inserted between
-  dialogue lines, a parallel-workers count for TTS synthesis (0 = auto; each
-  Piper line renders in its own process so this speeds it up directly, while
-  Kokoro's win comes mainly from the GPU — see below), plus the trim step's
-  silence threshold (dB) and minimum silence duration to cut.
-- **Pipeline behavior** — the correction pass's chunk size (characters per
-  LLM call), deep-dive depth (concise / standard / exhaustive), a target
-  podcast segment count (0 = let the model decide), the max tags applied per
-  artifact, and whether the auto-tagger is allowed to invent new vocabulary
-  tags or must only choose from existing ones.
-- **ASR options** — toggle the voice-activity-detection filter (disable if
-  faster-whisper is dropping quiet words) and set a language hint for
-  non-English sources (blank = auto-detect). The Whisper model size itself
-  (tiny → large) is set in the Model matrix, on the `asr` row.
-- **Compute** — GPU vs CPU device selection for faster-whisper (`auto` picks
-  CUDA when available) and its compute type, plus a Kokoro-device setting
-  that's effectively CPU-only today regardless of the GPU overlay — see
-  [Current limitations](#current-limitations) for why.
-- **Cloud storage** — see the next section.
-
-## Cloud storage
-
-Synapse can push every artifact it produces to your own cloud storage,
-either automatically as each one is written or on demand. This runs on
-[rclone](https://rclone.org/) inside the worker container, which is why one
-integration covers five very different backends — no separate SDK or app
-registration burden per provider beyond what's described below.
-
-**What syncs:** the entire `data/library/` tree (transcripts, deep dives,
-quick-refs, podcast script/audio, mind maps — everything) plus the archived
-`source_video`/`source_audio` files from `data/media/<project>/` if you've
-run the Download & keep media step. Working files (yt-dlp temp files,
-cookies, the transcription-only audio copy) are never uploaded.
-
-**When it runs:** turn on **auto-upload** and each artifact is queued for
-upload the moment its pipeline step finishes writing it — no separate click
-per file. Independently, the **"Sync everything now"** button does a full
-pass over the whole library and archived media at once, useful for backfilling
-artifacts that existed before you configured cloud storage, or for a periodic
-full resync. Clicking it again while one is already in flight returns the
-same in-progress sync rather than starting a second, overlapping one. On
-Google Drive specifically — the one backend of the five that allows multiple
-files with the same name in a folder — a full sync includes a dedupe
-pass that folds any same-name duplicates back down to the newest copy, so
-the remote self-heals rather than accumulating dupes from any past race.
-There's no scheduled sync — auto-upload-per-artifact and the manual button
-are the only triggers.
-
-**Sync direction:** by default everything is **one-way, local → cloud** —
-Synapse pushes and never touches your local files. Optionally, **Settings →
-Advanced → Cloud storage → Sync direction** switches "Sync everything now"
-to **two-way** for the library (built on `rclone bisync`): edit or add a
-Markdown document in the cloud copy — say, from Obsidian on another machine
-syncing against the same folder — and the next sync pulls it down, then
-rebuilds the index from the vault (and, when semantic search is enabled,
-re-embeds it) so the change shows up in the app. Know what you're opting into:
-
-- **Deletions propagate both ways.** Removing a document from the cloud copy
-  removes it locally on the next sync (and vice versa). As a safety stop, a
-  run that would delete more than half of either side aborts.
-- **Conflicting edits keep the newer version**; the older survives renamed
-  with a `.conflict` suffix rather than being lost.
-- The **first two-way run establishes a baseline** that merges both sides:
-  files unique to either side are copied to the other, nothing is deleted,
-  and where the *same* document differs on both sides the newer copy wins —
-  but during this baseline pass (only) the older copy is overwritten rather
-  than kept as a `.conflict` file, and on storage that doesn't track
-  modification times the local copy wins. Normal newer-wins-with-`.conflict`
-  behavior applies from the second run onward. A new baseline is also
-  established automatically whenever you change the provider, its
-  credentials, or the remote base folder.
-- **Archived media stays one-way** (push) in both modes, as does per-artifact
-  auto-upload — two-way applies only to the "Sync everything now" library pass.
-
-### Setup, step by step
-
-1. Open **Settings → Advanced → Cloud storage** and pick a **Provider** from
-   the dropdown. Below are the exact fields for each:
-
-   **S3-compatible** (AWS S3, self-hosted MinIO, Backblaze B2, Wasabi, or
-   anything else that speaks the S3 API):
-   - `endpoint` — the S3 API URL (e.g. `https://s3.us-east-1.amazonaws.com`
-     for AWS, `https://minio.yourdomain.com` for a self-hosted MinIO, or your
-     B2/Wasabi endpoint)
-   - `bucket` — the bucket name (create it in your provider's console first)
-   - `access_key_id` / `secret_access_key` — from your provider (IAM user for
-     AWS, an access key you generate in MinIO's console, an application key
-     for B2, etc.)
-   - `region` — optional; leave blank for MinIO/most non-AWS providers
-
-   **WebDAV** (Nextcloud, ownCloud, or any generic WebDAV server):
-   - `url` — your WebDAV endpoint, e.g. for Nextcloud:
-     `https://your-nextcloud.example.com/remote.php/dav/files/<your-username>`
-   - `vendor` — `nextcloud` or `owncloud` (blank defaults to `nextcloud`)
-   - `user` — your Nextcloud/ownCloud username
-   - `password` — an **app password**, not your login password: in
-     Nextcloud, go to Settings → Security → "Create new app password"
-
-   **Google Drive / Dropbox / OneDrive** (OAuth-based — no Synapse-side app
-   registration, but you generate a token once using rclone itself):
-   1. Install rclone on any machine with a web browser (`https://rclone.org/downloads/` —
-      this can be your everyday laptop, it doesn't need to be near Synapse).
-   2. Run `rclone authorize "drive"` (or `"dropbox"` / `"onedrive"`) in a
-      terminal. It opens your browser, asks you to sign in and approve
-      access, then prints a block of JSON to the terminal like
-      `{"access_token":"...","token_type":"Bearer",...}`.
-   3. Copy that entire JSON block and paste it into the **token** field in
-      Synapse's Settings.
-   4. Google Drive only: `root_folder_id` is optional — leave blank to sync
-      into "My Drive"'s root, or paste a folder ID to sync into a specific
-      existing folder. OneDrive only: `drive_type` is `personal` (default) or
-      `business`.
-   5. These tokens expire; if a sync starts failing after a long time, repeat
-      steps 1–3 to get a fresh token.
-
-2. Set **Remote base folder** (default `synapse`) — the top-level folder name
-   created inside your bucket/Drive/Nextcloud where everything lands
-   (`<remote_base>/library/...` and `<remote_base>/media/...`).
-3. Check **auto-upload each artifact when it's produced** if you want zero
-   manual steps going forward, or leave it off and rely on manual syncs.
-4. Click **Save cloud settings**.
-5. Click **Sync everything now** to do an initial full backfill of whatever's
-   already in your library. Progress shows in the job ticker (top-right of
-   the nav) same as any pipeline step; a status line under the cloud section
-   shows the result and timestamp of the last sync attempt, including the
-   error message if one failed.
-
-Secrets you enter are **masked** as soon as you save them — the API never
-echoes a saved `secret_access_key`, `password`, or `token` back to the
-browser (you'll see `•set•` instead). To rotate a credential, just type the
-new value over the masked field and save again; leaving it as `•set•` or
-blank keeps the previously stored value.
-
-## Backups and encryption
-
-Synapse can create a consistent ZIP containing an SQLite snapshot and the
-entire Markdown library, with archived/browser-uploaded source media optionally included.
-Backups live in `data/backups/`, which is shared by the API and worker. The
-lightweight `beat` service checks once per hour and queues a backup when the
-configured interval is due; scheduling is disabled by default. Retention
-defaults to the five newest archives. Configure the policy in **Settings →
-Backups**, then create, verify, or download snapshots under **System → Backups**.
-Verification checks the archive CRC and runs SQLite's own integrity check on
-the contained database snapshot. Backups wait until processing jobs finish, copy
-files into a stable staging area, and validate that nothing changed before the
-database snapshot is taken.
-
-Set `BACKUP_ENCRYPTION_KEY` in `.env` before creating backups if the archive
-should be encrypted. Use a long, random value, store it in a password manager,
-and keep it for as long as any encrypted archive exists—there is no recovery
-path if it is lost. Leaving it blank creates ordinary, unencrypted ZIP files,
-unless repository analysis exists; in that case Synapse refuses to create an
-unencrypted backup because SQLite contains repository evidence and derived guides.
-
-`SETTINGS_ENCRYPTION_KEY` protects saved cloud and GitHub credentials. If it is blank,
-Synapse generates `data/db/.settings.key` instead. For a portable disaster
-recovery setup, set and retain the environment value; otherwise secure a
-separate copy of `.settings.key`, because the database inside a Synapse backup
-does not contain that key. The backup directory is on the same host by
-default, so copy verified archives to another device or storage provider.
-
-The Markdown vault remains independently recoverable: **System → Library
-integrity → Rebuild index from vault** reconstructs projects, artifacts,
-quick-reference relationships, tags, FTS rows, and retrieval chunks. It does
-not overwrite Markdown. Project deletion stages folders before its database
-transaction; startup automatically restores or finishes any staging left by a
-power loss between those operations.
-
-## The library on disk
-
-Every artifact is a markdown file with YAML frontmatter, plus an SQLite index
-for search/sort/relations. **The markdown files are the source of truth for
-content; the database is just an index** — you can grep, `git`, sync, or back
-up `data/library/` directly, and it's openable as a second **Obsidian vault**
-(quick-refs and deep dives cross-link with `[[wikilinks]]`).
-
-```
-data/library/
-├── projects/<project-slug>/
-│   ├── transcript.md            # raw transcript, [HH:MM:SS]-timestamped
-│   ├── corrected.md             # after the correction pass
-│   ├── summary.md
-│   ├── deepdive_claude.md
-│   ├── deepdive_gemini.md
-│   ├── deepdive_merged.md
-│   ├── podcast_script.md
-│   ├── podcast_audio.md         # sidecar metadata; audio itself is podcast_audio.mp3
-│   ├── podcast_audio.mp3
-│   ├── trimmed_audio.md / .mp3
-│   ├── source_video.md          # sidecar for the archived download; the video/audio
-│   ├── source_audio.md          #   files themselves live in data/media/<slug>/
-│   └── mindmap.md               # topic-graph JSON in a code fence
-├── tools/<tool-slug>.md         # cross-project quick-references — instruction manuals
-├── techniques/<technique-slug>.md  #   — step-by-step recipes
-├── concepts/<concept-slug>.md      #   — explainers
-├── technologies/<technology-slug>.md  #   — platform/protocol primers
-├── <custom-category-folder>/       #   — one folder per category you define yourself
-└── .history/                    # timestamped snapshots taken before every quick-ref merge
+```dotenv
+ANTHROPIC_API_KEY=
+GEMINI_API_KEY=
+OPENAI_API_KEY=
 ```
 
-Frontmatter on every file includes `type`, `title`, `project`, `created`,
-`updated`, `provider`, `model`, `tags`, and provenance hashes/details for the
-effective inputs and configuration; quick-refs additionally track
-`aliases` (name variants matched to this doc). A quick-ref's artifact `type`
-is `quickref_<category-key>` — `quickref_tool`, `quickref_technology`,
-`quickref_<your-custom-key>`, and so on.
+Without cloud keys, reassign cloud-backed steps to Ollama or another local
+provider before running them.
 
-Working media and archived downloads live separately under `data/media/<slug>/`:
-the ingest step's working audio, yt-dlp temp files, and cookies, plus — once
-you've run **Download & keep media** — the permanent `source_video.mp4` and
-`source_audio.m4a`. Keeping the large binaries out of `data/library/` means
-your Obsidian-openable vault stays lightweight, while the sidecar `.md` files
-above keep the downloads searchable and playable from the Library UI. Back up
-`data/media/` too if the archived videos matter to you.
+### NVIDIA GPU
 
-## Configuring models
-
-Every LLM-driven step has an independent provider/model setting in
-**Settings → Model matrix**. Providers:
-
-- **ollama** — local, via the bundled `ollama` container (or point `OLLAMA_BASE_URL` in `.env` at a bigger box on your network — see below; repository analysis requires the bundled service or a loopback endpoint in v1). Default for correction, trim-span detection, and tagging (`qwen3:8b`).
-- **openai_compat** — any OpenAI-compatible server you run yourself, i.e. compatible engines that *aren't* OpenAI: LM Studio, llama.cpp server, vLLM, LocalAI, Jan, and the like. Set `OPENAI_COMPAT_BASE_URL` in `.env` (include the `/v1` suffix — e.g. LM Studio on the Docker host is `http://host.docker.internal:1234/v1`), plus `OPENAI_COMPAT_API_KEY` if your server enforces one. Any chat step — and semantic-search embeddings, via the provider dropdown under **Settings → Library intelligence** — can be assigned to it. (For OpenAI's own API, use the `openai` provider below instead.) Repository analysis never uses this provider; its steps are pinned to local Ollama.
-- **anthropic** — Claude API. Default for summary, the Claude deep dive, the merge, quick-references, the podcast script, and the mind map (all `claude-sonnet-5`; swap in `claude-opus-4-8` for more depth on any of these, or `claude-haiku-4-5` to cut cost on summary/quick-refs).
-- **gemini** — Gemini API. Default for the Gemini deep dive (`gemini-3.5-flash`); can also be assigned to ASR (native audio transcription) or TTS (native multi-speaker speech) if you'd rather not run those locally.
-- **openai** — OpenAI's own API (`OPENAI_API_KEY` in `.env`). A frontier provider like the two above: assign any chat step to it and pick from OpenAI's live model catalog in the dropdown — e.g. as a third deep-dive perspective, or in place of a provider you don't have a key for.
-
-Changing a dropdown takes effect on the *next run* of that step — nothing
-needs restarting. There's no requirement to use both frontier providers; if
-you only have an Anthropic key, for example, reassign the Gemini deep-dive
-step to `anthropic`/`claude-sonnet-5` (you'll get two Claude passes merged
-into one instead of a Claude+Gemini cross-check — still useful, just not the
-default two-perspective design) or to a local provider if you'd rather keep
-it fully local.
-
-### Local vs remote vs cloud — the mental model
-
-A provider names a *kind of server*, not a location:
-
-| Provider | Talks to | Which can run… |
-|---|---|---|
-| `ollama` | an Ollama server | in the bundled container (default), **or** on any other machine via `OLLAMA_BASE_URL` |
-| `openai_compat` | an OpenAI-compatible server that **isn't** OpenAI — LM Studio, llama.cpp, vLLM, LocalAI, Jan | on this same machine (`http://host.docker.internal:PORT/v1`), **or** on any other machine via `OPENAI_COMPAT_BASE_URL` |
-| `anthropic` / `gemini` / `openai` | that vendor's cloud API | Anthropic's / Google's / OpenAI's servers |
-
-Neither local provider is "local-only" or "remote-only" — the difference is
-just which URL you point it at. Pick `ollama` when the serving software is
-Ollama; pick `openai_compat` for everything else that speaks the OpenAI API
-except OpenAI itself, wherever it runs; pick `openai` for OpenAI's actual
-cloud service (it authenticates with `OPENAI_API_KEY` and speaks the current
-OpenAI request shape — reasoning models included — which self-hosted
-compatibility servers don't always accept).
-
-### Where Ollama models come from
-
-Ollama models must be **downloaded before a pipeline step can use them** —
-assigning a model that isn't installed fails at run time with a "not found"
-error. Models come from Ollama's public registry: browse
-[ollama.com/library](https://ollama.com/library) for names, sizes, and
-variants. Names take the form `name:tag` (e.g. `qwen3:8b`); omitting the tag
-means `latest`. Three ways to install one:
-
-1. **Settings → Model matrix → "Install an Ollama model"** — runs as a
-   background job with live download progress in **Jobs** (recommended; no
-   terminal needed).
-2. From a terminal: `docker compose exec ollama ollama pull qwen3:8b`.
-3. On a remote Ollama box: run `ollama pull qwen3:8b` there.
-
-Models land on whichever server `OLLAMA_BASE_URL` points at. Servers behind
-`openai_compat` manage their own models with their own tooling (LM Studio's
-model manager, vLLM's `--model` flag, …) — Synapse simply lists whatever the
-server reports.
-
-### Model dropdowns
-
-Every model field in the matrix is a dropdown of what the selected provider
-*actually offers right now*: installed models for `ollama` and
-`openai_compat`, and the vendor's live model list for `anthropic`, `gemini`,
-and `openai` (fetched with your API key; OpenAI's list is filtered to
-chat-capable models). Choose **custom…** to type a name the list doesn't
-show (a not-yet-pulled Ollama model, a brand-new API model). The ⟳ refresh
-link under the matrix re-queries every provider — useful right after
-installing a model.
-
-### Local model tuning
-
-**Settings → Advanced → Local models** controls how local providers are
-called:
-
-- **Context window** (`num_ctx`, Ollama only) — requested per call, so no
-  Modelfile edits are needed. Synapse defaults to 16k tokens because Ollama's
-  own default (4k in current releases) silently truncates the correction
-  pass's ~24k-character transcript chunks; raise it (up to 256k) for
-  local deep dives over long sources, or lower it if a big window doesn't fit
-  your RAM/VRAM. For `openai_compat` servers, set the context length in the
-  server itself (LM Studio's model settings, llama.cpp's `-c` flag).
-- **Keep model loaded** (Ollama only) — Ollama's `keep_alive`: `"5m"`
-  default, `"-1"` pins the model in memory between steps, `"0"` frees it
-  immediately after each call.
-- **Thinking** (Ollama only) — for reasoning models like `qwen3` or
-  `deepseek-r1`: `auto` keeps the model's default, `off` answers faster and
-  avoids reasoning loops on mechanical steps (tagging, correction), `on`
-  forces deliberate reasoning. Leave on `auto` for models without thinking
-  support — forcing a value errors on them. Inline `<think>` blocks are
-  stripped from outputs regardless.
-- **Request timeout** — for both local providers (default 300 s). Raise it if
-  a CPU-only box times out generating long outputs.
-- **JSON enforcement** — structured steps (trim spans, mind map, quick-ref
-  matching, tagging, the podcast-script outline) ask the server for
-  guaranteed-valid JSON (Ollama's `format`, OpenAI-compatible
-  `response_format`). Servers that reject `response_format` are retried
-  without it automatically; disable the toggle only if yours misbehaves with
-  it.
-
-The `asr` and `tts` rows aren't LLM chat calls, so they have their own
-provider sets: **asr** is `faster-whisper` (local, default) or `gemini`
-(native audio transcription); **tts** is `piper` (local, fast, recommended),
-`kokoro` (local, the older default), or `gemini` (native multi-speaker
-speech).
-
-## Local files, cookies, and remote GPUs
-
-**Browser upload (recommended for an ordinary file):** choose **Upload a
-file** on Projects. Synapse streams it into that project's private
-`data/media/<slug>/` folder, keeps a playable transcription-audio sidecar, and
-removes it with the project. The default limit is 20 GiB (`MAX_UPLOAD_BYTES`);
-nginx streams the request instead of buffering it in memory or temporary disk.
-
-**Mounted local-file input (useful for a large existing collection):** set
-`HOST_MEDIA_DIR` in `.env` to a folder on your host
-machine (default is `./data/media`, i.e. inside the project checkout). It's
-mounted read-only into the containers at `/host-media`. When creating a
-project with source type "local file", give a path **relative to that
-directory** — e.g. if `HOST_MEDIA_DIR=D:\Videos` and your file is
-`D:\Videos\talks\recon.mp4`, enter `talks/recon.mp4`.
-
-URL sources reject loopback, link-local, and private IP literals by default.
-Set `ALLOW_PRIVATE_URLS=true` only when you intentionally need a source served
-inside your trusted network. Credentials embedded in a URL are always rejected;
-use the per-project cookies upload for authenticated sites instead.
-
-### Downloading from sites that require a login
-
-For X/Twitter, Udemy, private Vimeo videos, Patreon, and other
-[yt-dlp-supported sites](https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md):
-
-1. Sign in with your normal browser and confirm that the exact video plays.
-2. Export that site's cookies as a Mozilla/Netscape-format `cookies.txt` file
-   using a trusted, local-only cookie exporter. For X, include both `x.com` and
-   `twitter.com` cookies when your session uses both domains.
-3. Create a URL project in Synapse, open its project page, and upload
-   `cookies.txt` **before** running **Ingest**, **Download & keep media**, or
-   **Transcript**. Choose **Download & keep media** to archive the video and an
-   audio-only copy; all three steps reuse the project's uploaded cookies.
-
-Cookies expire, so if yt-dlp reports a login or `403` error, sign in again,
-verify playback, and export a fresh file—preferably from a browser on the same
-network as Synapse. Treat `cookies.txt` like a password: never commit, share,
-or place it in a URL. Cookies only reproduce access your account already has;
-Synapse does not bypass DRM, and you should download only material you are
-authorized to retain. See yt-dlp's
-[cookie FAQ](https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp)
-for exporter and file-format troubleshooting.
-
-**Bigger local models on other hardware:** if you have a GPU box elsewhere on
-your network already running Ollama, set `OLLAMA_BASE_URL` in `.env` to its
-address (e.g. `http://10.0.0.5:11434`) instead of the bundled container for
-media and ordinary library workflows. Every step assigned to the `ollama`
-provider then runs there — no code changes, just point Settings at bigger
-model names (e.g. `qwen3:30b-a3b-instruct`) once they're pulled on that box.
-If that box runs LM Studio, llama.cpp, vLLM, or another OpenAI-compatible
-server instead of Ollama, set `OPENAI_COMPAT_BASE_URL` to it and assign steps
-to the `openai_compat` provider — same effect. Repository analysis
-intentionally rejects LAN/remote Ollama endpoints in v1 and requires the
-bundled service or a loopback endpoint.
-
-**Local NVIDIA GPU:** if the machine running Docker has an NVIDIA GPU, start
-the stack with the GPU overlay instead:
+Start with the GPU overlay to accelerate Ollama and faster-whisper:
 
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.gpu.yml up --build
 ```
 
-This grants the `ollama`, `worker`, and `api` containers GPU access (requires
-the NVIDIA Container Toolkit — bundled with Docker Desktop on Windows when an
-NVIDIA driver is present; `api` gets it only so the [System monitor](#using-the-app)'s
-`nvidia-smi` call can report utilization/VRAM, not for compute) and builds the
-worker with the CUDA libraries faster-whisper needs. Ollama then uses the GPU
-automatically for every `ollama`-assigned step; Whisper transcription is
-controlled from **Settings → Advanced → Compute** (device `auto`/`cpu`/`cuda`
-and compute type — `float16` for best GPU quality, `int8` for CPU). The
-default `auto` settings are safe either way: they use the GPU when it's
-available and fall back to CPU when it isn't. TTS (both Piper and Kokoro)
-runs on CPU regardless of the overlay — see
-[Current limitations](#current-limitations). Note that consumer GPUs around
-8 GB VRAM speed up the *same-size* local models dramatically but don't unlock
-meaningfully bigger ones — 7–8B-class quantized models remain the practical
-ceiling.
+To make that overlay the default on Windows, add this to `.env`:
 
-## Network exposure
+```dotenv
+COMPOSE_FILE=docker-compose.yml;docker-compose.gpu.yml
+COMPOSE_PATH_SEPARATOR=;
+```
 
-Synapse does not currently provide user authentication. The normal stack
-therefore publishes only the frontend, and only on `127.0.0.1:8080`; the API
-stays on Docker's private network and is reached through the frontend proxy.
+On Linux and macOS, use
+`COMPOSE_FILE=docker-compose.yml:docker-compose.gpu.yml` instead.
 
-To intentionally make the full app available on your LAN, set
-`SYNAPSE_BIND_ADDRESS=0.0.0.0` in `.env` and restart the stack. Treat that as
-granting everyone who can reach the host full access to the app and its
-library. Do not expose port 8080 directly to the internet; put authentication
-and TLS in a trusted reverse proxy first if remote access is required.
+### Create your first project
 
-Port 8000 is published only by `docker-compose.dev.yml`, and that development
-overlay also defaults to loopback. It is not needed when using the built-in
-frontend container.
+1. Open **Projects**.
+2. Choose a media URL/file, GitHub repository, or research paper.
+3. Review the project settings and privacy policy.
+4. Run a built-in pipeline profile, or run individual steps from the pipeline
+   board.
+5. Open the generated artifacts from the project or search them in **Library**.
+
+The default deployment binds only to `127.0.0.1`. Synapse does not provide
+multi-user authentication, so do not expose it directly to the internet.
+
+## Documentation
+
+Detailed documentation is maintained as wiki-ready Markdown in
+[`docs/wiki`](docs/wiki/Home.md):
+
+- [Getting started](docs/wiki/Getting-Started.md)
+- [Using Synapse](docs/wiki/Using-Synapse.md)
+- [How Synapse works](docs/wiki/How-Synapse-Works.md)
+- [Media ingestion](docs/wiki/Media-Ingestion.md)
+- [Authenticated media](docs/wiki/Authenticated-Media.md)
+- [GitHub repository analysis](docs/wiki/Repository-Analysis.md)
+- [Research paper analysis](docs/wiki/Research-Paper-Analysis.md)
+- [Models and providers](docs/wiki/Models-and-Providers.md)
+- [Configuration](docs/wiki/Configuration.md)
+- [Storage, backups, and cloud sync](docs/wiki/Storage-Backups-and-Cloud-Sync.md)
+- [Operations and troubleshooting](docs/wiki/Operations-and-Troubleshooting.md)
+- [Development](docs/wiki/Development.md)
+
+The [wiki publishing guide](docs/wiki/Wiki-Publishing.md) explains how these
+pages map to GitHub's separate wiki repository.
 
 ## Development
-
-Backend tests (pure Python, no Docker needed):
 
 ```bash
 cd backend
@@ -859,120 +138,17 @@ pip install -r requirements-dev.txt
 pytest tests -q
 ```
 
-Frontend dev server with hot reload (proxies `/api` to `localhost:8000`, so
-run the backend separately or start the backend containers with the
-development overlay first):
-
-```bash
-docker compose -f docker-compose.yml -f docker-compose.dev.yml up api redis ollama worker beat
-```
-
-Then, in another terminal:
-
 ```bash
 cd frontend
 npm ci
-npm run dev
+npm run typecheck
+npm run build
 ```
 
-`npm run typecheck` checks TypeScript without producing a build;
-`npm run build` runs that check and creates the production bundle. CI runs the
-backend tests, frontend type-check/build, and validates the default,
-development, and GPU Compose configurations on every pull request.
+See [Development](docs/wiki/Development.md) for the hot-reload stack,
+dependency-lock workflow, Compose validation, and logging.
 
-Backend container and CI installs are also locked while the requirement files
-remain portable for local development. Edit `requirements.txt` or
-`requirements-dev.txt`, then regenerate their Linux constraint locks from the
-`backend` directory with the same pinned compiler CI expects:
+## Project notes
 
-```bash
-python -m pip install pip-tools==7.5.3
-pip-compile --allow-unsafe --no-emit-index-url --no-emit-trusted-host --strip-extras --output-file=constraints.txt requirements.txt
-pip-compile --allow-unsafe --no-emit-index-url --no-emit-trusted-host --strip-extras --output-file=constraints-dev.txt requirements-dev.txt
-```
-
-Commit both the input and generated file, then rerun the backend tests.
-
-Rebuilding after backend/frontend code changes: `docker compose up --build`.
-
-Starting fresh (destructive — confirm you want to lose the library first):
-`docker compose down -v` removes the named volumes (Ollama/Whisper/Redis
-caches) but **not** the library, media, database, and logs — those are host
-bind mounts under `./data`. To wipe those too, also delete the directory:
-`docker compose down -v && rm -rf ./data`.
-
-## Logging
-
-The API, worker, and scheduler write structured, timestamped logs to two
-places at once: container stdout (visible through `docker compose logs`) and
-rotating log files on a shared volume — `data/logs/synapse-api.log`,
-`data/logs/synapse-worker.log`, and `data/logs/synapse-beat.log` (5 MB × 3
-rotations each). Every pipeline step logs its start/completion/failure, LLM
-calls log at debug level, and previously-silent background failures (cloud
-sync enqueueing, auto-tagging, caption fetch fallback) leave a warning trace
-instead of vanishing. Chatty third-party per-request logging (`httpx`, used
-by the system monitor's 2-second Ollama poll among other things) is pinned to
-WARNING so it doesn't drown out the app's own log lines.
-
-- **In-app viewer**: the **Logs** tab tails either service live in the
-  browser — no docker CLI or network access to the host needed. Filter by
-  minimum level or free text, choose how many lines to tail, watch it update
-  every 2 seconds or freeze it, and download the current tail. Multi-line
-  entries (tracebacks) stay grouped and colored under their error's level
-  even when you filter to errors-only.
-- **Log level**: set `LOG_LEVEL=DEBUG` (or WARNING/ERROR) in `.env` and
-  restart; default is INFO.
-- **Raw API**: `GET /api/logs` lists services with log files, and
-  `GET /api/logs/worker?lines=200` tails one directly if you want to script
-  against it.
-
-## Troubleshooting
-
-- **A step fails immediately with "missing prerequisite artifact"** — steps depend on earlier ones (e.g. the merge step needs both deep dives). Run the pipeline board top to bottom.
-- **Multiple projects are queued but nothing is running** — whole-project runs are serial by design. Worker startup normally clears interrupted jobs and resumes the oldest queued run automatically; if the broker was unavailable during that hand-off, use **Continue queue** in Jobs after Redis/worker readiness checks turn green in System.
-- **A completed card says “update available”** — one of its source artifacts, prompts, models, voices, or tuning values changed. Run the selected profile to refresh every stale consumer, or use **Re-run downstream** on the earliest changed step.
-- **Hybrid search only finds exact phrases** — enable semantic search in Settings, make sure `nomic-embed-text` (or your chosen embedding model) is installed in Ollama, and queue **Rebuild search index**. The System readiness card reports a missing embedding model.
-- **Transcription is slow** — faster-whisper on CPU is realistic for CPU-only hardware but not fast; for long videos, consider assigning the `asr` function to `gemini` in Settings instead, or run the [GPU overlay](#local-files-cookies-and-remote-gpus) if you have an NVIDIA card.
-- **TTS (podcast audio) is slow** — check the **System** tab while it runs: if CPU is pegged and no GPU shows activity, that's expected (TTS is CPU-only today, see [Current limitations](#current-limitations)). Try the `piper` provider if you're on `kokoro` — it's the faster of the two on CPU — and/or raise **Advanced → Audio → TTS parallel workers**.
-- **A frontier-model step errors with an auth/key message** — check the corresponding `_API_KEY` in `.env` and that you restarted (`docker compose up`) after editing it.
-- **yt-dlp fails on a URL** — the site may need cookies (see above) or may not be supported; check the **Logs** tab (or `docker compose logs worker`) for the underlying yt-dlp error.
-- **JSON-producing steps (trim spans, mind map, quick-ref matching) occasionally fail** — local models are more prone to malformed JSON than frontier ones. Synapse asks local servers for guaranteed-valid JSON natively (see [Local model tuning](#local-model-tuning)) and retries automatically; if a local model still consistently fails structured-output steps, assign those specific functions to a frontier provider instead.
-- **A local model seems to "forget" the start of long inputs, or a correction pass drops content** — the input exceeded the model's context window. Raise **Advanced → Local models → Context window** (Ollama), or your server's own context setting (`openai_compat`), and check the model itself supports that length.
-- **A step assigned to `openai_compat` errors immediately** — set `OPENAI_COMPAT_BASE_URL` in `.env` (include the `/v1` suffix) and restart the stack; the System tab's readiness card shows whether the server is reachable and how many models it offers (their names appear in the Settings model matrix's suggestions).
-- **Cloud sync fails** — check the status line under Settings → Advanced → Cloud storage for the specific rclone error. Common causes: an S3 `endpoint`/`bucket` typo, a WebDAV `password` that's your login password instead of an app password, or an expired Drive/Dropbox/OneDrive token (re-run `rclone authorize` and paste the fresh token).
-- **Google Drive shows duplicate files for the same artifact** — this can happen if two full syncs ever overlapped (Drive allows same-name duplicates in a folder, unlike the other four backends). Click **Sync everything now**: its final dedupe pass folds duplicates back down to the newest copy automatically.
-
-## Current limitations
-
-- ElevenLabs is listed as a future TTS option in the design but isn't wired
-  into the TTS step yet — the three working TTS providers today are Piper
-  (local), Kokoro (local), and Gemini (cloud). `ELEVENLABS_API_KEY` in
-  `.env.example` is a placeholder for that later addition.
-- No authentication — this is designed to run on a trusted local network for a
-  single user, not to be exposed to the internet.
-- **TTS runs on CPU even under the GPU overlay.** The GPU overlay accelerates
-  Ollama and faster-whisper; Piper and Kokoro both run on CPU regardless.
-  This isn't an oversight so much as a version conflict worth documenting: an
-  earlier attempt swapped in `onnxruntime-gpu` for Kokoro, but its current
-  release needs the CUDA 13 runtime while the image (matched to what
-  faster-whisper/ctranslate2 needs) ships CUDA 12 — so `onnxruntime` failed
-  to import entirely, breaking *both* TTS engines (Piper depends on the same
-  `onnxruntime` package). The fix reverted to CPU onnxruntime; Piper is
-  fast enough there that this hasn't been revisited. Resolving it for real
-  means either finding an `onnxruntime-gpu` build compatible with CUDA 12, or
-  moving the whole image to CUDA 13 and re-validating faster-whisper against
-  it. The **System** tab's GPU card is the way to confirm what's actually
-  running where on your hardware.
-- Cloud sync has no scheduler — auto-upload-per-artifact and the manual
-  "sync now" button are the only triggers. Two-way sync covers the library
-  only; archived media is always push. The backend image pins a current
-  rclone release (verified by checksum in the Dockerfile) rather than
-  Debian's years-old package, so provider token-format changes are a
-  version-bump away.
-- Job leasing/restart recovery assumes one ordinary worker and one paper worker
-  on their queue-partitioned tasks, as defined by `docker-compose.yml`. Scaling
-  either queue to independent worker replicas would need a distributed
-  lease/leader design for serialized project and track work.
-- Semantic retrieval stores vectors in SQLite and scores them in-process. It is
-  intentionally simple and private for a personal library; a very large
-  multi-user collection would warrant a dedicated vector index.
+Synapse was vibe coded by Fable and Sol, inspired by Jeff McJunkin's
+methodology.
