@@ -82,7 +82,7 @@ docstring-parser==0.18.0
     # via anthropic
 espeakng-loader==0.2.4
     # via kokoro-onnx
-fastapi==0.139.0
+fastapi==0.139.2
     # via -r requirements.txt
 faster-whisper==1.2.1
     # via -r requirements.txt
