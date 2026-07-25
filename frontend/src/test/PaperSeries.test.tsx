@@ -1,6 +1,6 @@
 import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { MemoryRouter, Route, Routes } from "react-router";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { api, Artifact, PaperSeriesPart, Project } from "../api";
 import PaperSeries from "../pages/PaperSeries";
@@ -104,8 +104,7 @@ describe("PaperSeries", () => {
   it("renders the immutable series bible and makes stale following outputs explicit", async () => {
     const user = userEvent.setup();
     render(
-      <MemoryRouter initialEntries={["/paper-series/91?part=911"]}
-        future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
+      <MemoryRouter initialEntries={["/paper-series/91?part=911"]}>
         <Routes>
           <Route path="/paper-series/:id" element={<PaperSeries />} />
         </Routes>

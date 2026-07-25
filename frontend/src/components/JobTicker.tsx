@@ -1,5 +1,5 @@
 import { useRef, useState } from "react";
-import { Link } from "react-router-dom";
+import { Link } from "react-router";
 import { Job } from "../api";
 import { useEventSource } from "../useEventSource";
 import { useStreamStatus } from "../useStreamStatus";

@@ -1,5 +1,5 @@
 import { isValidElement, ReactNode, useEffect, useMemo, useRef, useState } from "react";
-import { Link, useParams, useSearchParams } from "react-router-dom";
+import { Link, useParams, useSearchParams } from "react-router";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
@@ -322,7 +322,7 @@ export default function ArtifactView() {
     headingPosition.set(key, occurrence + 1);
     const match = toc.filter((item) => item.level === level && item.text === text)[occurrence];
     const headingId = match?.id ?? slugPart(text);
-    const Heading = `h${level}` as keyof JSX.IntrinsicElements;
+    const Heading = `h${level}` as "h1" | "h2" | "h3" | "h4";
     return <Heading id={headingId} className="anchored-heading">{children}</Heading>;
   }
 

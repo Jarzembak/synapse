@@ -1,5 +1,5 @@
 import { FormEvent, useRef, useState } from "react";
-import { Link, useNavigate } from "react-router-dom";
+import { Link, useNavigate } from "react-router";
 import { api, PAPER_AUDIENCES, PaperAudience, Project } from "../api";
 
 const MAX_BYTES = 250 * 1024 * 1024;
