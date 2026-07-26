@@ -20,11 +20,30 @@ from sse_starlette.sse import EventSourceResponse
 
 from ..config import settings
 from ..db import get_session
-from ..models import Job, LLMCall, Project
+from ..models import Job, LLMCall, PaperSource, Project
 from ..tasks.celery_app import celery
 from sqlmodel import select, text
 
 router = APIRouter(prefix="/api/system", tags=["system"])
+
+_LOCAL_MODEL_PROVIDERS = {
+    "ollama",
+    "faster-whisper",
+    "piper",
+    "kokoro",
+}
+_PAPER_ANALYSIS_FUNCTIONS = (
+    "paper_map",
+    "paper_reduce",
+    "paper_synthesis",
+    "paper_plan",
+)
+_PAPER_PRODUCTION_FUNCTIONS = (
+    "paper_synthesis",
+    "paper_script",
+    "paper_memory",
+    "tts",
+)
 
 
 def _num(s: str) -> float | None:
@@ -123,9 +142,174 @@ def _snapshot(cpu_interval: float | None = None) -> dict:
     }
 
 
+def _job_model_functions(job: Job, project: Project | None) -> tuple[str, ...]:
+    """Return model functions that an active tracked task can execute.
+
+    ``run_all`` is deliberately excluded: it is a coordinator, and each actual
+    child step has its own Job row. This prevents one local child from appearing
+    twice in deployment preflight results.
+    """
+    if job.task == "run_all":
+        return ()
+    if job.task == "paper_analyze":
+        return _PAPER_ANALYSIS_FUNCTIONS
+    if job.task == "paper_plan":
+        return ("paper_plan",)
+    if job.task == "paper_series_run":
+        return _PAPER_PRODUCTION_FUNCTIONS
+    if job.task == "paper_rebuild_following":
+        return ("paper_script", "paper_memory", "tts")
+    if job.task == "paper_part_step":
+        try:
+            options = json.loads(job.options or "{}")
+        except (TypeError, json.JSONDecodeError):
+            options = {}
+        step = options.get("step") if isinstance(options, dict) else None
+        return {
+            "guide": ("paper_synthesis",),
+            "script": ("paper_script", "paper_memory"),
+            "audio": ("tts",),
+        }.get(step, _PAPER_PRODUCTION_FUNCTIONS)
+    if project is None:
+        return ()
+
+    from ..provenance import REPOSITORY_STEP_FUNCTION, STEP_FUNCTION
+
+    functions = (
+        REPOSITORY_STEP_FUNCTION
+        if project.source_type == "github"
+        else STEP_FUNCTION
+    )
+    function = functions.get(job.task)
+    return (function,) if function else ()
+
+
+def _active_local_model_jobs() -> list[dict]:
+    """Describe queued/running Job rows that depend on local model services.
+
+    The result is intentionally read-only and contains no source URLs or prompt
+    content. It is suitable for a deployment or compute-mode preflight, but it
+    does not attempt to start, stop, or recreate Docker services.
+    """
+    with get_session() as session:
+        jobs = list(session.exec(
+            select(Job).where(
+                Job.status.in_(("queued", "running"))
+            ).order_by(Job.created)
+        ).all())
+        project_ids = {job.project_id for job in jobs if job.project_id}
+        projects = {
+            project.id: project
+            for project in session.exec(
+                select(Project).where(Project.id.in_(project_ids))
+            ).all()
+        } if project_ids else {}
+        paper_project_ids = {
+            project.id for project in projects.values()
+            if project.source_type == "paper"
+        }
+        paper_local_only = {
+            source.project_id: bool(source.local_only)
+            for source in session.exec(
+                select(PaperSource).where(
+                    PaperSource.project_id.in_(paper_project_ids)
+                )
+            ).all()
+        } if paper_project_ids else {}
+
+    found: list[dict] = []
+    for job in jobs:
+        project = projects.get(job.project_id)
+        executions: list[dict] = []
+
+        if job.task in {"ollama_pull", "ollama_benchmark"}:
+            model = (job.progress or "").split(": ", 1)[0]
+            executions.append({
+                "function": (
+                    "model_install"
+                    if job.task == "ollama_pull"
+                    else "model_benchmark"
+                ),
+                "provider": "ollama",
+                "model": model,
+            })
+        elif job.task == "paper_extract":
+            executions.append({
+                "function": "paper_extract",
+                "provider": "docling",
+                "model": "layout/OCR",
+            })
+        elif job.task in {
+            "index_artifact_chunks",
+            "index_paper_chunks",
+            "rebuild_search",
+        }:
+            from ..search import embedding_model, embedding_provider
+
+            provider = embedding_provider()
+            if provider == "ollama":
+                executions.append({
+                    "function": "embedding",
+                    "provider": provider,
+                    "model": embedding_model(),
+                })
+        else:
+            from .. import llm
+
+            local_only = (
+                True
+                if project and project.source_type == "github"
+                else paper_local_only.get(project.id, True)
+                if project and project.source_type == "paper"
+                else None
+            )
+            with llm.project_scope(
+                project.id if project else None,
+                local_only=local_only,
+            ):
+                for function in _job_model_functions(job, project):
+                    provider, model = llm.resolve_model(function)
+                    if provider not in _LOCAL_MODEL_PROVIDERS:
+                        continue
+                    execution = {
+                        "function": function,
+                        "provider": provider,
+                        "model": model,
+                    }
+                    if execution not in executions:
+                        executions.append(execution)
+
+        if not executions:
+            continue
+        found.append({
+            "id": job.id,
+            "task": job.task,
+            "status": job.status,
+            "project_id": job.project_id,
+            "project_title": project.title if project else "",
+            "paper_series_id": job.paper_series_id,
+            "paper_part_id": job.paper_part_id,
+            "executions": executions,
+        })
+    return found
+
+
+def _deployment_model_status() -> dict:
+    jobs = _active_local_model_jobs()
+    queued = sum(job["status"] == "queued" for job in jobs)
+    running = sum(job["status"] == "running" for job in jobs)
+    return {
+        "safe_to_restart_local_model_services": not jobs,
+        "active_local_model_jobs": jobs,
+        "queued": queued,
+        "running": running,
+    }
+
+
 def _preflight() -> dict:
     checks: list[dict] = []
     repository_projects_exist = False
+    deployment: dict
 
     def add(name: str, ok: bool, detail: str, required: bool = True):
         checks.append({"name": name, "ok": ok, "detail": detail, "required": required})
@@ -234,9 +418,42 @@ def _preflight() -> dict:
         add("disk space", free_gb >= 2, f"{free_gb:.1f} GB free")
     except OSError as exc:
         add("disk space", False, str(exc))
+    try:
+        deployment = _deployment_model_status()
+        local_count = len(deployment["active_local_model_jobs"])
+        if local_count:
+            add(
+                "local-model restart safety",
+                False,
+                f"{deployment['running']} running and {deployment['queued']} queued "
+                "local-model job(s); wait or cancel before recreating worker/Ollama",
+                required=False,
+            )
+        else:
+            add(
+                "local-model restart safety",
+                True,
+                "no queued or running local-model jobs",
+                required=False,
+            )
+    except Exception as exc:
+        deployment = {
+            "safe_to_restart_local_model_services": False,
+            "active_local_model_jobs": [],
+            "queued": 0,
+            "running": 0,
+            "error": str(exc)[:500],
+        }
+        add(
+            "local-model restart safety",
+            False,
+            f"could not inspect active jobs: {exc}",
+            required=False,
+        )
     return {
         "ready": all(check["ok"] for check in checks if check["required"]),
         "checks": checks,
+        "deployment": deployment,
     }
 
 

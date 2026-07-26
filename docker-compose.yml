@@ -255,6 +255,11 @@ services:
     image: ollama/ollama:latest@sha256:509fdf54e23bd50d87af646cb51c0a7a203d6a83cc4d6695b3b08c5be1c62c0a
     environment:
       - OLLAMA_CONTEXT_LENGTH=${OLLAMA_CONTEXT_LENGTH:-65536}
+      # One resident model and one generation at a time are conservative
+      # defaults for laptop GPUs. Larger hosts may explicitly raise either
+      # value, while Synapse's per-call admission check still guards memory.
+      - OLLAMA_MAX_LOADED_MODELS=${OLLAMA_MAX_LOADED_MODELS:-1}
+      - OLLAMA_NUM_PARALLEL=${OLLAMA_NUM_PARALLEL:-1}
       # Repository-local is a hard data boundary; never permit Ollama's
       # transparent cloud-model offload through the loopback daemon.
       - OLLAMA_NO_CLOUD=1

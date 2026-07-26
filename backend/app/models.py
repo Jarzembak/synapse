@@ -109,6 +109,72 @@ class Job(SQLModel, table=True):
     updated: datetime = Field(default_factory=utcnow)
 
 
+class MediaStorageTarget(SQLModel, table=True):
+    """Stable identity of one authoritative media destination.
+
+    Credentials remain in encrypted Settings rows.  Media objects retain this
+    non-secret identity so changing the global cloud configuration cannot make
+    an existing cloud-only object silently point at a different destination.
+    """
+
+    id: int | None = Field(default=None, primary_key=True)
+    identity_hash: str = Field(index=True, unique=True)
+    provider: str = Field(index=True)
+    remote_base: str
+    config_fingerprint: str = ""
+    created: datetime = Field(default_factory=utcnow)
+    updated: datetime = Field(default_factory=utcnow)
+
+
+class ProjectMediaPolicy(SQLModel, table=True):
+    """Per-project media retention policy; absence means ``keep_local``."""
+
+    project_id: int = Field(foreign_key="project.id", primary_key=True)
+    mode: str = Field(default="keep_local", index=True)
+    storage_target_id: int | None = Field(
+        default=None, foreign_key="mediastoragetarget.id", index=True)
+    created: datetime = Field(default_factory=utcnow)
+    updated: datetime = Field(default_factory=utcnow)
+
+
+class MediaObject(SQLModel, table=True):
+    """Durable state for an eligible source or generated media payload."""
+
+    id: int | None = Field(default=None, primary_key=True)
+    project_id: int = Field(foreign_key="project.id", index=True)
+    artifact_id: int | None = Field(
+        default=None, foreign_key="artifact.id", index=True)
+    role: str = Field(index=True)
+    # Same locator convention as Artifact.media_path: ``media:`` addresses
+    # MEDIA_DIR, while an unprefixed value addresses LIBRARY_DIR.
+    local_path: str
+    storage_target_id: int | None = Field(
+        default=None, foreign_key="mediastoragetarget.id", index=True)
+    remote_key: str = ""
+    state: str = Field(default="local", index=True)
+    size_bytes: int = 0
+    sha256: str = ""
+    remote_size_bytes: int = 0
+    remote_sha256: str = ""
+    verified_at: datetime | None = None
+    last_error: str = ""
+    eviction_token: str = ""
+    staging_path: str = ""
+    created: datetime = Field(default_factory=utcnow)
+    updated: datetime = Field(default_factory=utcnow)
+
+
+class MediaLease(SQLModel, table=True):
+    """Short-lived guard preventing eviction while media is being served."""
+
+    id: int | None = Field(default=None, primary_key=True)
+    media_object_id: int = Field(foreign_key="mediaobject.id", index=True)
+    token: str = Field(index=True, unique=True)
+    owner: str = ""
+    expires_at: datetime = Field(index=True)
+    created: datetime = Field(default_factory=utcnow)
+
+
 class SearchChunk(SQLModel, table=True):
     """Retrievable excerpt used by FTS, semantic search, and grounded Q&A."""
 

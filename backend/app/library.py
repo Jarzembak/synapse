@@ -30,7 +30,8 @@ from sqlmodel import Session, select, text
 
 from .config import settings
 from .models import (Artifact, ArtifactTag, ChunkEmbedding, Job, Project,
-                     QuickRef, QuickRefSource, SearchChunk, Tag, utcnow)
+                     ProjectMediaPolicy, QuickRef, QuickRefSource, SearchChunk,
+                     Tag, utcnow)
 
 log = logging.getLogger(__name__)
 
@@ -49,6 +50,31 @@ ARTIFACT_TYPES = [
     "paper_deepdive_methodology", "paper_study_guide",
     "paper_part_guide", "paper_part_script", "paper_part_audio",
 ]
+
+# These payload types are owned by the cloud-primary media lifecycle. Keep this
+# aligned with media_storage.ELIGIBLE_ARTIFACT_TYPES until the storage-domain
+# constants can be moved to a dependency-neutral module.
+CLOUD_PRIMARY_MEDIA_ARTIFACT_TYPES = frozenset({
+    "source_audio",
+    "source_video",
+    "podcast_audio",
+    "trimmed_audio",
+    "paper_part_audio",
+})
+
+
+def artifact_media_is_cloud_primary(
+    session: Session, artifact: Artifact,
+) -> bool:
+    """Whether legacy cloud sync must omit this artifact's binary payload."""
+    if (
+        artifact.project_id is None
+        or not artifact.media_path
+        or artifact.type not in CLOUD_PRIMARY_MEDIA_ARTIFACT_TYPES
+    ):
+        return False
+    policy = session.get(ProjectMediaPolicy, artifact.project_id)
+    return bool(policy and policy.mode == "cloud_primary")
 
 
 def lib_path(rel: str) -> Path:
@@ -152,7 +178,12 @@ def artifact_is_restricted(session: Session, artifact: Artifact) -> bool:
 
 def artifact_is_cloud_excluded(session: Session, artifact: Artifact) -> bool:
     """Whether an artifact must never be copied to configured cloud storage."""
+    project = (
+        session.get(Project, artifact.project_id)
+        if artifact.project_id is not None else None
+    )
     return bool(getattr(artifact, "cloud_sync_excluded", False)
+                or bool(project and project.deleting)
                 or artifact_is_restricted(session, artifact)
                 or artifact_is_repository_derived(session, artifact))
 
@@ -667,11 +698,17 @@ def _queue_cloud_sync(artifact: Artifact) -> None:
             stored = session.get(Artifact, artifact.id) if artifact.id else None
             if stored is None or artifact_is_cloud_excluded(session, stored):
                 return
+            sidecar_path = stored.path
+            payload_path = (
+                None
+                if artifact_media_is_cloud_primary(session, stored)
+                else stored.media_path
+            )
         # lazy import — library.py is used by the API, which must not pull the
         # whole celery task tree at module import time
         from .tasks.celery_app import celery
 
-        paths = [artifact.path] + ([artifact.media_path] if artifact.media_path else [])
+        paths = [sidecar_path] + ([payload_path] if payload_path else [])
         celery.send_task("cloud_sync_paths", args=[paths])
     except Exception as e:
         # a broker hiccup must never fail an artifact write — but leave a trace

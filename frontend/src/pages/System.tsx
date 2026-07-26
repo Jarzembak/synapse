@@ -37,6 +37,19 @@ interface UsageRow {
 }
 interface BackupItem { name: string; size: number; updated: number; encrypted: boolean }
 interface BackupList { backups: BackupItem[]; encryption_configured: boolean }
+export interface BackupVerification {
+  valid: boolean;
+  files: number;
+  media_self_contained?: boolean;
+  cloud_primary_media?: {
+    applicable: boolean;
+    valid: boolean;
+    dependency_count: number;
+    requires_remote: boolean;
+    remote_availability_checked: boolean;
+    message: string;
+  };
+}
 interface LibraryHealth {
   healthy: boolean; schema_version: number; files: number; artifacts: number;
   fts_rows: number; fts_consistent: boolean; search_chunks: number; missing_files: string[];
@@ -51,6 +64,26 @@ const STREAM_LABEL: Record<StreamStatus, string> = {
   offline: "offline",
   stale: "stale",
 };
+
+export function backupVerificationLabel(result: BackupVerification): string {
+  if (!result.valid) return "Verification failed";
+  const base = `Verified (${result.files} files)`;
+  const cloudMedia = result.cloud_primary_media;
+  if (cloudMedia?.requires_remote) {
+    const count = cloudMedia.dependency_count;
+    return (
+      `${base}; not portable by itself — depends on ${count} cloud-primary ` +
+      `media object${count === 1 ? "" : "s"} at the configured remote`
+    );
+  }
+  if (cloudMedia && !cloudMedia.applicable) {
+    return `${base}; archived media was not included`;
+  }
+  if (result.media_self_contained) {
+    return `${base}; selected media is self-contained`;
+  }
+  return base;
+}
 
 function Meter({ label, pct, sub }: { label: string; pct: number; sub?: string }) {
   return (
@@ -153,11 +186,11 @@ export default function System() {
   async function verifyBackup(name: string) {
     setAction(`verify:${name}`);
     try {
-      const result = await api<{ valid: boolean; files: number }>(
+      const result = await api<BackupVerification>(
         `/backups/${encodeURIComponent(name)}/verify`,
       );
       setVerification((current) => ({
-        ...current, [name]: result.valid ? `Verified (${result.files} files)` : "Verification failed",
+        ...current, [name]: backupVerificationLabel(result),
       }));
     } catch (error) {
       setVerification((current) => ({

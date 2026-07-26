@@ -9,6 +9,16 @@ from sqlmodel import select, text
 
 from ..config import ADVANCED_DEFAULTS, FUNCTION_DEFAULTS, advanced, settings
 from ..db import get_session
+from ..local_model_safety import (
+    LocalModelSafetyError,
+    acknowledge_blocked_model,
+    clear_acknowledgement,
+    ensure_model_safe,
+    inspect_model,
+    model_catalog,
+    save_annotation,
+    unload_model,
+)
 from ..models import Job, Tag
 from ..settings_store import (get_setting, set_setting,
                               set_cloud_settings_if_no_pending_purge,
@@ -158,6 +168,87 @@ def provider_models():
     return out
 
 
+def _model_safety_http(exc: LocalModelSafetyError) -> HTTPException:
+    return HTTPException(status_code=exc.http_status, detail=exc.detail())
+
+
+@router.get("/ollama/models")
+def ollama_models(refresh: bool = False):
+    """Structured installed-model inventory with compatibility and fit data."""
+    return model_catalog(refresh=refresh)
+
+
+class OllamaAnnotation(BaseModel):
+    model: str
+    label: str = ""
+    notes: str = ""
+    labels: list[str] = Field(default_factory=list)
+
+
+@router.put("/ollama/annotation")
+def save_ollama_annotation(req: OllamaAnnotation):
+    inventory, row = inspect_model(req.model)
+    name = row["name"] if inventory["ok"] and row else req.model.strip()
+    try:
+        annotation = save_annotation(
+            name,
+            label=req.label,
+            notes=req.notes,
+            labels=req.labels,
+        )
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    catalog = model_catalog()
+    stored = next(
+        (item for item in catalog["models"] if item["name"] == name),
+        None,
+    )
+    return stored or {"name": name, "annotation": annotation}
+
+
+class OllamaAcknowledgement(BaseModel):
+    model: str
+    digest: str
+    confirmation: str
+    reason: str
+
+
+@router.post("/ollama/acknowledge")
+def acknowledge_ollama_model(req: OllamaAcknowledgement):
+    try:
+        assessment = acknowledge_blocked_model(
+            req.model.strip(),
+            digest=req.digest.strip(),
+            confirmation=req.confirmation,
+            reason=req.reason,
+        )
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    return {
+        "ok": True,
+        "model": req.model.strip(),
+        "digest": req.digest.strip(),
+        "assessment": assessment,
+    }
+
+
+@router.delete("/ollama/acknowledgements/{digest}")
+def delete_ollama_acknowledgement(digest: str):
+    return {"ok": True, "removed": clear_acknowledgement(digest)}
+
+
+class OllamaUnload(BaseModel):
+    model: str
+
+
+@router.post("/ollama/unload")
+def unload_ollama_model(req: OllamaUnload):
+    try:
+        return unload_model(req.model.strip())
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
 class OllamaPull(BaseModel):
     model: str
 
@@ -203,6 +294,59 @@ def ollama_pull(req: OllamaPull):
         return job.model_dump()
 
 
+class OllamaBenchmark(BaseModel):
+    model: str
+
+
+@router.post("/ollama/benchmark")
+def ollama_benchmark(req: OllamaBenchmark):
+    model = req.model.strip()
+    if not model:
+        raise HTTPException(400, "model name required")
+    try:
+        ensure_model_safe(
+            model,
+            role="completion",
+            requested_context=2_048,
+            refresh=True,
+        )
+    except LocalModelSafetyError as exc:
+        raise _model_safety_http(exc) from exc
+    from ..tasks.celery_app import celery
+
+    with get_session() as session:
+        active = session.exec(
+            select(Job).where(
+                Job.task == "ollama_benchmark",
+                Job.status.in_(("queued", "running")),
+            )
+        ).all()
+        for existing in active:
+            progress = existing.progress or ""
+            if progress == model or progress.startswith(model + ": "):
+                return existing.model_dump()
+        job = Job(project_id=None, task="ollama_benchmark", progress=model)
+        session.add(job)
+        session.commit()
+        session.refresh(job)
+        try:
+            async_result = celery.send_task(
+                "ollama_benchmark",
+                args=[job.id, model],
+            )
+            job.celery_id = async_result.id
+        except Exception as exc:
+            job.status = "error"
+            job.error = f"could not dispatch: {exc}"[:2000]
+            session.add(job)
+            session.commit()
+            raise HTTPException(503, f"could not queue benchmark: {exc}") from exc
+        session.add(job)
+        session.commit()
+        session.refresh(job)
+        return job.model_dump()
+
+
 class ModelOverride(BaseModel):
     provider: str
     model: str
@@ -219,9 +363,27 @@ def set_model(function: str, req: ModelOverride):
                  f"choose from {', '.join(FUNCTION_PROVIDERS[function])}")
     if not model:
         raise HTTPException(400, "model cannot be blank")
+    # Preserve the existing analysis-settings contract before performing a
+    # potentially slow Ollama inventory/resource probe. The actual write below
+    # repeats this transactional guard so a job that starts during validation
+    # still wins the race.
+    _set_analysis_sensitive({})
+    safety = None
+    if provider == "ollama":
+        requested_context = int(advanced("local")["num_ctx"])
+        if function.startswith(("repository_", "paper_")):
+            requested_context = max(requested_context, 65_536)
+        try:
+            safety = ensure_model_safe(
+                model,
+                role="completion",
+                requested_context=requested_context,
+            )
+        except LocalModelSafetyError as exc:
+            raise _model_safety_http(exc) from exc
     _set_analysis_sensitive({
         f"model.{function}": {"provider": provider, "model": model}})
-    return {"ok": True}
+    return {"ok": True, "safety": safety}
 
 
 @router.get("/glossary")
@@ -491,6 +653,15 @@ def save_search_settings(req: SearchConfig):
     model = req.embedding_model.strip()
     if req.semantic_enabled and not model:
         raise HTTPException(422, "an embedding model is required")
+    if req.semantic_enabled and req.embedding_provider == "ollama" and model:
+        try:
+            ensure_model_safe(
+                model,
+                role="embedding",
+                requested_context=2_048,
+            )
+        except LocalModelSafetyError as exc:
+            raise _model_safety_http(exc) from exc
     _set_analysis_sensitive({
         "search.semantic_enabled": req.semantic_enabled,
         "search.embedding_provider": req.embedding_provider,
@@ -560,7 +731,9 @@ class CloudConfig(BaseModel):
 
 @router.put("/cloud")
 def set_cloud(req: CloudConfig):
+    from .. import media_storage
     from ..tasks.cloud import FIELDS
+    from ..tasks import cloud
 
     if req.provider and req.provider not in FIELDS:
         raise HTTPException(400, f"unknown provider {req.provider!r}")
@@ -574,13 +747,20 @@ def set_cloud(req: CloudConfig):
             continue  # keep the stored secret unless a new one is supplied
         merged[field] = incoming
     try:
-        set_cloud_settings_if_no_pending_purge({
-            "cloud.provider": req.provider or None,
-            "cloud.config": merged or None,
-            "cloud.remote_base": req.remote_base,
-            "cloud.auto": req.auto,
-            "cloud.mode": req.mode if req.mode != "push" else None,
-        })
+        # The same process-shared lock guards rclone transfers. A destination
+        # cannot change between a media upload and its readback verification.
+        with cloud._remote_lock():
+            set_cloud_settings_if_no_pending_purge({
+                "cloud.provider": req.provider or None,
+                "cloud.config": merged or None,
+                "cloud.remote_base": req.remote_base,
+                "cloud.auto": req.auto,
+                "cloud.mode": req.mode if req.mode != "push" else None,
+            }, before_commit=lambda session: (
+                media_storage.apply_target_change_in_transaction(
+                    session, req.provider, merged, req.remote_base
+                )
+            ))
     except RuntimeError as exc:
         raise HTTPException(409, str(exc)) from exc
     from ..tasks.cloud import enqueue_pending_privacy_purges

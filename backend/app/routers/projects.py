@@ -15,11 +15,13 @@ from sqlmodel import select, text
 from ..db import get_session
 from ..models import (
     Artifact, Job, PaperChunk, PaperChunkEmbedding, PaperMemoryRevision,
-    PaperPartEvidence, PaperSeries, PaperSeriesPart, PaperSource,
+    MediaLease, MediaObject, ProjectMediaPolicy, PaperPartEvidence,
+    PaperSeries, PaperSeriesPart, PaperSource,
     PaperSynthesisCache, Project, RepositoryChunk, RepositoryFile,
     RepositorySnapshot, RepositorySource, utcnow,
 )
 from .. import library
+from .. import media_storage as media_storage_service
 from ..config import settings
 from .. import media_auth
 from ..security import redact_url, validate_source_url
@@ -389,6 +391,23 @@ def run_step(project_id: int, step: str):
                 409,
                 "finish or cancel the interactive source login before starting project work",
             )
+        media_storage_job = session.exec(select(Job.id).where(
+            Job.project_id == project_id,
+            Job.task.in_(tuple(media_storage_service.ACTION_TASKS.values())),
+            Job.status.in_(("queued", "running")),
+        )).first()
+        if media_storage_job:
+            raise HTTPException(
+                409,
+                "wait for the active media storage action to finish before "
+                "starting project work",
+            )
+        if media_storage_service.active_media_transition(session, project_id):
+            raise HTTPException(
+                409,
+                "wait for interrupted media storage state recovery before "
+                "starting project work",
+            )
         running = session.exec(
             select(Job).where(Job.project_id == project_id, Job.task == step,
                               Job.paper_series_id == None,  # noqa: E711
@@ -495,6 +514,23 @@ def run_all(project_id: int, req: RunAllRequest | None = None):
             raise HTTPException(
                 409,
                 "finish or cancel the interactive source login before starting the pipeline",
+            )
+        media_storage_job = session.exec(select(Job.id).where(
+            Job.project_id == project_id,
+            Job.task.in_(tuple(media_storage_service.ACTION_TASKS.values())),
+            Job.status.in_(("queued", "running")),
+        )).first()
+        if media_storage_job:
+            raise HTTPException(
+                409,
+                "wait for the active media storage action to finish before "
+                "starting the pipeline",
+            )
+        if media_storage_service.active_media_transition(session, project_id):
+            raise HTTPException(
+                409,
+                "wait for interrupted media storage state recovery before "
+                "starting the pipeline",
             )
         existing = session.exec(
             select(Job).where(Job.project_id == project_id, Job.task == "run_all",
@@ -880,8 +916,12 @@ def delete_project(project_id: int):
     import shutil
 
     from sqlmodel import text
+    from ..tasks import cloud as cloud_tasks
 
-    with get_session() as session:
+    # Serialize the deletion fence with every legacy/cloud-primary remote
+    # publisher. Once ``deleting`` commits, their in-lock eligibility recheck
+    # excludes the project before any remote mutation.
+    with cloud_tasks._remote_lock(), get_session() as session:
         session.exec(text("BEGIN IMMEDIATE"))
         project = session.get(Project, project_id)
         if not project:
@@ -892,6 +932,31 @@ def delete_project(project_id: int):
         ).first()
         if active:
             raise HTTPException(409, "cancel active jobs before deleting this project")
+        if media_storage_service.active_media_transition(session, project_id):
+            raise HTTPException(
+                409,
+                "wait for interrupted media storage state recovery before "
+                "deleting this project",
+            )
+        try:
+            media_storage_service.assert_no_live_media_leases(
+                session, project_id, action="project deletion")
+        except media_storage_service.MediaStorageBusy as exc:
+            raise HTTPException(409, str(exc)) from exc
+        remote_media = session.exec(select(MediaObject.id).where(
+            MediaObject.project_id == project_id,
+            MediaObject.remote_key != "",
+        )).first()
+        media_policy = session.get(ProjectMediaPolicy, project_id)
+        if remote_media or (
+            media_policy and media_policy.storage_target_id is not None
+        ):
+            raise HTTPException(
+                409,
+                "switch media storage to keep-local, restore any cloud-only "
+                "files, and purge the project's remote media and legacy cloud "
+                "paths before deleting it",
+            )
         repository_source = session.exec(
             select(RepositorySource).where(
                 RepositorySource.project_id == project_id)
@@ -986,6 +1051,22 @@ def delete_project(project_id: int):
             for art in shared:
                 art.project_id = None
                 session.add(art)
+            media_objects = session.exec(select(MediaObject).where(
+                MediaObject.project_id == project_id
+            )).all()
+            media_object_ids = [row.id for row in media_objects]
+            if media_object_ids:
+                for lease in session.exec(select(MediaLease).where(
+                    MediaLease.media_object_id.in_(media_object_ids)
+                )).all():
+                    session.delete(lease)
+                session.flush()
+            for media_object in media_objects:
+                session.delete(media_object)
+            media_policy = session.get(ProjectMediaPolicy, project_id)
+            if media_policy:
+                session.delete(media_policy)
+            session.flush()
             for art in own:
                 chunk_ids = [r[0] for r in session.exec(text(
                     "SELECT id FROM searchchunk WHERE artifact_id=:id"

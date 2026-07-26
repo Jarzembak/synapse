@@ -17,6 +17,7 @@ import {
 import { useEventSource } from "../useEventSource";
 import { StreamStatus, useStreamStatus } from "../useStreamStatus";
 import MediaAuthentication from "../components/MediaAuthentication";
+import MediaStoragePolicy from "../components/MediaStoragePolicy";
 import PaperProjectPanel from "../components/PaperProjectPanel";
 
 interface DetailStep extends Step {
@@ -690,6 +691,9 @@ export default function ProjectDetail() {
             <h3>Applicable repository pipeline</h3>
           </div>
         </div>
+      )}
+      {!repositoryProject && (
+        <MediaStoragePolicy projectId={project.id} disabled={detail.any_active} />
       )}
       {detail.project.source_type === "url" && (
         <MediaAuthentication

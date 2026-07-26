@@ -164,7 +164,9 @@ def test_live_viewer_websocket_closes_at_session_expiry(
             "source_digest": hashlib.sha256(b"https://example.com/watch").hexdigest(),
             "created_at": datetime.now(timezone.utc).isoformat(),
             "expires_at": (
-                datetime.now(timezone.utc) + timedelta(milliseconds=100)
+                # Leave enough time for TestClient's application startup and
+                # WebSocket handshake under a loaded full-suite run.
+                datetime.now(timezone.utc) + timedelta(seconds=1)
             ).isoformat(),
         },
     )

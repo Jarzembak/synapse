@@ -78,7 +78,27 @@ const detail: PaperDetail = {
 
 describe("PaperProjectPanel", () => {
   beforeEach(() => {
-    vi.mocked(api).mockResolvedValue(detail);
+    vi.mocked(api).mockImplementation(async (path: string) => {
+      if (path === `/projects/${project.id}/media-storage`) {
+        return {
+          policy: { mode: "keep_local", storage_target_id: null },
+          target: null,
+          summary: {
+            eligible_objects: 0,
+            total_bytes: 0,
+            local_objects: 0,
+            local_bytes: 0,
+            verified_objects: 0,
+            cloud_only_objects: 0,
+            pending_objects: 0,
+            error_objects: 0,
+            excluded_objects: 1,
+          },
+          objects: [],
+        };
+      }
+      return detail;
+    });
   });
 
   it("keeps poor-page acknowledgement visible and audience tracks independent", async () => {

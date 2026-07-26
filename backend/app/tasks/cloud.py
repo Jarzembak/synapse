@@ -26,6 +26,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -42,7 +43,13 @@ log = logging.getLogger("synapse.cloud")
 from .. import library
 from ..config import settings
 from ..db import get_session
-from ..models import Artifact, Job, RepositorySource
+from ..models import (
+    Artifact,
+    Job,
+    Project,
+    ProjectMediaPolicy,
+    RepositorySource,
+)
 from ..settings_store import get_setting, set_setting
 from .celery_app import celery
 from .common import set_job
@@ -238,9 +245,91 @@ def _write_bisync_filters(workdir: Path) -> None:
     file and refuses with a must-run---resync error whenever it changes, so a
     changing restricted set forces a fresh baseline by construction (handled
     by the lockout branch below)."""
-    lines = [f"- /{pattern}" for pattern in _restricted_library_paths()]
+    excluded = {
+        *_restricted_library_paths(),
+        *_cloud_primary_library_media_paths(),
+    }
+    lines = [f"- /{pattern}" for pattern in sorted(excluded)]
     (workdir / "filters.txt").write_text(
         "\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _cloud_primary_project_slugs() -> list[str]:
+    """Return projects whose media must bypass the legacy mirror."""
+    with get_session() as session:
+        slugs = set(session.exec(
+            select(Project.slug)
+            .join(
+                ProjectMediaPolicy,
+                ProjectMediaPolicy.project_id == Project.id,
+            )
+            .where(ProjectMediaPolicy.mode == "cloud_primary")
+        ).all())
+        slugs.update(session.exec(select(Project.slug).where(
+            Project.deleting == True,  # noqa: E712
+        )).all())
+        return sorted(slugs)
+
+
+def _mark_legacy_cleanup_before_upload(
+    project_ids: set[int] | None = None,
+) -> int:
+    """Persist cleanup intent before an S3 legacy-media mutation."""
+    from .. import media_storage
+
+    with get_session() as session:
+        session.exec(text("BEGIN IMMEDIATE"))
+        marked = media_storage.mark_legacy_cleanup_required(
+            session, project_ids)
+        session.commit()
+        return marked
+
+
+def _legacy_media_project_ids_for_path(path: str) -> set[int]:
+    lookup = path.removeprefix("media:") if path.startswith("media:") else path
+    with get_session() as session:
+        return {
+            project_id for project_id in session.exec(
+                select(Artifact.project_id).where(
+                    Artifact.project_id != None,  # noqa: E711
+                    Artifact.type.in_(
+                        tuple(library.CLOUD_PRIMARY_MEDIA_ARTIFACT_TYPES)),
+                    Artifact.media_path.in_((path, lookup)),
+                )
+            ).all()
+            if project_id is not None
+        }
+
+
+def _legacy_media_copy_args() -> list[str]:
+    """Build one-way archived-media filters without mirroring cloud-primary bytes."""
+    args = ["copy", str(settings.media_dir), _dest("media")]
+    slugs = _cloud_primary_project_slugs()
+    if not slugs:
+        # Preserve the established keep-local command exactly when no project
+        # has opted into authoritative cloud-primary media.
+        return args + [
+            "--include", "/*/source_video.*",
+            "--include", "/*/source_audio.*",
+        ]
+
+    for slug in slugs:
+        if not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", slug):
+            raise RuntimeError(
+                "unsafe cloud-primary project slug prevents legacy media sync")
+        args.extend([
+            "--filter", f"- /{slug}/source_video.*",
+            "--filter", f"- /{slug}/source_audio.*",
+        ])
+    # Ordered rclone filter rules keep the selected project directories
+    # traversable while excluding every unrelated working/authentication file.
+    args.extend([
+        "--filter", "+ /*/source_video.*",
+        "--filter", "+ /*/source_audio.*",
+        "--filter", "+ /*/",
+        "--filter", "- **",
+    ])
+    return args
 
 
 def _sync_all_bisync(job_id: int) -> None:
@@ -249,9 +338,12 @@ def _sync_all_bisync(job_id: int) -> None:
     workdir.mkdir(parents=True, exist_ok=True)
     fingerprint = _bisync_fingerprint(dest)
     resync = get_setting("cloud.bisync_state") != fingerprint
-    _write_bisync_filters(workdir)
 
     with _remote_lock():
+        # Policy updates take the same lock. Build filters only after acquiring
+        # it so a keep-local payload cannot become cloud-primary in the gap
+        # between filter generation and remote publication.
+        _write_bisync_filters(workdir)
         # bisync (unlike copy) requires both base directories to exist — a
         # never-pushed remote would otherwise fail the very first two-way run
         _rclone(["mkdir", dest])
@@ -290,8 +382,8 @@ def _sync_all_bisync(job_id: int) -> None:
         with get_session() as session:
             set_job(session, job_id, status="running",
                     progress="uploading archived media")
-        _rclone(["copy", str(settings.media_dir), _dest("media"),
-                 "--include", "/*/source_video.*", "--include", "/*/source_audio.*"])
+        _mark_legacy_cleanup_before_upload()
+        _rclone(_legacy_media_copy_args())
         if get_setting("cloud.provider") == "drive":
             _rclone(["dedupe", "--dedupe-mode", "newest", _dest("media")])
 
@@ -358,6 +450,24 @@ def _restricted_artifact_for_path(path: str, session: Session | None = None) -> 
     )
 
 
+def _cloud_primary_media_for_path(
+    path: str, session: Session | None = None,
+) -> bool:
+    """Whether a legacy per-path upload addresses managed cloud-primary media."""
+    lookup = path.removeprefix("media:") if path.startswith("media:") else path
+    if session is None:
+        with get_session() as owned:
+            return _cloud_primary_media_for_path(path, owned)
+    artifacts = session.exec(select(Artifact).where(
+        Artifact.type.in_(tuple(library.CLOUD_PRIMARY_MEDIA_ARTIFACT_TYPES)),
+    )).all()
+    return any(
+        library.artifact_media_is_cloud_primary(session, artifact)
+        and artifact.media_path in {path, lookup}
+        for artifact in artifacts
+    )
+
+
 def _restricted_library_paths() -> list[str]:
     with get_session() as session:
         artifacts = [
@@ -370,6 +480,25 @@ def _restricted_library_paths() -> list[str]:
         paths.add(f".history/{artifact.path}.*")
         if artifact.media_path and not artifact.media_path.startswith("media:"):
             paths.add(artifact.media_path)
+    return sorted(paths)
+
+
+def _cloud_primary_library_media_paths() -> list[str]:
+    """Library-relative binary payloads owned by cloud-primary media storage."""
+    with get_session() as session:
+        paths = {
+            artifact.media_path
+            for artifact in session.exec(select(Artifact).where(
+                Artifact.type.in_(
+                    tuple(library.CLOUD_PRIMARY_MEDIA_ARTIFACT_TYPES)),
+                Artifact.media_path != "",
+            )).all()
+            if (
+                artifact.media_path
+                and not artifact.media_path.startswith("media:")
+                and library.artifact_media_is_cloud_primary(session, artifact)
+            )
+        }
     return sorted(paths)
 
 
@@ -462,7 +591,10 @@ def _stage_public_path(path: str) -> tuple[Path, str] | None:
     try:
         with get_session() as session:
             session.exec(text("BEGIN IMMEDIATE"))
-            if _restricted_artifact_for_path(path, session):
+            if (
+                _restricted_artifact_for_path(path, session)
+                or _cloud_primary_media_for_path(path, session)
+            ):
                 session.rollback()
                 shutil.rmtree(stage_dir, ignore_errors=True)
                 return None
@@ -507,7 +639,12 @@ def _stage_public_library() -> Path:
             for artifact in public_artifacts:
                 allowed_exact.add(artifact.path)
                 history_prefixes.append(f".history/{artifact.path}.")
-                if artifact.media_path and not artifact.media_path.startswith("media:"):
+                if (
+                    artifact.media_path
+                    and not artifact.media_path.startswith("media:")
+                    and not library.artifact_media_is_cloud_primary(
+                        session, artifact)
+                ):
                     allowed_exact.add(artifact.media_path)
 
             for rel in sorted(allowed_exact):
@@ -557,9 +694,14 @@ def sync_paths(paths: list[str]):
             try:
                 dest = _dest(f"media/{rel}" if p.startswith("media:") else f"library/{rel}")
                 with _remote_lock():
-                    if _restricted_artifact_for_path(p):
+                    if (
+                        _restricted_artifact_for_path(p)
+                        or _cloud_primary_media_for_path(p)
+                    ):
                         skipped += 1
                         continue
+                    _mark_legacy_cleanup_before_upload(
+                        _legacy_media_project_ids_for_path(p))
                     _rclone(["copyto", str(src), dest])
                     uploaded += 1
             finally:
@@ -606,8 +748,8 @@ def sync_all(job_id: int):
         with get_session() as session:
             set_job(session, job_id, status="running", progress="uploading archived media")
         # media dir holds working files too — only the archived downloads sync
-        _rclone(["copy", str(settings.media_dir), _dest("media"),
-                 "--include", "/*/source_video.*", "--include", "/*/source_audio.*"])
+        _mark_legacy_cleanup_before_upload()
+        _rclone(_legacy_media_copy_args())
         # Google Drive allows same-name files in a folder, so an interrupted or
         # raced upload can leave duplicates. Fold them back to one (keep newest)
         # so a full sync always converges to a clean remote — self-healing.

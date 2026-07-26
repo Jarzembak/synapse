@@ -327,6 +327,23 @@ def step_done(session, project: Project, step: str,
             ).all()
         }
     if step == "ingest":
+        # A durably verified cloud-only source remains a completed ingest. Do
+        # not restore a potentially large file merely to render project status;
+        # downstream consumers restore it immediately before use.
+        from ..models import MediaObject
+
+        remote_source = session.exec(
+            select(MediaObject)
+            .join(Artifact, Artifact.id == MediaObject.artifact_id)
+            .where(
+                Artifact.project_id == project.id,
+                Artifact.type == "source_audio",
+                MediaObject.state == "cloud_only",
+                MediaObject.remote_sha256 != "",
+            )
+        ).first()
+        if remote_source:
+            return True
         from .ingest import source_audio
 
         try:

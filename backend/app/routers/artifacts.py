@@ -4,12 +4,14 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlmodel import select
+from starlette.background import BackgroundTask
 
 from ..db import get_session
 from ..models import (
     Artifact, ArtifactTag, PaperSeries, PaperSeriesPart, Project, Tag,
 )
 from .. import library
+from .. import media_storage
 
 router = APIRouter(prefix="/api", tags=["artifacts"])
 
@@ -120,12 +122,24 @@ def search_library(
 
 @router.get("/media/{artifact_id}")
 def get_media(artifact_id: int):
-    """Serve an artifact's binary payload (mp3) from the library volume."""
+    """Serve local media, restoring a verified cloud-only payload first."""
     with get_session() as session:
         art = session.get(Artifact, artifact_id)
         if not art or not art.media_path:
             raise HTTPException(404)
-        path = library.resolve_media_path(art.media_path)
-        if not path.exists():
-            raise HTTPException(410)
-        return FileResponse(path, media_type=media_mime(path.name), filename=path.name)
+    try:
+        path, lease_id = media_storage.prepare_artifact_playback(artifact_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(410, str(exc)) from exc
+    except media_storage.MediaStorageError as exc:
+        raise HTTPException(503, f"could not restore media: {exc}") from exc
+    background = (
+        BackgroundTask(media_storage.release_lease, lease_id)
+        if lease_id is not None else None
+    )
+    return FileResponse(
+        path,
+        media_type=media_mime(path.name),
+        filename=path.name,
+        background=background,
+    )

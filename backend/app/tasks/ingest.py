@@ -88,9 +88,18 @@ def ingest(job_id: int, project_id: int):
             }) or project.title
     else:
         progress(job_id, "copying local file")
-        src = (media.resolve_uploaded_source(project.slug, project.source)
-               if project.source_type == "upload"
-               else media.resolve_local_source(project.source))
+        if project.source_type == "upload":
+            from .. import media_storage
+
+            try:
+                src = media_storage.ensure_project_original_upload_local(
+                    project.id)
+            except FileNotFoundError:
+                # Backward compatibility for uploads created before the durable
+                # media inventory existed.
+                src = media.resolve_uploaded_source(project.slug, project.source)
+        else:
+            src = media.resolve_local_source(project.source)
         if src.suffix.lower() in {".m4a", ".mp3", ".wav", ".flac", ".ogg", ".opus"}:
             shutil.copy(src, wd / f"source{src.suffix.lower()}")
             audio = wd / f"source{src.suffix.lower()}"
@@ -125,6 +134,31 @@ def source_audio(project_slug: str) -> Path:
         p = wd / f"source{ext}"
         if p.exists():
             return p
+    # A cloud-primary project may have safely evicted its verified working
+    # audio. Restore it before any downstream Whisper/FFmpeg consumer opens it.
+    from sqlmodel import select
+
+    from .. import media_storage
+    from ..models import Artifact, Project
+
+    with get_session() as session:
+        project = session.exec(select(Project).where(
+            Project.slug == project_slug
+        )).first()
+        artifact = (
+            session.exec(select(Artifact).where(
+                Artifact.project_id == project.id,
+                Artifact.type == "source_audio",
+                Artifact.paper_series_id == None,  # noqa: E711
+                Artifact.paper_part_id == None,  # noqa: E711
+            )).first()
+            if project else None
+        )
+        artifact_id = artifact.id if artifact else None
+    if artifact_id is not None:
+        path, _media_object_id = media_storage.ensure_artifact_media_local(
+            artifact_id)
+        return path
     raise FileNotFoundError("no ingested audio — run the ingest step first")
 
 

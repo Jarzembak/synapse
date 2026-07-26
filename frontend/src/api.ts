@@ -9,7 +9,15 @@ export async function api<T = any>(path: string, opts?: RequestInit): Promise<T>
   if (!res.ok) {
     let detail = res.statusText;
     try {
-      detail = (await res.json()).detail ?? detail;
+      const payload = await res.json();
+      const responseDetail = payload.detail;
+      detail = typeof responseDetail === "string"
+        ? responseDetail
+        : responseDetail?.message
+          ? String(responseDetail.message)
+          : responseDetail
+            ? JSON.stringify(responseDetail)
+            : detail;
     } catch {}
     throw new Error(detail);
   }
