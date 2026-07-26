@@ -143,6 +143,108 @@ async def _start_server(
     return server, server.sockets[0].getsockname()[1]
 
 
+def test_local_health_request_succeeds_without_proxy_resolution(caplog):
+    async def scenario():
+        resolver_called = False
+
+        async def resolver(_host, _port, _timeout):
+            nonlocal resolver_called
+            resolver_called = True
+            return ()
+
+        proxy = auth_egress.FilteringProxy(
+            auth_egress.ProxyConfig(bind_host="127.0.0.1", bind_port=0),
+            resolver=resolver,
+        )
+        server = await proxy.start()
+        port = server.sockets[0].getsockname()[1]
+        try:
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+            writer.write(
+                f"GET {auth_egress.HEALTH_PATH} HTTP/1.1\r\n"
+                "Host: 127.0.0.1\r\n"
+                "Connection: close\r\n\r\n".encode("ascii")
+            )
+            await writer.drain()
+            response = await asyncio.wait_for(reader.read(), 1.0)
+            writer.close()
+            await writer.wait_closed()
+        finally:
+            server.close()
+            await server.wait_closed()
+
+        assert response.startswith(b"HTTP/1.1 200 OK\r\n")
+        assert response.endswith(b"\r\n\r\nok\n")
+        assert resolver_called is False
+
+    caplog.set_level(logging.WARNING, logger=auth_egress.__name__)
+    _run(scenario())
+    assert "incomplete_headers" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("peer", "expected"),
+    [
+        (("127.0.0.1", 50000), True),
+        (("::1", 50000, 0, 0), True),
+        (("::ffff:127.0.0.1", 50000, 0, 0), True),
+        (("172.20.0.4", 50000), False),
+        (("203.0.113.5", 50000), False),
+        (None, False),
+    ],
+)
+def test_health_peer_classifier_accepts_only_loopback(peer, expected):
+    class PeerWriter:
+        def get_extra_info(self, name):
+            assert name == "peername"
+            return peer
+
+    assert auth_egress._peer_is_loopback(PeerWriter()) is expected
+
+
+def test_health_request_from_nonloopback_peer_is_denied(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    async def scenario():
+        resolver_called = False
+
+        async def resolver(_host, _port, _timeout):
+            nonlocal resolver_called
+            resolver_called = True
+            return ()
+
+        monkeypatch.setattr(
+            auth_egress,
+            "_peer_is_loopback",
+            lambda _writer: False,
+        )
+        proxy = auth_egress.FilteringProxy(
+            auth_egress.ProxyConfig(bind_host="127.0.0.1", bind_port=0),
+            resolver=resolver,
+        )
+        server = await proxy.start()
+        port = server.sockets[0].getsockname()[1]
+        try:
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+            writer.write(
+                f"GET {auth_egress.HEALTH_PATH} HTTP/1.1\r\n"
+                "Host: auth-egress\r\n"
+                "Connection: close\r\n\r\n".encode("ascii")
+            )
+            await writer.drain()
+            response = await asyncio.wait_for(reader.read(), 1.0)
+            writer.close()
+            await writer.wait_closed()
+        finally:
+            server.close()
+            await server.wait_closed()
+
+        assert response.startswith(b"HTTP/1.1 403 Forbidden\r\n")
+        assert resolver_called is False
+
+    _run(scenario())
+
+
 def test_plain_http_is_filtered_rewritten_and_logs_are_redacted(caplog):
     async def scenario():
         captured: asyncio.Future[bytes] = asyncio.get_running_loop().create_future()

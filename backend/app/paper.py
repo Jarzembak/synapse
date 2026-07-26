@@ -58,6 +58,29 @@ def _digest(value: Any) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+def normalize_paper_json(value: Any) -> Any:
+    """Recursively replace non-finite floats with JSON-safe null values.
+
+    Docling confidence reports may contain ``NaN`` or infinite scores when a
+    metric cannot be computed. Python's JSON encoder accepts those values by
+    default, but they are not valid JSON and Starlette correctly refuses to
+    serialize them in API responses. Preserve all ordinary values while
+    representing unavailable numeric metrics as ``None``.
+    """
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {
+            key: normalize_paper_json(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [normalize_paper_json(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(normalize_paper_json(item) for item in value)
+    return value
+
+
 def file_sha256(path: Path, chunk_bytes: int = 1024 * 1024) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -68,12 +91,16 @@ def file_sha256(path: Path, chunk_bytes: int = 1024 * 1024) -> str:
 
 def _json(value: Any, default: Any) -> Any:
     if isinstance(value, type(default)):
-        return value
+        return normalize_paper_json(value)
     try:
         parsed = json.loads(value or "")
     except (TypeError, json.JSONDecodeError):
         return default
-    return parsed if isinstance(parsed, type(default)) else default
+    return (
+        normalize_paper_json(parsed)
+        if isinstance(parsed, type(default))
+        else default
+    )
 
 
 def _grade(value: Any) -> str:
@@ -769,7 +796,7 @@ def extract_pdf(
             "nontrivial": page in nontrivial_pages,
             "scores": scores_by_page.get(page, {}),
         })
-    quality_report = {
+    quality_report = normalize_paper_json({
         "document_grade": document_grade,
         "analysis_blocked": bool(blocked_reasons),
         "blocked_reasons": blocked_reasons,
@@ -780,12 +807,12 @@ def extract_pdf(
             "poor_nontrivial_pages_block": True,
             "critical_claims_may_not_rely_only_on_acknowledged_gaps": True,
         },
-    }
+    })
     visual_ids = [item.evidence_id for item in evidence
                   if "visual_review_needed" in item.flags]
     unreliable_ids = [item.evidence_id for item in evidence
                       if "unreliable_extraction" in item.flags]
-    coverage_report = {
+    coverage_report = normalize_paper_json({
         "source_hash": source_hash,
         "source_bytes": size_bytes,
         "page_count": parsed.page_count,
@@ -805,7 +832,7 @@ def extract_pdf(
         },
         "sampling": False,
         "prefix_truncation": False,
-    }
+    })
     return PaperExtractionResult(
         source_hash=source_hash,
         size_bytes=size_bytes,
@@ -879,7 +906,14 @@ def persist_extraction(session: Session, source: Any,
             evidence_id=item.evidence_id,
             page_number=item.page_number,
             section_path=json.dumps(item.section_path, ensure_ascii=False),
-            bbox=json.dumps(item.bbox, sort_keys=True) if item.bbox else "{}",
+            bbox=(
+                json.dumps(
+                    normalize_paper_json(item.bbox),
+                    sort_keys=True,
+                    allow_nan=False,
+                )
+                if item.bbox else "{}"
+            ),
             kind=item.kind,
             body=item.body,
             body_hash=item.body_hash,
@@ -912,8 +946,16 @@ def persist_extraction(session: Session, source: Any,
     source.status = ("review_required" if result.quality_report["analysis_blocked"]
                      else "ready")
     source.quality_grade = result.document_grade
-    source.quality_report = json.dumps(result.quality_report, sort_keys=True)
-    source.coverage_report = json.dumps(result.coverage_report, sort_keys=True)
+    source.quality_report = json.dumps(
+        normalize_paper_json(result.quality_report),
+        sort_keys=True,
+        allow_nan=False,
+    )
+    source.coverage_report = json.dumps(
+        normalize_paper_json(result.coverage_report),
+        sort_keys=True,
+        allow_nan=False,
+    )
     source.updated = utcnow()
     session.add(source)
     session.commit()

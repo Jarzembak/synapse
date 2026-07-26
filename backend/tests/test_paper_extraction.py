@@ -13,7 +13,7 @@ from app.models import PaperChunk, PaperSource, Project
 from app.paper import (
     PaperAnalysisBlocked, PaperExtractionConfig, PaperExtractionError,
     ParsedBlock, ParsedPageQuality, ParsedPaper, acknowledged_page_numbers,
-    extract_pdf, extraction_blockers, persist_extraction,
+    extract_pdf, extraction_blockers, normalize_paper_json, persist_extraction,
     require_analysis_ready, validate_and_render_citations,
 )
 from app.tasks import paper as paper_tasks
@@ -227,6 +227,68 @@ def test_persist_extraction_rebuilds_paper_fts(tmp_path):
         assert [row[0] for row in indexed] == [
             "first indexed evidence", "final page evidence"]
         assert indexed[-1][1] == 2
+
+
+def test_nonfinite_parser_metrics_are_normalized_before_persistence(tmp_path):
+    path = _pdf(tmp_path, "nonfinite-metrics.pdf")
+    parsed = ParsedPaper(
+        page_count=1,
+        blocks=(ParsedBlock(body="Readable evidence.", page_number=1),),
+        page_quality=(ParsedPageQuality(
+            page_number=1,
+            grade="GOOD",
+            scores={
+                "layout": float("nan"),
+                "ocr": float("inf"),
+                "nested": [float("-inf"), 0.875],
+            },
+        ),),
+        document_grade="GOOD",
+        confidence={
+            "mean": float("nan"),
+            "ordinary": {
+                "score": 0.625,
+                "label": "available",
+                "count": 3,
+                "accepted": True,
+            },
+        },
+        parser_name="fixture",
+        parser_version="fixture-v1",
+    )
+
+    result = extract_pdf(path, parser=StaticParser(parsed))
+    assert result.quality_report["confidence"]["mean"] is None
+    assert result.quality_report["confidence"]["ordinary"] == {
+        "score": 0.625,
+        "label": "available",
+        "count": 3,
+        "accepted": True,
+    }
+    scores = result.quality_report["pages"][0]["scores"]
+    assert scores["layout"] is None
+    assert scores["ocr"] is None
+    assert scores["nested"] == [None, 0.875]
+
+    project, source = _paper_project(
+        "paper-nonfinite-persistence", result.source_hash)
+    with get_session() as session:
+        persisted = session.get(PaperSource, source.id)
+        persist_extraction(session, persisted, result)
+        session.refresh(persisted)
+        assert "NaN" not in persisted.quality_report
+        assert "Infinity" not in persisted.quality_report
+        decoded = json.loads(persisted.quality_report)
+        assert decoded["confidence"]["mean"] is None
+        assert decoded["confidence"]["ordinary"]["score"] == 0.625
+
+    assert normalize_paper_json({
+        "finite": 1.25,
+        "nested": (float("nan"), "unchanged"),
+    }) == {
+        "finite": 1.25,
+        "nested": (None, "unchanged"),
+    }
 
 
 def test_same_pdf_can_be_imported_into_independent_projects(tmp_path):

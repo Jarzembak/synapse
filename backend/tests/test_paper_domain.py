@@ -92,6 +92,50 @@ def test_paper_upload_is_immutable_and_always_cloud_excluded(client):
     assert pdf.content.startswith(b"%PDF-")
 
 
+def test_paper_detail_normalizes_nonfinite_legacy_reports(client):
+    payload = _upload(client)
+    project_id = payload["project"]["id"]
+    with get_session() as session:
+        source = session.exec(select(PaperSource).where(
+            PaperSource.project_id == project_id
+        )).one()
+        source.quality_report = json.dumps({
+            "analysis_blocked": False,
+            "poor_pages": [],
+            "blocked_reasons": [],
+            "confidence": {
+                "mean": float("nan"),
+                "range": [float("-inf"), 0.91, float("inf")],
+                "label": "legacy report",
+            },
+        })
+        source.coverage_report = json.dumps({
+            "evidence_block_count": 1,
+            "mapped_evidence_blocks": 1,
+            "diagnostics": {
+                "unavailable": float("nan"),
+                "finite": 2.5,
+            },
+        })
+        session.add(source)
+        session.commit()
+
+    response = client.get(f"/api/papers/{project_id}")
+    assert response.status_code == 200, response.text
+    detail = response.json()
+    confidence = detail["quality"]["report"]["confidence"]
+    assert confidence == {
+        "mean": None,
+        "range": [None, 0.91, None],
+        "label": "legacy report",
+    }
+    assert detail["source"]["quality_report"]["confidence"] == confidence
+    assert detail["coverage"]["diagnostics"] == {
+        "unavailable": None,
+        "finite": 2.5,
+    }
+
+
 def test_shared_model_settings_are_locked_during_active_paper_jobs(client):
     payload = _upload(client)
     project_id = payload["project"]["id"]

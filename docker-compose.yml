@@ -95,7 +95,7 @@ services:
         - CMD
         - python
         - -c
-        - import socket; s=socket.create_connection(('127.0.0.1',8899),3); s.close()
+        - import http.client; c=http.client.HTTPConnection('127.0.0.1',8899,timeout=3); c.request('GET','/.well-known/synapse-auth-egress-health'); r=c.getresponse(); body=r.read(); c.close(); assert r.status == 200 and body == b'ok\n'
       interval: 10s
       timeout: 5s
       retries: 5
