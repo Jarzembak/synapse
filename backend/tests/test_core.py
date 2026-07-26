@@ -288,6 +288,15 @@ LOCAL_CFG = {"num_ctx": 8192, "keep_alive": "10m", "think": "off",
              "timeout_seconds": 120, "json_mode": True}
 
 
+@pytest.fixture
+def bypass_ollama_safety(monkeypatch):
+    """Keep transport-contract tests independent of installed model inventory."""
+    from app import local_model_safety
+
+    monkeypatch.setattr(
+        local_model_safety, "ensure_model_safe", lambda *args, **kwargs: {})
+
+
 def test_strip_think():
     from app.llm import _strip_think
 
@@ -311,7 +320,7 @@ def test_extract_json_tolerates_prose_and_think():
         _extract_json("not json at all")
 
 
-def test_ollama_payload_mapping(monkeypatch):
+def test_ollama_payload_mapping(monkeypatch, bypass_ollama_safety):
     from app import llm
 
     captured = {}
@@ -346,7 +355,9 @@ def test_ollama_payload_mapping(monkeypatch):
     assert payload["messages"][0] == {"role": "system", "content": "sys"}
 
 
-def test_ollama_restricted_floors_context_timeout_and_disables_think(monkeypatch):
+def test_ollama_restricted_floors_context_timeout_and_disables_think(
+    monkeypatch, bypass_ollama_safety,
+):
     """Repository (local-only) calls must not inherit the general-purpose
     num_ctx/timeout tuned for transcript chunks, and never spend budget on
     hidden reasoning."""
@@ -376,7 +387,9 @@ def test_ollama_restricted_floors_context_timeout_and_disables_think(monkeypatch
     assert captured["timeout"].read == llm.REPOSITORY_TIMEOUT_SECONDS
 
 
-def test_ollama_drops_think_flag_when_model_rejects_it(monkeypatch):
+def test_ollama_drops_think_flag_when_model_rejects_it(
+    monkeypatch, bypass_ollama_safety,
+):
     """Models without the thinking capability 400 on the flag; one retry
     without it (mirrors the response_format fallback in _openai_compat)."""
     from app import llm
@@ -409,7 +422,9 @@ def test_ollama_drops_think_flag_when_model_rejects_it(monkeypatch):
     assert len(sent) == 2 and "think" in sent[0] and "think" not in sent[1]
 
 
-def test_ollama_auto_think_omits_flag_and_format(monkeypatch):
+def test_ollama_auto_think_omits_flag_and_format(
+    monkeypatch, bypass_ollama_safety,
+):
     from app import llm
 
     captured = {}
@@ -437,7 +452,9 @@ def test_ollama_auto_think_omits_flag_and_format(monkeypatch):
     assert "temperature" not in payload["options"]
 
 
-def test_ollama_error_body_surfaces_and_is_not_transient(monkeypatch):
+def test_ollama_error_body_surfaces_and_is_not_transient(
+    monkeypatch, bypass_ollama_safety,
+):
     from app import llm
 
     class FakeResponse:
@@ -572,7 +589,9 @@ def test_complete_json_retries_then_extracts(monkeypatch):
     assert llm.complete_json("tag", "s", "u") == {"a": 1}
 
 
-def test_json_mode_off_suppresses_native_json_enforcement(monkeypatch):
+def test_json_mode_off_suppresses_native_json_enforcement(
+    monkeypatch, bypass_ollama_safety,
+):
     import types
 
     import openai
@@ -619,7 +638,9 @@ def test_json_mode_off_suppresses_native_json_enforcement(monkeypatch):
     assert "response_format" not in compat_calls[0]
 
 
-def test_ollama_keep_alive_numeric_strings_sent_as_numbers(monkeypatch):
+def test_ollama_keep_alive_numeric_strings_sent_as_numbers(
+    monkeypatch, bypass_ollama_safety,
+):
     from app import llm
 
     captured = {}

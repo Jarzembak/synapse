@@ -9,6 +9,7 @@ from sqlmodel import select
 
 from ..db import get_session
 from ..media_auth import LEASE_TASK
+from ..media_storage import ACTION_TASKS as MEDIA_STORAGE_ACTION_TASKS
 from ..models import Job, Project
 from ..tasks.celery_app import celery
 from ..tasks.common import transition_job
@@ -20,7 +21,12 @@ router = APIRouter(prefix="/api/jobs", tags=["jobs"])
 NONSTEP_LABELS = {
     "run_all": "Run all steps",
     "cloud_sync_all": "Cloud sync — everything",
+    "media_storage_sync": "Media storage — sync and verify",
+    "media_storage_evict": "Media storage — free verified local copies",
+    "media_storage_restore": "Media storage — restore local copies",
+    "media_storage_purge": "Media storage — purge verified remote copies",
     "ollama_pull": "Install local model",
+    "ollama_benchmark": "Check local model compatibility",
     "create_backup": "Create backup",
     "rebuild_library": "Rebuild index from vault",
     "rebuild_search": "Rebuild search index",
@@ -99,17 +105,30 @@ def cancel_job(job_id: int):
             raise HTTPException(
                 409, "finish or cancel this login from the project's Source access card"
             )
+        media_integrity_action = job.task in MEDIA_STORAGE_ACTION_TASKS.values()
+        if media_integrity_action and job.status == "running":
+            raise HTTPException(
+                409,
+                "running media storage integrity actions cannot be canceled; "
+                "wait for the bounded verify, evict, restore, or purge operation "
+                "to finish",
+            )
         # Fence database state before revocation so a task picked up in the
         # small race window sees a terminal state and exits without publishing.
-        transition_job(session, job.id, {"queued", "running"}, "canceled",
-                       error="canceled by user")
+        from_states = {"queued"} if media_integrity_action else {"queued", "running"}
+        if not transition_job(
+                session, job.id, from_states, "canceled",
+                error="canceled by user"):
+            raise HTTPException(
+                409, "job started before cancellation could be applied")
         if job.task == "run_all":
             cancel_children(job.id, "run-all canceled by user")
         if job.celery_id:
             try:
                 # terminate=True stops a task that's already executing, not just
                 # one still waiting in the queue.
-                celery.control.revoke(job.celery_id, terminate=True)
+                celery.control.revoke(
+                    job.celery_id, terminate=not media_integrity_action)
             except Exception:
                 pass
     # Canceling the active orchestrator should immediately release the serial

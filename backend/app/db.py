@@ -191,6 +191,18 @@ def _migrate(conn) -> None:
         "ON papermemoryrevision(series_id, revision)",
         "CREATE INDEX IF NOT EXISTS ix_paper_memory_part_hash "
         "ON papermemoryrevision(part_id, content_hash)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_media_storage_target_identity "
+        "ON mediastoragetarget(identity_hash)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_project_media_policy "
+        "ON projectmediapolicy(project_id)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_media_object_artifact "
+        "ON mediaobject(artifact_id) WHERE artifact_id IS NOT NULL",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_media_object_project_role_path "
+        "ON mediaobject(project_id, role, local_path)",
+        "CREATE INDEX IF NOT EXISTS ix_media_object_project_state "
+        "ON mediaobject(project_id, state)",
+        "CREATE INDEX IF NOT EXISTS ix_media_lease_object_expiry "
+        "ON medialease(media_object_id, expires_at)",
     ]
     for ddl in indexes:
         try:
@@ -210,6 +222,9 @@ def _migrate(conn) -> None:
         current = 2
     if current < 3:
         conn.exec_driver_sql("INSERT INTO schema_version(version) VALUES (3)")
+        current = 3
+    if current < 4:
+        conn.exec_driver_sql("INSERT INTO schema_version(version) VALUES (4)")
 
 
 def init_db() -> None:

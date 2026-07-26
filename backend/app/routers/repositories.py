@@ -9,6 +9,7 @@ from sqlmodel import select, text
 
 from .. import library
 from ..db import get_session
+from ..local_model_safety import LocalModelSafetyError, ensure_model_safe
 from ..models import Job, Project, RepositoryFile, RepositorySnapshot, RepositorySource, utcnow
 from ..repository import (
     RepositoryError,
@@ -26,7 +27,10 @@ from ..repository import (
     set_github_token,
     validate_repository_local_model,
 )
-from ..settings_store import set_settings_if_no_repository_jobs
+from ..settings_store import (
+    assert_no_shared_local_model_jobs,
+    set_settings_if_no_repository_jobs,
+)
 
 router = APIRouter(prefix="/api/repositories", tags=["repositories"])
 
@@ -89,10 +93,28 @@ def save_repository_settings(req: RepositorySettingsRequest):
     current = repository_scan_settings()
     updates: dict[str, object] = {}
     if req.local_model is not None:
+        # Report the established shared-model lock before a potentially slow
+        # inventory probe. The actual write repeats this transactional check
+        # so a job that starts during validation still prevents the update.
+        try:
+            assert_no_shared_local_model_jobs()
+        except RuntimeError as exc:
+            raise HTTPException(409, str(exc)) from exc
         try:
             model = validate_repository_local_model(req.local_model)
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
+        try:
+            ensure_model_safe(
+                model,
+                role="completion",
+                requested_context=65_536,
+            )
+        except LocalModelSafetyError as exc:
+            raise HTTPException(
+                status_code=exc.http_status,
+                detail=exc.detail(),
+            ) from exc
         updates["repository.local_model"] = model
 
     ranges = {

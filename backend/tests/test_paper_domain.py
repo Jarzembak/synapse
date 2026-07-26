@@ -635,7 +635,7 @@ def test_schema_v3_job_scope_indexes_allow_independent_tracks():
         version = session.exec(text(
             "SELECT MAX(version) FROM schema_version"
         )).one()[0]
-        assert version == 3
+        assert version == 4
 
         # The application test database is shared with later integration
         # modules.  Do not leave intentionally-created active jobs behind and
@@ -698,4 +698,95 @@ def test_v2_upgrade_adds_paper_scope_without_rewriting_old_rows(tmp_path):
         ).scalar() == "done"
         assert connection.exec_driver_sql(
             "SELECT MAX(version) FROM schema_version"
-        ).scalar() == 3
+        ).scalar() == 4
+
+
+def test_v3_upgrade_adds_media_storage_without_rewriting_existing_rows(tmp_path):
+    upgrade_engine = create_engine(f"sqlite:///{tmp_path / 'v3.sqlite3'}")
+    with upgrade_engine.begin() as connection:
+        connection.exec_driver_sql(
+            "CREATE TABLE schema_version (version INTEGER NOT NULL, "
+            "applied TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+        )
+        connection.exec_driver_sql("INSERT INTO schema_version(version) VALUES (3)")
+        connection.exec_driver_sql(
+            "CREATE TABLE project (id INTEGER PRIMARY KEY, slug VARCHAR, title VARCHAR, "
+            "source VARCHAR, source_type VARCHAR, status VARCHAR, deleting BOOLEAN, "
+            "created DATETIME)"
+        )
+        connection.exec_driver_sql(
+            "CREATE TABLE artifact (id INTEGER PRIMARY KEY, project_id INTEGER, type VARCHAR, "
+            "title VARCHAR, path VARCHAR, media_path VARCHAR, provider VARCHAR, model VARCHAR, "
+            "input_hash VARCHAR DEFAULT '', config_hash VARCHAR DEFAULT '', "
+            "provenance VARCHAR DEFAULT '{}', restricted BOOLEAN DEFAULT 0, "
+            "repository_derived BOOLEAN DEFAULT 0, paper_series_id INTEGER, "
+            "paper_part_id INTEGER, cloud_sync_excluded BOOLEAN DEFAULT 0, "
+            "created DATETIME, updated DATETIME)"
+        )
+        connection.exec_driver_sql(
+            "CREATE TABLE job (id INTEGER PRIMARY KEY, project_id INTEGER, task VARCHAR, "
+            "status VARCHAR, progress VARCHAR, error VARCHAR, celery_id VARCHAR, "
+            "parent_job_id INTEGER, options VARCHAR DEFAULT '{}', paper_series_id INTEGER, "
+            "paper_part_id INTEGER, started DATETIME, finished DATETIME, heartbeat DATETIME, "
+            "created DATETIME, updated DATETIME)"
+        )
+        connection.exec_driver_sql(
+            "INSERT INTO project(id,slug,title,source,source_type,status,deleting) "
+            "VALUES (7,'v3-project','V3 project','recording.mp4','upload','done',0)"
+        )
+        connection.exec_driver_sql(
+            "INSERT INTO artifact(id,project_id,type,title,path,media_path,provider,model,"
+            "input_hash,config_hash,provenance,restricted,repository_derived,"
+            "cloud_sync_excluded) VALUES "
+            "(11,7,'source_audio','Source','projects/v3/source.md',"
+            "'media:v3-project/source.mp3','local','whisper','ih','ch','{\"v\":3}',0,0,0)"
+        )
+        connection.exec_driver_sql(
+            "INSERT INTO job(id,project_id,task,status,progress,error,celery_id,options) "
+            "VALUES (13,7,'transcribe','done','complete','','','{\"language\":\"en\"}')"
+        )
+
+    SQLModel.metadata.create_all(upgrade_engine)
+    with upgrade_engine.begin() as connection:
+        _migrate(connection)
+        assert connection.exec_driver_sql(
+            "SELECT MAX(version) FROM schema_version"
+        ).scalar() == 4
+        tables = {
+            row[0] for row in connection.exec_driver_sql(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        assert {
+            "mediastoragetarget",
+            "projectmediapolicy",
+            "mediaobject",
+            "medialease",
+        } <= tables
+        indexes = {
+            row[1] for row in connection.exec_driver_sql(
+                "PRAGMA index_list('mediaobject')"
+            )
+        }
+        assert {
+            "uq_media_object_artifact",
+            "uq_media_object_project_role_path",
+            "ix_media_object_project_state",
+        } <= indexes
+        assert connection.exec_driver_sql(
+            "SELECT slug,title,source,status FROM project WHERE id=7"
+        ).one() == ("v3-project", "V3 project", "recording.mp4", "done")
+        assert connection.exec_driver_sql(
+            "SELECT type,path,media_path,input_hash,config_hash,provenance "
+            "FROM artifact WHERE id=11"
+        ).one() == (
+            "source_audio",
+            "projects/v3/source.md",
+            "media:v3-project/source.mp3",
+            "ih",
+            "ch",
+            '{"v":3}',
+        )
+        assert connection.exec_driver_sql(
+            "SELECT task,status,progress,options FROM job WHERE id=13"
+        ).one() == ("transcribe", "done", "complete", '{"language":"en"}')

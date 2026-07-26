@@ -607,14 +607,26 @@ def rebuild_from_vault(session: Session, *, prune_missing: bool = False,
     if prune_missing:
         for artifact in session.exec(select(Artifact)).all():
             if (artifact.path, artifact.type) not in seen:
-                library.delete_search_chunks(session, artifact.id)
-                session.exec(text(
-                    "DELETE FROM artifact_fts WHERE artifact_id=:id"
-                ).bindparams(id=artifact.id))
-                session.exec(text(
-                    "DELETE FROM artifacttag WHERE artifact_id=:id"
-                ).bindparams(id=artifact.id))
-                session.delete(artifact)
+                from .media_storage import (
+                    MediaStorageBusy,
+                    delete_artifact_with_media,
+                )
+
+                try:
+                    delete_artifact_with_media(
+                        session,
+                        artifact,
+                        remote_reference_policy="block",
+                    )
+                except MediaStorageBusy as exc:
+                    # A missing sidecar must not orphan its independently
+                    # recoverable cloud media. Keep the row visible until the
+                    # operator restores/purges it or recovery finishes.
+                    log.warning(
+                        "deferred pruning artifact %s: %s",
+                        artifact.id,
+                        exc,
+                    )
     rebuild_repository_fts(session, on_progress=on_progress)
     rebuild_paper_fts(session, on_progress=on_progress)
     session.commit()

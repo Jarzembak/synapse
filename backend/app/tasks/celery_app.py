@@ -49,6 +49,7 @@ else:
     from . import (  # noqa: E402,F401
         ingest, transcribe, generate, repository, quickref, audio, cloud,
         orchestrate, backup, recovery, search, paper, paper_series, localmodels,
+        media_storage,
     )
 
 from celery.signals import worker_ready  # noqa: E402
@@ -71,6 +72,7 @@ def _reset_orphaned_jobs(**_kwargs):
     from ..task_names import MEDIA_AUTH_LEASE_TASK
 
     try:
+        paper_recovery = {"series": 0, "parts": 0}
         with get_session() as session:
             owned_task = (
                 Job.task == "paper_extract" if PAPER_WORKER
@@ -106,6 +108,11 @@ def _reset_orphaned_jobs(**_kwargs):
                 job.error = "interrupted before broker dispatch"
                 job.updated = utcnow()
                 session.add(job)
+            if not PAPER_WORKER:
+                from .paper_series import reconcile_interrupted_paper_jobs
+
+                paper_recovery = reconcile_interrupted_paper_jobs(
+                    session, stale)
             session.commit()
         if PAPER_WORKER:
             if stale or ghosts:
@@ -116,6 +123,9 @@ def _reset_orphaned_jobs(**_kwargs):
         from ..repository import cleanup_repository_staging
 
         cleanup_repository_staging()
+        from ..media_storage import recover_interrupted_media_storage
+
+        recover_interrupted_media_storage()
         from .cloud import enqueue_pending_privacy_purges
 
         enqueue_pending_privacy_purges()
@@ -123,6 +133,10 @@ def _reset_orphaned_jobs(**_kwargs):
             logging.getLogger("synapse.pipeline").warning(
                 "reset %d running and %d undispatched job(s) on worker start",
                 len(stale), len(ghosts))
+        if paper_recovery["series"] or paper_recovery["parts"]:
+            logging.getLogger("synapse.pipeline").warning(
+                "reconciled %d interrupted paper series and %d part(s)",
+                paper_recovery["series"], paper_recovery["parts"])
         # Recovery is lease-based now, so safely continue the serial queue
         # instead of requiring a manual button after every deployment.
         from .orchestrate import maybe_start_next_run_all

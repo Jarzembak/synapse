@@ -106,6 +106,83 @@ installing or publishing a model.
 Ollama itself may cap the requested context at a model's native limit. A larger
 window also consumes substantially more RAM or VRAM.
 
+## RTX 5060 Laptop GPU (8 GB) profile
+
+This capacity-balanced profile is tailored to an NVIDIA GeForce RTX 5060
+Laptop GPU with 8 GB VRAM and approximately 32 GB of system memory. It is a
+starting point rather than a universal model ranking. Runtime memory includes
+model weights, context cache, working buffers, Docker, and other GPU users, so
+an Ollama download size is not the complete VRAM requirement.
+
+Both recommended Qwen 3.5 models passed Synapse's production-path paper
+evidence and multipart-plan contracts after contract normalization. The
+retained benchmark does not establish a reliable quality or speed difference
+between them, so the assignments below combine those compatibility results
+with the actual memory and context requirements of each pipeline.
+
+| Workload | Model Matrix rows or setting | Recommended assignment |
+|---|---|---|
+| Media cleanup and classification | `correct`, `trim_spans`, `tag`, `mindmap` | `qwen3.5:4b-q4_K_M` |
+| Media generation and Q&A | `summarize`, both deep dives, `merge`, `quickref`, `podcast_script`, `library_qa` | Start with `qwen3.5:4b-q4_K_M`; use `qwen3.5:9b-q4_K_M` when prose quality matters more than speed |
+| GitHub repository analysis | **Settings → Local repository analysis → Ollama model** | `qwen3.5:4b-q4_K_M` |
+| Local-only research papers | The same local repository model setting | `qwen3.5:4b-q4_K_M` |
+| Cloud-enabled papers using local chat models | `paper_map`, `paper_reduce`, `paper_plan`, `paper_memory` | `qwen3.5:4b-q4_K_M` |
+| Cloud-enabled paper prose | `paper_synthesis`, `paper_script` | `qwen3.5:9b-q4_K_M` when slower hybrid GPU/system-memory execution is acceptable; otherwise use the 4B model |
+| Semantic search | **Settings → Search → Embedding model** | `nomic-embed-text`; consider `qwen3-embedding:0.6b` for multilingual and code-heavy libraries |
+| English transcription | `asr` | faster-whisper `distil-large-v3` with the GPU overlay |
+| Multilingual transcription | `asr` | faster-whisper `turbo` |
+| Local podcast speech | `tts` | Piper with a medium voice; this path uses the CPU |
+
+The repository model setting also controls every language-model call for a
+local-only paper. Privacy enforcement overrides the individual paper rows in
+the Model Matrix, forces Ollama, disables thinking, and requests a 65,536-token
+context. The 4B Q4 model is approximately 3.4 GB, leaving much more room for
+that context cache than the approximately 6.6 GB 9B Q4 model. The 9B model can
+still run through partial CPU offload when sufficient system memory is
+available, but it will be slower.
+
+The older `qwen3:8b` shipping default remains useful for ordinary 16K work, but
+its current Ollama artifact declares a 40,960-token context. For this hardware,
+prefer Qwen 3.5 4B for the 64K repository and local-only paper boundary.
+
+Install the recommended chat models:
+
+```bash
+docker compose exec ollama ollama pull qwen3.5:4b-q4_K_M
+docker compose exec ollama ollama pull qwen3.5:9b-q4_K_M
+```
+
+Optionally install the newer embedding alternative:
+
+```bash
+docker compose exec ollama ollama pull qwen3-embedding:0.6b
+```
+
+Recommended advanced settings:
+
+- Keep **Context window** at 16,384 for ordinary media and cloud-enabled paper
+  calls. Restricted repository and local-only paper calls raise it to 65,536
+  automatically.
+- Set **Thinking** to **off** for predictable latency and structured output.
+  Restricted runs enforce this setting automatically.
+- Keep **JSON enforcement** enabled.
+- Do not pin the 9B model with `keep_alive=-1` when faster-whisper also uses
+  the GPU. Keep the normal five-minute setting, or use `0` to unload after each
+  call when VRAM contention is visible.
+- Check **System** while a job runs. Ollama's `PROCESSOR` value should be
+  `100% GPU` for maximum throughput; a CPU/GPU split indicates offload.
+
+The hardware and model details above are documented by
+[NVIDIA's RTX 50-series laptop specifications](https://www.nvidia.com/en-us/geforce/laptops/50-series/),
+the Ollama pages for
+[Qwen 3.5 4B](https://ollama.com/library/qwen3.5:4b),
+[Qwen 3.5 9B](https://ollama.com/library/qwen3.5:9b), and
+[Qwen3 Embedding](https://ollama.com/library/qwen3-embedding:0.6b), plus
+[Ollama's context and offload guidance](https://docs.ollama.com/context-length).
+The ASR choices follow the
+[faster-whisper model guidance](https://github.com/SYSTRAN/faster-whisper) and
+[Distil-Whisper model card](https://huggingface.co/distil-whisper/distil-large-v3).
+
 ## Embeddings
 
 Hybrid search can use local Ollama embeddings or a configured
@@ -116,8 +193,14 @@ OpenAI-compatible embedding server. The default Ollama embedding model is
 docker compose exec ollama ollama pull nomic-embed-text
 ```
 
+For a multilingual or code-heavy library, `qwen3-embedding:0.6b` is a current
+639 MB alternative with a substantially larger context window. It is not the
+shipping default and has not yet been compared with `nomic-embed-text` on a
+retained Synapse retrieval benchmark.
+
 After enabling semantic search or changing its model, rebuild the search index.
-System readiness reports a missing embedding model.
+Embeddings from different models are not interchangeable. System readiness
+reports a missing embedding model.
 
 ## ASR and TTS
 
@@ -134,9 +217,10 @@ currently run on CPU even when the GPU overlay is active.
 ## Capacity guidance
 
 A consumer GPU with approximately 8 GB VRAM significantly accelerates a
-quantized 7–9B model, but large context allocations can spill to system RAM and
-become much slower. Model weight size is not the only requirement: reserve
-memory for the context cache, Docker, extraction, and the operating system.
+quantized 4B model. A quantized 9B model can also run, but large context
+allocations are likely to spill into system memory and become much slower.
+Model weight size is not the only requirement: reserve memory for the context
+cache, Docker, extraction, and the operating system.
 
 Use the System page to inspect loaded models, CPU/GPU utilization, and VRAM
 while a job runs.

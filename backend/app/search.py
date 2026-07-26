@@ -43,6 +43,16 @@ def embed_texts(values: list[str], model: str | None = None, *,
     if not local_only and embedding_provider() == "openai_compat":
         vectors = _embed_openai_compat(values, selected_model)
     else:
+        from .local_model_safety import ensure_model_safe
+
+        # The selected tag may have changed after Settings saved it. Recheck
+        # embedding capability and the current execution budget at the actual
+        # Ollama transport boundary.
+        ensure_model_safe(
+            selected_model,
+            role="embedding",
+            requested_context=2_048,
+        )
         # Restricted embeddings must not inherit an outbound proxy. Keep public
         # remote-Ollama compatibility while explicitly bypassing proxy env vars
         # for the local-only path.

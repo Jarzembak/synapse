@@ -15,6 +15,71 @@ interface ProfileInfo { label: string; description: string; steps: string[]; cus
 interface StepInfo { name: string; label: string }
 interface SearchConfig { semantic_enabled: boolean; embedding_provider: string; embedding_model: string }
 interface ProviderModelsInfo { configured: boolean; ok: boolean; models: string[]; detail: string }
+type OllamaResourceTier =
+  "recommended" | "hybrid" | "resource_intensive" | "blocked" | "unavailable";
+interface OllamaModelRecord {
+  name: string;
+  digest: string;
+  size_bytes: number;
+  details: {
+    family?: string;
+    families?: string[];
+    parameter_size?: string;
+    quantization_level?: string;
+  };
+  capabilities: string[];
+  native_context_tokens: number | null;
+  annotation: { label: string; notes: string; labels: string[] };
+  benchmark: {
+    prompt_version: string;
+    completion: boolean;
+    structured_json: boolean;
+    checked_at: string;
+  } | null;
+  residency?: {
+    loaded: boolean;
+    size_bytes: number;
+    size_vram_bytes: number;
+    context_length: number;
+    expires_at: string;
+    processor: "cpu" | "gpu" | "hybrid" | "";
+  };
+  assessment: {
+    tier: OllamaResourceTier;
+    message: string;
+    requested_context_tokens: number;
+    estimated_weight_bytes: number;
+    estimated_context_bytes: number;
+    estimated_total_bytes: number;
+    acknowledged: boolean;
+  };
+  restricted_assessment?: {
+    tier: OllamaResourceTier;
+    message: string;
+    requested_context_tokens: number;
+    estimated_weight_bytes: number;
+    estimated_context_bytes: number;
+    estimated_total_bytes: number;
+    acknowledged: boolean;
+  };
+}
+interface OllamaInventory {
+  configured: boolean;
+  ok: boolean;
+  local: boolean;
+  detail: string;
+  resources: {
+    available: boolean;
+    reason: string;
+    ram_total_bytes: number;
+    ram_available_bytes: number;
+    vram_total_bytes: number;
+    vram_free_bytes: number;
+  };
+  models: OllamaModelRecord[];
+}
+interface OllamaAnnotationDraft { label: string; notes: string; labels: string }
+interface OllamaOverrideDraft { confirmation: string; reason: string }
 interface SearchStatus {
   chunks: number;
   repository_chunks: number;
@@ -45,11 +110,12 @@ interface CloudState {
 // A model field that offers the provider's actual models as a dropdown while
 // still allowing any custom name. Falls back to a plain input when the
 // provider's model list isn't available (server down, key not set).
-function ModelPicker({ value, models, onCommit, onDraft }: {
+function ModelPicker({ value, models, onCommit, onDraft, formatModel }: {
   value: string;
   models: string[];
   onCommit: (model: string) => void;   // save (dropdown pick / input blur)
   onDraft: (model: string) => void;    // local state only (while typing)
+  formatModel?: (model: string) => string;
 }) {
   // Explicit state, not derived from value∈models: deriving would unmount the
   // input mid-typing the moment a draft matches a listed model, swallowing
@@ -72,7 +138,7 @@ function ModelPicker({ value, models, onCommit, onDraft }: {
           else { setCustomMode(false); onCommit(e.target.value); }
         }}>
         <option value="" disabled>choose a model…</option>
-        {models.map((m) => <option key={m} value={m}>{m}</option>)}
+        {models.map((m) => <option key={m} value={m}>{formatModel?.(m) ?? m}</option>)}
         <option value="__custom__">custom…</option>
       </select>
       {showCustom && (
@@ -117,6 +183,26 @@ const CLOUD_LABELS: Record<string, string> = {
 const OAUTH_HINT = "Run `rclone authorize \"<provider>\"` on any machine with a " +
   "browser (rclone.org downloads), approve access, and paste the token JSON here.";
 
+const RESOURCE_TIER_LABELS: Record<OllamaResourceTier, string> = {
+  recommended: "Recommended",
+  hybrid: "CPU/GPU hybrid",
+  resource_intensive: "Resource-intensive",
+  blocked: "Blocked",
+  unavailable: "Assessment unavailable",
+};
+
+function formatBytes(value?: number | null): string {
+  if (!value || value < 1) return "unknown";
+  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+  let amount = value;
+  let index = 0;
+  while (amount >= 1024 && index < units.length - 1) {
+    amount /= 1024;
+    index += 1;
+  }
+  return `${amount >= 10 || index === 0 ? amount.toFixed(0) : amount.toFixed(1)} ${units[index]}`;
+}
+
 interface CatDraft {
   label: string; plural: string; icon: string; description: string; prompt: string;
 }
@@ -135,6 +221,10 @@ export default function Settings() {
   const [providers, setProviders] = useState<string[]>([]);
   const [providerOptions, setProviderOptions] = useState<Record<string, string[]>>({});
   const [providerModels, setProviderModels] = useState<Record<string, ProviderModelsInfo>>({});
+  const [ollamaInventory, setOllamaInventory] = useState<OllamaInventory | null>(null);
+  const [ollamaDrafts, setOllamaDrafts] = useState<Record<string, OllamaAnnotationDraft>>({});
+  const [ollamaOverrides, setOllamaOverrides] = useState<Record<string, OllamaOverrideDraft>>({});
+  const [ollamaPending, setOllamaPending] = useState("");
   const [pullName, setPullName] = useState("");
   const [voices, setVoices] = useState<VoicesState | null>(null);
   const [profiles, setProfiles] = useState<Record<string, ProfileInfo>>({});
@@ -178,6 +268,7 @@ export default function Settings() {
           setProviderOptions(r.provider_options);
         }),
       api<Record<string, ProviderModelsInfo>>("/settings/provider-models").then(setProviderModels),
+      api<OllamaInventory>("/settings/ollama/models").then(setOllamaInventory),
       api<VoicesState>("/settings/voices").then(setVoices),
       api<Record<string, ProfileInfo>>("/settings/profiles").then(setProfiles),
       api<StepInfo[]>("/projects/steps").then(setSteps),
@@ -477,8 +568,123 @@ export default function Settings() {
   }
 
   const refreshProviderModels = () =>
-    api<Record<string, ProviderModelsInfo>>("/settings/provider-models")
-      .then(setProviderModels).catch(() => {});
+    Promise.all([
+      api<Record<string, ProviderModelsInfo>>("/settings/provider-models")
+        .then(setProviderModels),
+      api<OllamaInventory>("/settings/ollama/models")
+        .then(setOllamaInventory),
+    ]).catch(() => {});
+
+  function annotationDraft(model: OllamaModelRecord): OllamaAnnotationDraft {
+    return ollamaDrafts[model.digest] ?? {
+      label: model.annotation.label,
+      notes: model.annotation.notes,
+      labels: model.annotation.labels.join(", "),
+    };
+  }
+
+  async function saveOllamaAnnotation(model: OllamaModelRecord) {
+    const draft = annotationDraft(model);
+    setOllamaPending(`annotation:${model.digest}`);
+    try {
+      await api("/settings/ollama/annotation", {
+        method: "PUT",
+        body: JSON.stringify({
+          model: model.name,
+          label: draft.label.trim(),
+          notes: draft.notes.trim(),
+          labels: draft.labels.split(",").map((value) => value.trim()).filter(Boolean),
+        }),
+      });
+      const refreshed = await api<OllamaInventory>("/settings/ollama/models");
+      setOllamaInventory(refreshed);
+      setOllamaDrafts((current) => {
+        const next = { ...current };
+        delete next[model.digest];
+        return next;
+      });
+      flash(`saved labels for ${model.name}`);
+    } catch (e: any) {
+      flash(`label save failed: ${e.message}`, true);
+    } finally {
+      setOllamaPending("");
+    }
+  }
+
+  async function benchmarkOllamaModel(model: OllamaModelRecord) {
+    setOllamaPending(`benchmark:${model.digest}`);
+    try {
+      await api("/settings/ollama/benchmark", {
+        method: "POST",
+        body: JSON.stringify({ model: model.name }),
+      });
+      flash(`compatibility benchmark queued for ${model.name}`);
+    } catch (e: any) {
+      flash(`benchmark failed to queue: ${e.message}`, true);
+    } finally {
+      setOllamaPending("");
+    }
+  }
+
+  async function unloadOllamaModel(model: OllamaModelRecord) {
+    setOllamaPending(`unload:${model.digest}`);
+    try {
+      await api("/settings/ollama/unload", {
+        method: "POST",
+        body: JSON.stringify({ model: model.name }),
+      });
+      setOllamaInventory(await api<OllamaInventory>(
+        "/settings/ollama/models?refresh=true",
+      ));
+      flash(`released ${model.name} from Ollama memory`);
+    } catch (e: any) {
+      flash(`unload failed: ${e.message}`, true);
+    } finally {
+      setOllamaPending("");
+    }
+  }
+
+  async function acknowledgeBlockedModel(model: OllamaModelRecord) {
+    const draft = ollamaOverrides[model.digest] ?? { confirmation: "", reason: "" };
+    setOllamaPending(`override:${model.digest}`);
+    try {
+      await api("/settings/ollama/acknowledge", {
+        method: "POST",
+        body: JSON.stringify({
+          model: model.name,
+          digest: model.digest,
+          confirmation: draft.confirmation,
+          reason: draft.reason.trim(),
+        }),
+      });
+      setOllamaInventory(await api<OllamaInventory>("/settings/ollama/models"));
+      setOllamaOverrides((current) => {
+        const next = { ...current };
+        delete next[model.digest];
+        return next;
+      });
+      flash(`administrator override recorded for ${model.name}`);
+    } catch (e: any) {
+      flash(`override failed: ${e.message}`, true);
+    } finally {
+      setOllamaPending("");
+    }
+  }
+
+  async function clearBlockedModelAcknowledgement(model: OllamaModelRecord) {
+    setOllamaPending(`override:${model.digest}`);
+    try {
+      await api(`/settings/ollama/acknowledgements/${encodeURIComponent(model.digest)}`, {
+        method: "DELETE",
+      });
+      setOllamaInventory(await api<OllamaInventory>("/settings/ollama/models"));
+      flash(`administrator override removed for ${model.name}`);
+    } catch (e: any) {
+      flash(`override removal failed: ${e.message}`, true);
+    } finally {
+      setOllamaPending("");
+    }
+  }
 
   async function pullOllamaModel() {
     const model = pullName.trim();
@@ -827,6 +1033,21 @@ export default function Settings() {
                   key={cfg.provider}
                   value={cfg.model}
                   models={providerModels[cfg.provider]?.models ?? []}
+                  formatModel={cfg.provider === "ollama"
+                    ? (modelName) => {
+                        const model = ollamaInventory?.models.find(
+                          (candidate) => candidate.name === modelName,
+                        );
+                        if (!model) return modelName;
+                        const label = model.annotation.label
+                          ? `${model.annotation.label} — `
+                          : "";
+                        const assessment = fn.startsWith("paper_")
+                          ? model.restricted_assessment ?? model.assessment
+                          : model.assessment;
+                        return `${label}${modelName} [${RESOURCE_TIER_LABELS[assessment.tier]}]`;
+                      }
+                    : undefined}
                   onCommit={(model) => void saveModel(fn, { ...cfg, model })}
                   onDraft={(model) => setFunctions((current) => ({
                     ...current, [fn]: { ...cfg, model },
@@ -863,6 +1084,231 @@ export default function Settings() {
         <code>qwen3:8b</code>). Installs run as background jobs (see Jobs) and
         land on whichever Ollama server OLLAMA_BASE_URL points at.
       </p>
+
+      <section className="ollama-inventory" aria-labelledby="ollama-inventory-title">
+        <div className="section-heading">
+          <div>
+            <h3 id="ollama-inventory-title">Local Ollama model safeguards</h3>
+            <p className="meta">
+              Detected capabilities and resource tiers are facts about the current
+              model digest and execution environment. Compatibility results come
+              from Synapse's bounded completion and structured-output benchmark.
+            </p>
+          </div>
+          <button type="button" onClick={() => void refreshProviderModels()}>
+            Refresh inventory
+          </button>
+        </div>
+        {!ollamaInventory?.ok ? (
+          <p className="meta">
+            {ollamaInventory?.detail || "Ollama inventory is not currently available."}
+          </p>
+        ) : (
+          <>
+            <p className="meta">
+              {ollamaInventory.local
+                ? ollamaInventory.resources.available
+                  ? `Runtime capacity: ${formatBytes(ollamaInventory.resources.vram_free_bytes)} free VRAM of ${
+                      formatBytes(ollamaInventory.resources.vram_total_bytes)
+                    }, ${formatBytes(ollamaInventory.resources.ram_available_bytes)} available RAM of ${
+                      formatBytes(ollamaInventory.resources.ram_total_bytes)
+                    }.`
+                  : `Local resource assessment unavailable: ${ollamaInventory.resources.reason}`
+                : "This Ollama server is remote. Configure its resource profile before relying on fit estimates."}
+            </p>
+            <div className="ollama-model-grid">
+              {ollamaInventory.models.map((model) => {
+                const draft = annotationDraft(model);
+                const override = ollamaOverrides[model.digest] ?? {
+                  confirmation: "",
+                  reason: "",
+                };
+                const blockedAssessment = model.restricted_assessment?.tier === "blocked"
+                  ? model.restricted_assessment
+                  : model.assessment.tier === "blocked"
+                    ? model.assessment
+                    : null;
+                const overallAssessment = model.restricted_assessment ?? model.assessment;
+                const detectedUses = [
+                  ...(model.capabilities.includes("completion") ? ["Text generation"] : []),
+                  ...(model.capabilities.includes("embedding") ? ["Semantic search"] : []),
+                  ...(model.capabilities.includes("completion") &&
+                    (model.native_context_tokens ?? 0) >= 65_536
+                    ? ["Dense-context candidate"]
+                    : []),
+                  ...(model.benchmark?.structured_json ? ["Structured output verified"] : []),
+                ];
+                const pending = ollamaPending.endsWith(model.digest);
+                return (
+                  <article className={`card ollama-model-card tier-${overallAssessment.tier}`}
+                    key={model.digest}>
+                    <div className="ollama-model-heading">
+                      <div>
+                        <h4>{model.annotation.label || model.name}</h4>
+                        {model.annotation.label && <code>{model.name}</code>}
+                      </div>
+                      <span className={`resource-tier ${overallAssessment.tier}`}>
+                        {RESOURCE_TIER_LABELS[overallAssessment.tier]}
+                      </span>
+                    </div>
+                    <p className="meta">
+                      {model.restricted_assessment
+                        ? `Standard ${model.assessment.requested_context_tokens.toLocaleString()}-token work: ${
+                            RESOURCE_TIER_LABELS[model.assessment.tier]
+                          } — ${model.assessment.message}.`
+                        : model.assessment.message}
+                    </p>
+                    {model.restricted_assessment &&
+                      model.restricted_assessment.tier !== model.assessment.tier && (
+                        <p className="meta">
+                          Dense repository/paper analysis at{" "}
+                          {model.restricted_assessment.requested_context_tokens.toLocaleString()} tokens:{" "}
+                          <strong>{RESOURCE_TIER_LABELS[model.restricted_assessment.tier]}</strong>
+                          {" — "}{model.restricted_assessment.message}.
+                        </p>
+                      )}
+                    <dl className="model-facts">
+                      <div><dt>Weights</dt><dd>{formatBytes(model.size_bytes)}</dd></div>
+                      <div><dt>Parameters</dt><dd>{model.details.parameter_size || "unknown"}</dd></div>
+                      <div><dt>Quantization</dt><dd>{model.details.quantization_level || "unknown"}</dd></div>
+                      <div><dt>Native context</dt><dd>
+                        {model.native_context_tokens
+                          ? model.native_context_tokens.toLocaleString()
+                          : "unknown"}
+                      </dd></div>
+                    </dl>
+                    <div className="tagcloud" aria-label={`${model.name} capabilities`}>
+                      {model.capabilities.length
+                        ? model.capabilities.map((capability) => (
+                            <span className="tag" key={capability}>{capability}</span>
+                          ))
+                        : <span className="meta">No capabilities reported</span>}
+                    </div>
+                    <p className="meta model-fit-label">Detected Synapse fit</p>
+                    <div className="tagcloud" aria-label={`${model.name} Synapse fit`}>
+                      {detectedUses.length
+                        ? detectedUses.map((use) => <span className="tag" key={use}>{use}</span>)
+                        : <span className="meta">No eligible pipeline role detected</span>}
+                      {model.capabilities.includes("completion") && !model.benchmark?.structured_json && (
+                        <span className="jobstatus partial">Structured output unverified</span>
+                      )}
+                    </div>
+                    <div className="model-benchmark">
+                      {model.benchmark ? (
+                        <p className="meta">
+                          Benchmark: completion {model.benchmark.completion ? "passed" : "failed"};
+                          structured JSON {model.benchmark.structured_json ? "passed" : "failed"}.
+                        </p>
+                      ) : (
+                        <p className="meta">Compatibility benchmark pending or not yet run.</p>
+                      )}
+                      <button type="button" onClick={() => void benchmarkOllamaModel(model)}
+                        disabled={pending}>
+                        {ollamaPending === `benchmark:${model.digest}`
+                          ? "Queuing..."
+                          : model.benchmark ? "Re-run benchmark" : "Run benchmark"}
+                      </button>
+                      {model.residency?.loaded && (
+                        <div className="resident-model-row">
+                          <span className="meta">
+                            Loaded {model.residency.processor || "locally"} ·{" "}
+                            {formatBytes(model.residency.size_vram_bytes)} VRAM ·{" "}
+                            {formatBytes(model.residency.size_bytes)} total
+                          </span>
+                          <button type="button" onClick={() => void unloadOllamaModel(model)}
+                            disabled={pending}>
+                            {ollamaPending === `unload:${model.digest}`
+                              ? "Unloading..."
+                              : "Unload from memory"}
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                    <details>
+                      <summary>Labels and notes</summary>
+                      <div className="knobs compact-knobs">
+                        <label>Display label
+                          <input value={draft.label}
+                            onChange={(event) => setOllamaDrafts((current) => ({
+                              ...current,
+                              [model.digest]: { ...draft, label: event.target.value },
+                            }))} />
+                        </label>
+                        <label>Labels, separated by commas
+                          <input value={draft.labels}
+                            onChange={(event) => setOllamaDrafts((current) => ({
+                              ...current,
+                              [model.digest]: { ...draft, labels: event.target.value },
+                            }))} />
+                        </label>
+                        <label>Notes
+                          <textarea rows={3} value={draft.notes}
+                            onChange={(event) => setOllamaDrafts((current) => ({
+                              ...current,
+                              [model.digest]: { ...draft, notes: event.target.value },
+                            }))} />
+                        </label>
+                        <button type="button" onClick={() => void saveOllamaAnnotation(model)}
+                          disabled={pending}>Save labels</button>
+                      </div>
+                    </details>
+                    {blockedAssessment && (
+                      <details className="danger-zone">
+                        <summary>Administrator override</summary>
+                        {blockedAssessment.acknowledged ? (
+                          <>
+                            <p className="error">
+                              This blocked model has an active digest-specific override.
+                            </p>
+                            <button type="button"
+                              onClick={() => void clearBlockedModelAcknowledgement(model)}
+                              disabled={pending}>
+                              Remove override
+                            </button>
+                          </>
+                        ) : (
+                          <div className="knobs compact-knobs">
+                            <p className="error">
+                              This can exhaust runtime memory, become extremely slow, or fail.
+                              Type the complete model name and record a reason to continue.
+                            </p>
+                            <label>Type <code>{model.name}</code>
+                              <input value={override.confirmation}
+                                onChange={(event) => setOllamaOverrides((current) => ({
+                                  ...current,
+                                  [model.digest]: {
+                                    ...override,
+                                    confirmation: event.target.value,
+                                  },
+                                }))} />
+                            </label>
+                            <label>Administrative reason
+                              <textarea rows={3} value={override.reason}
+                                onChange={(event) => setOllamaOverrides((current) => ({
+                                  ...current,
+                                  [model.digest]: { ...override, reason: event.target.value },
+                                }))} />
+                            </label>
+                            <button type="button"
+                              onClick={() => void acknowledgeBlockedModel(model)}
+                              disabled={
+                                pending ||
+                                override.confirmation !== model.name ||
+                                override.reason.trim().length < 10
+                              }>
+                              Record administrator override
+                            </button>
+                          </div>
+                        )}
+                      </details>
+                    )}
+                  </article>
+                );
+              })}
+            </div>
+          </>
+        )}
+      </section>
 
       <h2>Podcast voices</h2>
       <p className="meta">
@@ -1029,8 +1475,15 @@ export default function Settings() {
               onChange={(event) => setBackupConfig({
                 ...backupConfig, include_media: event.target.checked,
               })} />
-            include archived source and generated audio
+            include archived source and generated audio that is currently local
           </label>
+          <p className="warning">
+            Cloud-primary media bytes are not downloaded into a backup. Synapse records
+            each remote-media dependency and its non-secret storage target identity in the
+            backup manifest, but the backup remains dependent on that configured remote
+            and valid credentials. Restore cloud-only media locally before creating the
+            backup when you need a self-contained media archive.
+          </p>
           <label className="checkline">
             <input type="checkbox" checked={!!backupConfig.include_repositories}
               onChange={(event) => setBackupConfig({

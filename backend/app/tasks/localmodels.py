@@ -15,10 +15,59 @@ import httpx
 
 from ..config import settings
 from ..db import get_session
+from ..local_model_safety import (
+    clear_inventory_cache,
+    inspect_model,
+    run_compatibility_benchmark,
+)
+from ..models import Job
 from .celery_app import celery
 from .common import set_job, transition_job
 
 log = logging.getLogger("synapse.localmodels")
+
+
+def _queue_automatic_benchmark(model: str) -> None:
+    """Queue a non-fatal post-install compatibility check for chat models."""
+    try:
+        clear_inventory_cache()
+        inventory, row = inspect_model(model, refresh=True)
+        capabilities = set((row or {}).get("capabilities") or [])
+        if inventory["ok"] and row and capabilities and "completion" not in capabilities:
+            log.info(
+                "ollama benchmark %s skipped: model does not advertise completion",
+                model,
+            )
+            return
+        with get_session() as session:
+            job = Job(
+                project_id=None,
+                task="ollama_benchmark",
+                progress=model,
+                options=json.dumps({"automatic": True}),
+            )
+            session.add(job)
+            session.commit()
+            session.refresh(job)
+            try:
+                result = celery.send_task(
+                    "ollama_benchmark",
+                    args=[job.id, model],
+                )
+                job.celery_id = result.id
+            except Exception as exc:
+                job.status = "error"
+                job.error = f"could not dispatch automatic benchmark: {exc}"[:2000]
+            session.add(job)
+            session.commit()
+    except Exception:
+        # Installation is complete and useful even if inspection, persistence,
+        # or broker dispatch for this optional follow-up fails.
+        log.warning(
+            "could not queue automatic ollama benchmark for %s",
+            model,
+            exc_info=True,
+        )
 
 
 @celery.task(name="ollama_pull")
@@ -76,9 +125,55 @@ def ollama_pull(job_id: int, model: str):
             transition_job(session, job_id, {"running"}, "done",
                            progress=f"{model}: installed")
         log.info("pulled ollama model %s", model)
+        _queue_automatic_benchmark(model)
     except Exception as e:
         with get_session() as session:
             transition_job(session, job_id, {"queued", "running"}, "error",
                            error=str(e)[:2000])
         log.error("ollama pull failed for %s: %s", model, e)
+        raise
+
+
+@celery.task(
+    name="ollama_benchmark",
+    soft_time_limit=120,
+    time_limit=150,
+)
+def ollama_benchmark(job_id: int, model: str):
+    """Run one small completion/JSON probe and persist it by model digest."""
+    with get_session() as session:
+        if not transition_job(
+            session,
+            job_id,
+            {"queued"},
+            "running",
+            progress=f"{model}: checking compatibility",
+        ):
+            log.info(
+                "ollama benchmark %s skipped: job %s is no longer queued",
+                model,
+                job_id,
+            )
+            return
+    try:
+        result = run_compatibility_benchmark(model)
+        with get_session() as session:
+            transition_job(
+                session,
+                job_id,
+                {"running"},
+                "done",
+                progress=f"{model}: compatible",
+            )
+        log.info("benchmarked ollama model %s: %s", model, result)
+    except Exception as exc:
+        with get_session() as session:
+            transition_job(
+                session,
+                job_id,
+                {"queued", "running"},
+                "error",
+                error=str(exc)[:2000],
+            )
+        log.error("ollama benchmark failed for %s: %s", model, exc)
         raise

@@ -1115,6 +1115,131 @@ def test_system_stats_shape(client):
     assert len(s["cpu_per_core"]) == s["cpu_count"]
 
 
+def test_deployment_preflight_finds_local_only_paper_model_jobs():
+    import uuid
+
+    from app.models import Job, PaperSource, Project, Setting
+    from app.routers import system
+    from app.settings_store import get_setting, set_setting
+
+    prior_synthesis = get_setting("model.paper_synthesis")
+    prior_local_model = get_setting("repository.local_model")
+    suffix = uuid.uuid4().hex
+    job_ids: list[int] = []
+    project_id: int | None = None
+    source_id: int | None = None
+    try:
+        # The configured function is cloud-backed, but local-only paper policy
+        # must make deployment preflight report its effective Ollama execution.
+        set_setting("model.paper_synthesis", {
+            "provider": "anthropic",
+            "model": "cloud-paper-model",
+        })
+        set_setting("repository.local_model", "paper-local-model")
+        with get_session() as session:
+            project = Project(
+                slug=f"deployment-paper-{suffix}",
+                title="Local deployment paper",
+                source="paper.pdf",
+                source_type="paper",
+            )
+            session.add(project)
+            session.flush()
+            project_id = project.id
+            source = PaperSource(
+                project_id=project.id,
+                original_filename="paper.pdf",
+                source_hash=suffix.ljust(64, "0")[:64],
+                relative_path=f"projects/{project.slug}/source/original.pdf",
+                local_only=True,
+                privacy_locked=True,
+                status="ready",
+                quality_grade="GOOD",
+            )
+            session.add(source)
+            session.flush()
+            source_id = source.id
+            paper_job = Job(
+                project_id=project.id,
+                task="paper_analyze",
+                status="running",
+            )
+            pull_job = Job(
+                task="ollama_pull",
+                status="queued",
+                progress="deepseek-r1:671b",
+            )
+            benchmark_job = Job(
+                task="ollama_benchmark",
+                status="running",
+                progress="qwen3:4b",
+            )
+            session.add(paper_job)
+            session.add(pull_job)
+            session.add(benchmark_job)
+            session.commit()
+            session.refresh(paper_job)
+            session.refresh(pull_job)
+            session.refresh(benchmark_job)
+            job_ids = [paper_job.id, pull_job.id, benchmark_job.id]
+
+        active = system._active_local_model_jobs()
+        by_id = {row["id"]: row for row in active if row["id"] in job_ids}
+        assert set(by_id) == set(job_ids)
+        assert by_id[job_ids[0]]["project_title"] == "Local deployment paper"
+        assert {
+            execution["provider"]
+            for execution in by_id[job_ids[0]]["executions"]
+        } == {"ollama"}
+        assert {
+            execution["model"]
+            for execution in by_id[job_ids[0]]["executions"]
+        } == {"paper-local-model"}
+        assert by_id[job_ids[1]]["executions"] == [{
+            "function": "model_install",
+            "provider": "ollama",
+            "model": "deepseek-r1:671b",
+        }]
+        assert by_id[job_ids[2]]["executions"] == [{
+            "function": "model_benchmark",
+            "provider": "ollama",
+            "model": "qwen3:4b",
+        }]
+
+        deployment = system._deployment_model_status()
+        assert deployment["safe_to_restart_local_model_services"] is False
+        assert deployment["running"] >= 1
+        assert deployment["queued"] >= 1
+    finally:
+        for key, value in (
+            ("model.paper_synthesis", prior_synthesis),
+            ("repository.local_model", prior_local_model),
+        ):
+            if value is not None:
+                set_setting(key, value)
+                continue
+            with get_session() as session:
+                row = session.get(Setting, key)
+                if row:
+                    session.delete(row)
+                    session.commit()
+        if job_ids:
+            with get_session() as session:
+                for job_id in job_ids:
+                    job = session.get(Job, job_id)
+                    if job:
+                        session.delete(job)
+                if source_id:
+                    source = session.get(PaperSource, source_id)
+                    if source:
+                        session.delete(source)
+                if project_id:
+                    project = session.get(Project, project_id)
+                    if project:
+                        session.delete(project)
+                session.commit()
+
+
 def test_piper_voice_urls():
     from app.tasks.audio import _piper_urls
 
@@ -1691,6 +1816,217 @@ def test_cloud_mode_roundtrip_and_validation(client):
         "auto": False, "mode": "push"})  # restore
 
 
+def test_cloud_primary_media_bypasses_legacy_mirror(tmp_path, monkeypatch):
+    import shutil
+    import types
+    import uuid
+
+    from sqlmodel import select
+
+    from app import library, settings_store
+    from app.db import get_session
+    from app.models import Artifact, Project, ProjectMediaPolicy
+    from app.tasks import celery_app, cloud
+
+    library_dir = tmp_path / "library"
+    media_dir = tmp_path / "media"
+    library_dir.mkdir()
+    media_dir.mkdir()
+    monkeypatch.setattr(library.settings, "library_dir", library_dir)
+    monkeypatch.setattr(library.settings, "media_dir", media_dir)
+
+    suffix = uuid.uuid4().hex[:10]
+    cloud_slug = f"cloud-primary-{suffix}"
+    local_slug = f"keep-local-{suffix}"
+    project_ids: list[int] = []
+    artifact_ids: list[int] = []
+
+    def write(relative: str, payload: bytes) -> None:
+        path = (
+            media_dir / relative.removeprefix("media:")
+            if relative.startswith("media:")
+            else library_dir / relative
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+
+    rows = {
+        "cloud_library": {
+            "type": "podcast_audio",
+            "path": f"projects/{cloud_slug}/podcast_audio.md",
+            "media_path": f"projects/{cloud_slug}/podcast_audio.mp3",
+        },
+        "cloud_source": {
+            "type": "source_audio",
+            "path": f"projects/{cloud_slug}/source_audio.md",
+            "media_path": f"media:{cloud_slug}/source_audio.m4a",
+        },
+        "local_library": {
+            "type": "podcast_audio",
+            "path": f"projects/{local_slug}/podcast_audio.md",
+            "media_path": f"projects/{local_slug}/podcast_audio.mp3",
+        },
+        "local_source": {
+            "type": "source_audio",
+            "path": f"projects/{local_slug}/source_audio.md",
+            "media_path": f"media:{local_slug}/source_audio.m4a",
+        },
+    }
+
+    try:
+        with get_session() as session:
+            cloud_project = Project(
+                slug=cloud_slug,
+                title="Cloud-primary legacy exclusion",
+                source="https://example.test/cloud",
+                source_type="url",
+            )
+            local_project = Project(
+                slug=local_slug,
+                title="Keep-local legacy behavior",
+                source="https://example.test/local",
+                source_type="url",
+            )
+            session.add(cloud_project)
+            session.add(local_project)
+            session.flush()
+            project_ids = [cloud_project.id, local_project.id]
+            session.add(ProjectMediaPolicy(
+                project_id=cloud_project.id,
+                mode="cloud_primary",
+            ))
+            session.add(ProjectMediaPolicy(
+                project_id=local_project.id,
+                mode="keep_local",
+            ))
+            artifacts: dict[str, Artifact] = {}
+            for name, values in rows.items():
+                project = (
+                    cloud_project if name.startswith("cloud_") else local_project)
+                artifact = Artifact(
+                    project_id=project.id,
+                    type=values["type"],
+                    title=name,
+                    path=values["path"],
+                    media_path=values["media_path"],
+                )
+                session.add(artifact)
+                artifacts[name] = artifact
+            session.commit()
+            for artifact in artifacts.values():
+                session.refresh(artifact)
+                artifact_ids.append(artifact.id)
+
+        for values in rows.values():
+            write(values["path"], b"sidecar")
+            write(values["media_path"], values["media_path"].encode("utf-8"))
+
+        sent: list[tuple[str, list]] = []
+        monkeypatch.setattr(
+            celery_app.celery,
+            "send_task",
+            lambda name, args=None: (
+                sent.append((name, args)) or types.SimpleNamespace(id="cloud-id")
+            ),
+        )
+        original_get_setting = settings_store.get_setting
+        monkeypatch.setattr(
+            settings_store,
+            "get_setting",
+            lambda key, default=None: (
+                True if key == "cloud.auto"
+                else original_get_setting(key, default)
+            ),
+        )
+
+        with get_session() as session:
+            current = {
+                artifact.title: artifact
+                for artifact in session.exec(select(Artifact).where(
+                    Artifact.id.in_(artifact_ids)
+                )).all()
+            }
+        library._queue_cloud_sync(current["cloud_library"])
+        library._queue_cloud_sync(current["cloud_source"])
+        library._queue_cloud_sync(current["local_library"])
+
+        assert sent == [
+            ("cloud_sync_paths", [[rows["cloud_library"]["path"]]]),
+            ("cloud_sync_paths", [[rows["cloud_source"]["path"]]]),
+            ("cloud_sync_paths", [[
+                rows["local_library"]["path"],
+                rows["local_library"]["media_path"],
+            ]]),
+        ]
+
+        # A legacy task queued before the policy changed is checked again when
+        # its immutable upload snapshot is created.
+        assert cloud._stage_public_path(
+            rows["cloud_source"]["media_path"]) is None
+        staged_local = cloud._stage_public_path(
+            rows["local_source"]["media_path"])
+        assert staged_local is not None
+        try:
+            assert staged_local[0].read_bytes() == \
+                rows["local_source"]["media_path"].encode("utf-8")
+        finally:
+            shutil.rmtree(staged_local[0].parent, ignore_errors=True)
+
+        staged_library = cloud._stage_public_library()
+        try:
+            assert (staged_library / rows["cloud_library"]["path"]).is_file()
+            assert not (
+                staged_library / rows["cloud_library"]["media_path"]).exists()
+            assert (staged_library / rows["local_library"]["path"]).is_file()
+            assert (
+                staged_library / rows["local_library"]["media_path"]).is_file()
+        finally:
+            shutil.rmtree(staged_library, ignore_errors=True)
+
+        bisync_work = tmp_path / "bisync"
+        bisync_work.mkdir()
+        cloud._write_bisync_filters(bisync_work)
+        bisync_filters = (bisync_work / "filters.txt").read_text(
+            encoding="utf-8")
+        assert f"- /{rows['cloud_library']['media_path']}" in bisync_filters
+        assert rows["cloud_library"]["path"] not in bisync_filters
+        assert rows["local_library"]["media_path"] not in bisync_filters
+
+        media_args = cloud._legacy_media_copy_args()
+        assert f"- /{cloud_slug}/source_audio.*" in media_args
+        assert f"- /{cloud_slug}/source_video.*" in media_args
+        assert f"- /{local_slug}/source_audio.*" not in media_args
+
+        # With no cloud-primary project, retain the exact established command.
+        monkeypatch.setattr(cloud, "_cloud_primary_project_slugs", lambda: [])
+        assert cloud._legacy_media_copy_args() == [
+            "copy",
+            str(media_dir),
+            cloud._dest("media"),
+            "--include",
+            "/*/source_video.*",
+            "--include",
+            "/*/source_audio.*",
+        ]
+    finally:
+        with get_session() as session:
+            for artifact_id in artifact_ids:
+                artifact = session.get(Artifact, artifact_id)
+                if artifact:
+                    session.delete(artifact)
+            session.flush()
+            for project_id in project_ids:
+                policy = session.get(ProjectMediaPolicy, project_id)
+                if policy:
+                    session.delete(policy)
+            session.flush()
+            for project_id in project_ids:
+                project = session.get(Project, project_id)
+                if project:
+                    session.delete(project)
+            session.commit()
+
+
 def _mock_reindex_dispatch(monkeypatch, cloud, dispatched: list):
     """Capture the rebuild_library / rebuild_search dispatch (signature +
     chain + apply_async) without a broker."""
@@ -1918,6 +2254,13 @@ def test_ollama_pull_task_success_error_and_cancel(client, monkeypatch):
     from app.models import Job
     from app.tasks import localmodels
 
+    automatic_benchmarks = []
+    monkeypatch.setattr(
+        localmodels,
+        "_queue_automatic_benchmark",
+        lambda model: automatic_benchmarks.append(model),
+    )
+
     def make_job(status="queued"):
         with get_session() as session:
             job = Job(project_id=None, task="ollama_pull", status=status,
@@ -1961,6 +2304,7 @@ def test_ollama_pull_task_success_error_and_cancel(client, monkeypatch):
         job = session.get(Job, job_id)
         assert job.status == "done"
         assert job.progress == "qwen3:8b: installed"
+    assert automatic_benchmarks == ["qwen3:8b"]
 
     # an error line in the stream fails the job with Ollama's message
     monkeypatch.setattr(

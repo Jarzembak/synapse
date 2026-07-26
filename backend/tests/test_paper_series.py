@@ -94,6 +94,131 @@ def _series_fixture(*, local_only: bool = False) -> tuple[int, int, int, int, Pa
         return project.id, series.id, first.id, second.id, chunk
 
 
+def _isolate_worker_start_recovery(monkeypatch) -> None:
+    from app import repository
+    from app.tasks import celery_app, cloud, orchestrate
+
+    monkeypatch.setattr(celery_app, "PAPER_WORKER", False)
+    monkeypatch.setattr(repository, "cleanup_repository_staging", lambda: None)
+    monkeypatch.setattr(cloud, "enqueue_pending_privacy_purges", lambda: None)
+    monkeypatch.setattr(orchestrate, "maybe_start_next_run_all", lambda: None)
+
+
+def test_worker_restart_repairs_interrupted_paper_script_continuity(monkeypatch):
+    from app.tasks.celery_app import _reset_orphaned_jobs
+
+    project_id, series_id, first_id, second_id, _chunk = _series_fixture()
+    with get_session() as session:
+        series = session.get(PaperSeries, series_id)
+        series.status = "running"
+        first = session.get(PaperSeriesPart, first_id)
+        first.status = "generating"
+        first.script_status = "generating"
+        first.audio_status = "done"
+        second = session.get(PaperSeriesPart, second_id)
+        second.status = "complete"
+        second.script_status = "done"
+        second.audio_status = "done"
+        job = Job(
+            project_id=project_id,
+            paper_series_id=series_id,
+            paper_part_id=first_id,
+            task="paper_part_step",
+            status="running",
+            options=json.dumps({"step": "script"}),
+        )
+        session.add(series)
+        session.add(first)
+        session.add(second)
+        session.add(job)
+        session.commit()
+        session.refresh(job)
+        job_id = job.id
+
+    _isolate_worker_start_recovery(monkeypatch)
+    _reset_orphaned_jobs()
+
+    with get_session() as session:
+        job = session.get(Job, job_id)
+        series = session.get(PaperSeries, series_id)
+        first = session.get(PaperSeriesPart, first_id)
+        second = session.get(PaperSeriesPart, second_id)
+        assert job.status == "error"
+        assert "interrupted by a worker restart" in job.error
+        assert series.status == "error"
+        assert first.status == "error"
+        assert first.script_status == "error"
+        assert first.audio_status == "stale"
+        assert first.stale is True
+        assert second.script_status == "stale"
+        assert second.audio_status == "stale"
+        assert second.stale is True
+
+
+def test_worker_restart_repairs_all_generating_guides_in_track(monkeypatch):
+    from app.tasks.celery_app import _reset_orphaned_jobs
+
+    project_id, series_id, first_id, second_id, _chunk = _series_fixture()
+    with get_session() as session:
+        series = session.get(PaperSeries, series_id)
+        series.status = "running"
+        for part_id in (first_id, second_id):
+            part = session.get(PaperSeriesPart, part_id)
+            part.status = "generating"
+            part.guide_status = "generating"
+            session.add(part)
+        job = Job(
+            project_id=project_id,
+            paper_series_id=series_id,
+            task="paper_series_run",
+            status="running",
+        )
+        session.add(series)
+        session.add(job)
+        session.commit()
+        session.refresh(job)
+        job_id = job.id
+
+    _isolate_worker_start_recovery(monkeypatch)
+    _reset_orphaned_jobs()
+
+    with get_session() as session:
+        assert session.get(Job, job_id).status == "error"
+        assert session.get(PaperSeries, series_id).status == "error"
+        for part_id in (first_id, second_id):
+            part = session.get(PaperSeriesPart, part_id)
+            assert part.status == "error"
+            assert part.guide_status == "error"
+
+
+def test_interrupted_error_track_can_be_queued_again(monkeypatch):
+    from app.routers.papers import run_paper_series
+    from app.tasks.celery_app import celery
+
+    _project_id, series_id, _first_id, _second_id, _chunk = _series_fixture()
+    with get_session() as session:
+        series = session.get(PaperSeries, series_id)
+        series.status = "error"
+        session.add(series)
+        session.commit()
+
+    monkeypatch.setattr(
+        celery,
+        "send_task",
+        lambda *_args, **_kwargs: type("Result", (), {"id": "retry-task"})(),
+    )
+    job = run_paper_series(series_id)
+    job_id = job.id
+    assert job.status == "queued"
+    assert job.paper_series_id == series_id
+
+    # Keep the module's shared test database free of an active broker fixture.
+    with get_session() as session:
+        job = session.get(Job, job_id)
+        session.delete(job)
+        session.commit()
+
+
 def test_local_only_paper_forces_chat_and_tts_to_local_providers(monkeypatch):
     project_id, _series_id, _first_id, _second_id, _chunk = _series_fixture(
         local_only=True)

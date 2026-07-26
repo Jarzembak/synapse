@@ -15,14 +15,14 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Iterable
 
-from sqlmodel import select, text
+from sqlmodel import Session, select, text
 
 from .. import library, llm, paper as paper_store
 from ..config import advanced
 from ..context import current_job_id
 from ..db import get_session
 from ..models import (
-    Artifact, PaperChunk, PaperMemoryRevision, PaperPartEvidence, PaperSeries,
+    Artifact, Job, PaperChunk, PaperMemoryRevision, PaperPartEvidence, PaperSeries,
     PaperSeriesPart, PaperSource, Project, utcnow,
 )
 from ..settings_store import get_setting
@@ -64,6 +64,11 @@ _PAPER_LINK = re.compile(
     r"\[[^\]]*\]\(/api/papers/[^)]*\)", re.IGNORECASE)
 MAX_MEMORY_ITEMS_PER_FIELD = 200
 MAX_MEMORY_EVIDENCE_IDS = 2_000
+PAPER_PRODUCTION_TASKS = {
+    "paper_series_run",
+    "paper_part_step",
+    "paper_rebuild_following",
+}
 
 
 def _digest(value: Any) -> str:
@@ -77,6 +82,115 @@ def _loads(value: str | None, fallback):
     except (TypeError, json.JSONDecodeError):
         return fallback
     return parsed if isinstance(parsed, type(fallback)) else fallback
+
+
+def reconcile_interrupted_paper_jobs(
+    session: Session,
+    interrupted_jobs: Iterable[Job],
+) -> dict[str, int]:
+    """Repair track state left behind when a worker is terminated abruptly.
+
+    Normal Python exceptions run the production helpers' cleanup paths. A hard
+    container stop cannot, so ``Job`` recovery must also clear any durable
+    ``generating`` markers. Script interruption additionally invalidates its
+    audio and every following script/audio because no matching immutable memory
+    revision can be assumed to have been finalized.
+
+    The caller owns the transaction so Job and domain-state recovery commit
+    atomically during worker startup.
+    """
+    jobs = [
+        job for job in interrupted_jobs
+        if job.paper_series_id and job.task in PAPER_PRODUCTION_TASKS
+    ]
+    if not jobs:
+        return {"series": 0, "parts": 0}
+
+    repaired_series: set[int] = set()
+    repaired_parts: set[int] = set()
+    now = utcnow()
+
+    for job in jobs:
+        series = session.get(PaperSeries, job.paper_series_id)
+        if series is None:
+            continue
+        series.status = "error"
+        series.updated = now
+        session.add(series)
+        repaired_series.add(series.id)
+
+        parts = list(session.exec(
+            select(PaperSeriesPart).where(
+                PaperSeriesPart.series_id == series.id
+            ).order_by(PaperSeriesPart.position)
+        ).all())
+        if job.paper_part_id:
+            start = next(
+                (part for part in parts if part.id == job.paper_part_id),
+                None,
+            )
+            if start is None:
+                continue
+            if job.task == "paper_rebuild_following":
+                targets = [
+                    part for part in parts if part.position >= start.position
+                ]
+            else:
+                targets = [start]
+        else:
+            targets = parts
+
+        requested_step = ""
+        if job.task == "paper_part_step":
+            requested_step = str(
+                _loads(job.options, {}).get("step") or ""
+            ).strip()
+        candidate_steps = (
+            [requested_step]
+            if requested_step in {"guide", "script", "audio"}
+            else ["guide", "script", "audio"]
+        )
+
+        interrupted_scripts: list[PaperSeriesPart] = []
+        for part in targets:
+            part_repaired = False
+            for step in candidate_steps:
+                attr = f"{step}_status"
+                if getattr(part, attr) != "generating":
+                    continue
+                setattr(part, attr, "error")
+                part_repaired = True
+                if step == "script":
+                    interrupted_scripts.append(part)
+            if part_repaired:
+                part.status = "error"
+                part.updated = now
+                session.add(part)
+                repaired_parts.add(part.id)
+
+        for interrupted in interrupted_scripts:
+            interrupted.stale = True
+            if interrupted.audio_status != "pending":
+                interrupted.audio_status = "stale"
+            interrupted.updated = now
+            session.add(interrupted)
+            repaired_parts.add(interrupted.id)
+            for following in parts:
+                if following.position <= interrupted.position:
+                    continue
+                if following.script_status != "pending":
+                    following.script_status = "stale"
+                if following.audio_status != "pending":
+                    following.audio_status = "stale"
+                following.stale = True
+                following.updated = now
+                session.add(following)
+                repaired_parts.add(following.id)
+
+    return {
+        "series": len(repaired_series),
+        "parts": len(repaired_parts),
+    }
 
 
 def _series_rows(project_id: int, series_id: int,
@@ -854,7 +968,7 @@ def _threaded_guide(job_id: int, project_id: int, series_id: int,
 @pipeline_task
 def paper_series_run(job_id: int, project_id: int, series_id: int):
     _project, _source, series, _part = _series_rows(project_id, series_id)
-    if series.status not in {"approved", "running", "complete"}:
+    if series.status not in {"approved", "running", "complete", "error"}:
         raise RuntimeError("approve the paper audience plan before production")
     try:
         with get_session() as session:

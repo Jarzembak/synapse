@@ -14,7 +14,8 @@ from pydantic import BaseModel, Field
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import select, text
 
-from .. import library, paper as paper_store
+from .. import library, media_storage as media_storage_service
+from .. import paper as paper_store
 from ..config import settings
 from ..db import get_session
 from ..models import (
@@ -2031,7 +2032,7 @@ def approve_paper_plan(series_id: int, req: VersionedRequest):
 def run_paper_series(series_id: int):
     with get_session() as session:
         series = _series_row(session, series_id)
-        if series.status not in {"approved", "running", "complete"}:
+        if series.status not in {"approved", "running", "complete", "error"}:
             raise HTTPException(409, "approve the audience plan before production")
         if not session.exec(
             select(PaperSeriesPart).where(PaperSeriesPart.series_id == series.id)
@@ -2126,7 +2127,7 @@ def run_paper_part_step(series_id: int, part_id: int, step: str):
         raise HTTPException(422, "part step must be guide, script, or audio")
     with get_session() as session:
         series = _series_row(session, series_id)
-        if series.status not in {"approved", "running", "complete"}:
+        if series.status not in {"approved", "running", "complete", "error"}:
             raise HTTPException(409, "approve the current plan before generating a part")
         active = _active_track_job(session, series.id)
         if active:
@@ -2166,7 +2167,7 @@ def run_paper_part_step(series_id: int, part_id: int, step: str):
 def rebuild_paper_part_and_following(series_id: int, part_id: int):
     with get_session() as session:
         series = _series_row(session, series_id)
-        if series.status not in {"approved", "running", "complete"}:
+        if series.status not in {"approved", "running", "complete", "error"}:
             raise HTTPException(409, "approve the current plan before rebuilding")
         active = _active_track_job(session, series.id)
         if active:
@@ -2189,6 +2190,7 @@ def rebuild_paper_part_and_following(series_id: int, part_id: int):
 def delete_paper_series(series_id: int):
     paths: list[Path] = []
     with get_session() as session:
+        session.exec(text("BEGIN IMMEDIATE"))
         series = _series_row(session, series_id)
         active = session.exec(
             select(Job).where(
@@ -2198,17 +2200,29 @@ def delete_paper_series(series_id: int):
         ).first()
         if active:
             raise HTTPException(409, "cancel the active track job before deleting it")
+        try:
+            media_storage_service.assert_media_storage_idle(
+                session,
+                series.project_id,
+                action="deleting this paper series",
+            )
+        except media_storage_service.MediaStorageBusy as exc:
+            raise HTTPException(409, str(exc)) from exc
         artifacts = session.exec(
             select(Artifact).where(Artifact.paper_series_id == series.id)
         ).all()
         for artifact in artifacts:
-            library.delete_search_chunks(session, artifact.id)
-            session.exec(text("DELETE FROM artifact_fts WHERE artifact_id=:id").bindparams(id=artifact.id))
-            session.exec(text("DELETE FROM artifacttag WHERE artifact_id=:id").bindparams(id=artifact.id))
             paths.append(library.lib_path(artifact.path))
             if artifact.media_path and not artifact.media_path.startswith("media:"):
                 paths.append(library.lib_path(artifact.media_path))
-            session.delete(artifact)
+            try:
+                media_storage_service.delete_artifact_with_media(
+                    session,
+                    artifact,
+                    remote_reference_policy="block",
+                )
+            except media_storage_service.MediaStorageBusy as exc:
+                raise HTTPException(409, str(exc)) from exc
         parts = session.exec(
             select(PaperSeriesPart).where(PaperSeriesPart.series_id == series.id)
         ).all()

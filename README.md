@@ -97,6 +97,23 @@ COMPOSE_PATH_SEPARATOR=;
 On Linux and macOS, use
 `COMPOSE_FILE=docker-compose.yml:docker-compose.gpu.yml` instead.
 
+#### RTX 5060 Laptop GPU
+
+For an RTX 5060 Laptop GPU with 8 GB VRAM, use this capacity-balanced local
+starting profile:
+
+| Pipeline | Recommended local model |
+|---|---|
+| Media | `qwen3.5:4b-q4_K_M`; use `qwen3.5:9b-q4_K_M` for prose-heavy synthesis when slower system-memory offload is acceptable |
+| GitHub repositories | `qwen3.5:4b-q4_K_M` |
+| Research papers | `qwen3.5:4b-q4_K_M` for local-only papers; optionally use the 9B model for synthesis on cloud-enabled papers |
+| Semantic search | `nomic-embed-text`; `qwen3-embedding:0.6b` is a larger multilingual and code-retrieval alternative |
+| Transcription and podcast audio | `distil-large-v3` for English ASR and Piper for local TTS |
+
+Repository and local-only paper work reserve a 64K context window, so the 4B
+model leaves substantially more VRAM for context than the 9B model. See the
+[per-step assignments and tuning notes](docs/wiki/Models-and-Providers.md#rtx-5060-laptop-gpu-8-gb-profile).
+
 ### Create your first project
 
 1. Open **Projects**.

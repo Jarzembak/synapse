@@ -399,6 +399,17 @@ def _ollama(system: str, user: str, model: str, max_tokens: int,
         # timeout the repository evidence budgets were sized for.
         options["num_ctx"] = max(options["num_ctx"], REPOSITORY_NUM_CTX)
         timeout_seconds = max(timeout_seconds, REPOSITORY_TIMEOUT_SECONDS)
+    # Recheck immediately before the model call.  Assignment-time checks can be
+    # stale after another application consumes memory or a tag is updated to a
+    # different digest.  Remote Ollama hosts retain capability checking but
+    # report resource status as unavailable rather than using this host's RAM.
+    from .local_model_safety import ensure_model_safe
+
+    ensure_model_safe(
+        model,
+        role="completion",
+        requested_context=options["num_ctx"],
+    )
     if temperature is not None:
         options["temperature"] = temperature
     payload: dict = {

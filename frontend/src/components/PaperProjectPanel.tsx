@@ -15,6 +15,7 @@ import {
   typeLabel,
 } from "../api";
 import { useEventSource } from "../useEventSource";
+import MediaStoragePolicy from "./MediaStoragePolicy";
 
 interface PaperProjectPanelProps {
   project: Project;
@@ -299,6 +300,8 @@ export default function PaperProjectPanel({
           <div><dt>Extracted text</dt><dd>{(source.extracted_characters ?? source.character_count)?.toLocaleString() ?? "pending"} characters</dd></div>
         </dl>
       </section>
+
+      <MediaStoragePolicy projectId={project.id} />
 
       {loadError && <p className="error" role="alert">Paper details could not be loaded: {loadError}</p>}
       {actionError && <p className="error" role="alert">{actionError}</p>}

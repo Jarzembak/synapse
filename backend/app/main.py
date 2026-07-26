@@ -14,7 +14,7 @@ from .db import get_session, init_db  # noqa: E402
 from .models import Tag  # noqa: E402
 from .routers import (  # noqa: E402
     artifacts, backup, jobs, logs, projects, quickrefs, recovery, repositories,
-    search, system, papers,
+    search, system, papers, media_storage,
 )
 from .routers.settings import router as settings_router, tags_router  # noqa: E402
 from .media_auth_view import router as media_auth_view_router  # noqa: E402
@@ -38,6 +38,9 @@ async def lifespan(app: FastAPI):
     from .recovery import recover_interrupted_deletions
 
     recover_interrupted_deletions()
+    from .media_storage import recover_interrupted_media_storage
+
+    recover_interrupted_media_storage()
     from .tasks.cloud import enqueue_pending_privacy_purges
 
     enqueue_pending_privacy_purges()
@@ -58,6 +61,7 @@ app.include_router(papers.router)
 app.include_router(papers.series_router)
 app.include_router(jobs.router)
 app.include_router(artifacts.router)
+app.include_router(media_storage.router)
 app.include_router(quickrefs.router)
 app.include_router(search.router)
 app.include_router(recovery.router)

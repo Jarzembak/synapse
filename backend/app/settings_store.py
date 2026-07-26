@@ -137,6 +137,15 @@ def set_settings_if_no_repository_jobs(values: dict[str, object]) -> None:
     )
 
 
+def assert_no_shared_local_model_jobs() -> None:
+    """Check the repository/paper model lock without changing a setting."""
+    _set_settings_if_no_project_jobs(
+        {},
+        source_types=("github", "paper"),
+        scope_label="repository or paper",
+    )
+
+
 def set_settings_if_no_analysis_jobs(values: dict[str, object]) -> None:
     """Freeze shared generation settings during repository or paper runs."""
     _set_settings_if_no_project_jobs(
@@ -146,7 +155,9 @@ def set_settings_if_no_analysis_jobs(values: dict[str, object]) -> None:
     )
 
 
-def set_cloud_settings_if_no_pending_purge(values: dict[str, object]) -> None:
+def set_cloud_settings_if_no_pending_purge(
+    values: dict[str, object], *, before_commit=None
+) -> None:
     """Keep a privacy purge pinned to the remote where copies were uploaded."""
     from sqlmodel import select, text
 
@@ -172,6 +183,8 @@ def set_cloud_settings_if_no_pending_purge(values: dict[str, object]) -> None:
             row = session.get(Setting, key) or Setting(key=key)
             row.value = _dumps(key, value)
             session.add(row)
+        if before_commit is not None:
+            before_commit(session)
         session.commit()
 
 
