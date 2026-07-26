@@ -5,6 +5,7 @@ import json
 import uuid
 from pathlib import Path
 from unittest.mock import ANY
+from urllib.parse import parse_qs, urljoin, urlsplit
 
 import pytest
 from fastapi.testclient import TestClient
@@ -33,6 +34,25 @@ def _session_payload(project_id: int, source: str) -> dict:
         "created_at": "2099-01-01T00:00:00+00:00",
         "expires_at": "2099-01-01T00:30:00+00:00",
     }
+
+
+def test_viewer_url_resolves_websocket_path_from_the_origin_root():
+    project_id = 41
+    token = "viewer-capability"
+    browser_path = media_auth._viewer_url(project_id, token)
+    browser_url = urljoin("http://localhost:8080/", browser_path)
+    websocket_path = parse_qs(urlsplit(browser_url).query)["path"][0]
+    expected_path = (
+        f"/api/projects/{project_id}/auth/browser/view/{token}/websockify"
+    )
+
+    assert websocket_path == expected_path
+
+    resolved_websocket_url = urlsplit(urljoin(browser_url, websocket_path))
+    assert resolved_websocket_url.scheme == "http"
+    assert resolved_websocket_url.netloc == "localhost:8080"
+    assert resolved_websocket_url.path == expected_path
+    assert f"/view/{token}/api/projects/" not in resolved_websocket_url.path
 
 
 def test_start_browser_auth_creates_isolated_session_and_redacts_status(

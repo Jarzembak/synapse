@@ -14,7 +14,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import select, text
 
-from .. import library
+from .. import library, paper as paper_store
 from ..config import settings
 from ..db import get_session
 from ..models import (
@@ -50,7 +50,11 @@ def _json_load(value: str | None, fallback):
         parsed = json.loads(value or "")
     except (TypeError, json.JSONDecodeError):
         return fallback
-    return parsed if isinstance(parsed, type(fallback)) else fallback
+    return (
+        paper_store.normalize_paper_json(parsed)
+        if isinstance(parsed, type(fallback))
+        else fallback
+    )
 
 
 def _canonical_hash(value: object) -> str:

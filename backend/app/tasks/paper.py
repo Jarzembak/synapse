@@ -173,12 +173,16 @@ def _digest(value: Any) -> str:
 
 def _json(value: Any, default: Any) -> Any:
     if isinstance(value, type(default)):
-        return value
+        return paper_store.normalize_paper_json(value)
     try:
         parsed = json.loads(value or "")
     except (TypeError, json.JSONDecodeError):
         return default
-    return parsed if isinstance(parsed, type(default)) else default
+    return (
+        paper_store.normalize_paper_json(parsed)
+        if isinstance(parsed, type(default))
+        else default
+    )
 
 
 def _paper_analysis_settings() -> dict[str, int]:
@@ -1390,7 +1394,11 @@ def build_analysis_bundle(job_id: int, project_id: int) -> dict[str, Any]:
             "prefix_truncation": False,
         })
         source.coverage_report = json.dumps(
-            source_coverage, sort_keys=True, ensure_ascii=False)
+            paper_store.normalize_paper_json(source_coverage),
+            sort_keys=True,
+            ensure_ascii=False,
+            allow_nan=False,
+        )
         source.updated = utcnow()
         session.add(source)
         session.commit()

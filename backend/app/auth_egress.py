@@ -35,6 +35,7 @@ from urllib.parse import SplitResult, urlsplit, urlunsplit
 logger = logging.getLogger(__name__)
 
 ALLOWED_DESTINATION_PORTS = frozenset({80, 443})
+HEALTH_PATH = "/.well-known/synapse-auth-egress-health"
 _HOST_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 _HTTP_TOKEN = re.compile(rb"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
 _LOCAL_NAMES = frozenset(
@@ -588,6 +589,40 @@ async def _send_error(writer: asyncio.StreamWriter, status: int) -> None:
         pass
 
 
+async def _send_health(writer: asyncio.StreamWriter) -> None:
+    body = b"ok\n"
+    response = (
+        b"HTTP/1.1 200 OK\r\n"
+        b"Content-Type: text/plain; charset=utf-8\r\n"
+        + f"Content-Length: {len(body)}\r\n".encode("ascii")
+        + b"Cache-Control: no-store\r\n"
+        + b"Connection: close\r\n\r\n"
+        + body
+    )
+    try:
+        writer.write(response)
+        await asyncio.wait_for(writer.drain(), 2.0)
+    except (ConnectionError, OSError, TimeoutError):
+        pass
+
+
+def _peer_is_loopback(writer: asyncio.StreamWriter) -> bool:
+    peer = writer.get_extra_info("peername")
+    if not isinstance(peer, tuple) or not peer:
+        return False
+    try:
+        address = ipaddress.ip_address(str(peer[0]).split("%", 1)[0])
+    except ValueError:
+        return False
+    if address.is_loopback:
+        return True
+    return bool(
+        isinstance(address, ipaddress.IPv6Address)
+        and address.ipv4_mapped is not None
+        and address.ipv4_mapped.is_loopback
+    )
+
+
 def _peer_label(writer: asyncio.StreamWriter) -> str:
     peer = writer.get_extra_info("peername")
     if isinstance(peer, tuple) and peer:
@@ -637,6 +672,13 @@ class FilteringProxy:
                 raise ProxyRejection(503, "connection_limit") from exc
 
             request = await _read_request_head(client_reader, self.config)
+            if request.method == "GET" and request.target == HEALTH_PATH:
+                if not _peer_is_loopback(client_writer):
+                    raise ProxyRejection(403, "health_peer_denied")
+                await _send_health(client_writer)
+                committed = True
+                return
+
             destination = _request_destination(request)
             addresses = await self._resolver(
                 destination.host,

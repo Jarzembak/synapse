@@ -252,7 +252,7 @@ def _load_live_session(project_slug: str) -> dict[str, Any]:
 def _viewer_url(project_id: int, token: str) -> str:
     base = f"/api/projects/{project_id}/auth/browser/view/{token}/"
     websocket_path = (
-        f"api/projects/{project_id}/auth/browser/view/{token}/websockify"
+        f"/api/projects/{project_id}/auth/browser/view/{token}/websockify"
     )
     query = urlencode({
         "autoconnect": "1",
