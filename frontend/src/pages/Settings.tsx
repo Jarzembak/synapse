@@ -53,6 +53,15 @@ interface OllamaModelRecord {
     estimated_total_bytes: number;
     acknowledged: boolean;
   };
+  repository_assessment?: {
+    tier: OllamaResourceTier;
+    message: string;
+    requested_context_tokens: number;
+    estimated_weight_bytes: number;
+    estimated_context_bytes: number;
+    estimated_total_bytes: number;
+    acknowledged: boolean;
+  };
   restricted_assessment?: {
     tier: OllamaResourceTier;
     message: string;
@@ -468,6 +477,7 @@ export default function Settings() {
         method: "PUT",
         body: JSON.stringify({
           local_model: repositorySettings.local_model,
+          reduce_model: repositorySettings.reduce_model,
           limits: repositorySettings.limits,
           default_exclusions: repositorySettings.default_exclusions,
         }),
@@ -842,14 +852,62 @@ export default function Settings() {
             </p>
             {repositorySettings && (
               <>
-                <label className="stacked" htmlFor="repository-local-model">Ollama model
-                  <input id="repository-local-model" value={repositorySettings.local_model}
-                    placeholder="qwen3:8b"
-                    onChange={(event) => setRepositorySettings({
-                      ...repositorySettings, local_model: event.target.value,
-                    })} />
+                <label className="stacked">
+                  Evidence-map and final-writing model
+                  <ModelPicker
+                    value={repositorySettings.local_model}
+                    models={providerModels.ollama?.models ?? []}
+                    formatModel={(modelName) => {
+                      const model = ollamaInventory?.models.find(
+                        (candidate) => candidate.name === modelName,
+                      );
+                      if (!model) return modelName;
+                      const label = model.annotation.label
+                        ? `${model.annotation.label} — `
+                        : "";
+                      const assessment = model.repository_assessment ?? model.assessment;
+                      return `${label}${modelName} [${
+                        RESOURCE_TIER_LABELS[assessment.tier]
+                      }]`;
+                    }}
+                    onCommit={(model) => setRepositorySettings({
+                      ...repositorySettings, local_model: model,
+                    })}
+                    onDraft={(model) => setRepositorySettings({
+                      ...repositorySettings, local_model: model,
+                    })}
+                  />
                 </label>
-                <p className="hint">The model must already be available to the configured Ollama service.</p>
+                <label className="stacked">
+                  Hierarchical-reduction model
+                  <ModelPicker
+                    value={repositorySettings.reduce_model}
+                    models={providerModels.ollama?.models ?? []}
+                    formatModel={(modelName) => {
+                      const model = ollamaInventory?.models.find(
+                        (candidate) => candidate.name === modelName,
+                      );
+                      if (!model) return modelName;
+                      const label = model.annotation.label
+                        ? `${model.annotation.label} — `
+                        : "";
+                      const assessment = model.repository_assessment ?? model.assessment;
+                      return `${label}${modelName} [${
+                        RESOURCE_TIER_LABELS[assessment.tier]
+                      }]`;
+                    }}
+                    onCommit={(model) => setRepositorySettings({
+                      ...repositorySettings, reduce_model: model,
+                    })}
+                    onDraft={(model) => setRepositorySettings({
+                      ...repositorySettings, reduce_model: model,
+                    })}
+                  />
+                </label>
+                <p className="hint">
+                  Both models must already be available to the configured Ollama service.
+                  Changing only the reducer preserves compatible cached leaf maps.
+                </p>
               </>
             )}
           </div>
@@ -983,7 +1041,9 @@ export default function Settings() {
                 </label>
               )}
               <button type="button" onClick={() => void saveRepositorySettings()}
-                disabled={githubPending !== "" || !repositorySettings.local_model.trim()}>
+                disabled={githubPending !== ""
+                  || !repositorySettings.local_model.trim()
+                  || !repositorySettings.reduce_model.trim()}>
                 {githubPending === "settings" ? "Saving..." : "Save repository settings"}
               </button>
             </div>
@@ -1161,10 +1221,19 @@ export default function Settings() {
                     {model.restricted_assessment &&
                       model.restricted_assessment.tier !== model.assessment.tier && (
                         <p className="meta">
-                          Dense repository/paper analysis at{" "}
+                          Maximum dense local-only paper analysis at{" "}
                           {model.restricted_assessment.requested_context_tokens.toLocaleString()} tokens:{" "}
                           <strong>{RESOURCE_TIER_LABELS[model.restricted_assessment.tier]}</strong>
                           {" — "}{model.restricted_assessment.message}.
+                        </p>
+                      )}
+                    {model.repository_assessment
+                      && model.repository_assessment.tier !== model.assessment.tier && (
+                        <p className="meta">
+                          Typical dense repository analysis at{" "}
+                          {model.repository_assessment.requested_context_tokens.toLocaleString()} tokens:{" "}
+                          <strong>{RESOURCE_TIER_LABELS[model.repository_assessment.tier]}</strong>
+                          {" — "}{model.repository_assessment.message}.
                         </p>
                       )}
                     <dl className="model-facts">

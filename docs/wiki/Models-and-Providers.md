@@ -23,7 +23,11 @@ Synapse. You do not need accounts with every frontier provider. Reassign a
 step to a provider you have configured.
 
 Repository analysis is an exception: its privacy policy forces repository chat
-work through a local Ollama endpoint and podcast audio through Piper.
+work through a local Ollama endpoint and podcast audio through Piper. Evidence
+mapping/final writing and hierarchical reduction have separate local-model
+settings so a reduction-model change does not invalidate compatible leaf maps.
+On upgrade, an existing mapper selection is retained while the newly separate
+reducer starts with the Qwen 3.5 4B default.
 
 ## Local versus remote
 
@@ -124,7 +128,7 @@ with the actual memory and context requirements of each pipeline.
 |---|---|---|
 | Media cleanup and classification | `correct`, `trim_spans`, `tag`, `mindmap` | `qwen3.5:4b-q4_K_M` |
 | Media generation and Q&A | `summarize`, both deep dives, `merge`, `quickref`, `podcast_script`, `library_qa` | Start with `qwen3.5:4b-q4_K_M`; use `qwen3.5:9b-q4_K_M` when prose quality matters more than speed |
-| GitHub repository analysis | **Settings → Local repository analysis → Ollama model** | `qwen3.5:4b-q4_K_M` |
+| GitHub repository analysis | Both model fields under **Settings → Local repository analysis** | `qwen3.5:4b-q4_K_M` |
 | Local-only research papers | The same local repository model setting | `qwen3.5:4b-q4_K_M` |
 | Cloud-enabled papers using local chat models | `paper_map`, `paper_reduce`, `paper_plan`, `paper_memory` | `qwen3.5:4b-q4_K_M` |
 | Cloud-enabled paper prose | `paper_synthesis`, `paper_script` | `qwen3.5:9b-q4_K_M` when slower hybrid GPU/system-memory execution is acceptable; otherwise use the 4B model |
@@ -133,17 +137,19 @@ with the actual memory and context requirements of each pipeline.
 | Multilingual transcription | `asr` | faster-whisper `turbo` |
 | Local podcast speech | `tts` | Piper with a medium voice; this path uses the CPU |
 
-The repository model setting also controls every language-model call for a
-local-only paper. Privacy enforcement overrides the individual paper rows in
-the Model Matrix, forces Ollama, disables thinking, and requests a 65,536-token
-context. The 4B Q4 model is approximately 3.4 GB, leaving much more room for
-that context cache than the approximately 6.6 GB 9B Q4 model. The 9B model can
-still run through partial CPU offload when sufficient system memory is
-available, but it will be slower.
+The repository map/writing model setting also controls every language-model
+call for a local-only paper. Privacy enforcement overrides the individual
+paper rows in the Model Matrix, forces Ollama, and disables thinking. Synapse
+now sizes native Ollama context per call from the input, output budget, and
+safety margin instead of forcing every restricted call to 65,536 tokens. The
+4B Q4 model is approximately 3.4 GB, leaving much more room for dense context
+than the approximately 6.6 GB 9B Q4 model. The 9B model can still run through
+partial CPU offload when sufficient system memory is available, but it will be
+slower.
 
-The older `qwen3:8b` shipping default remains useful for ordinary 16K work, but
-its current Ollama artifact declares a 40,960-token context. For this hardware,
-prefer Qwen 3.5 4B for the 64K repository and local-only paper boundary.
+The older `qwen3:8b` general-purpose default remains useful for ordinary 16K
+work, but its current Ollama artifact declares a 40,960-token context. For this
+hardware, Qwen 3.5 4B is the repository default.
 
 Install the recommended chat models:
 
@@ -160,9 +166,9 @@ docker compose exec ollama ollama pull qwen3-embedding:0.6b
 
 Recommended advanced settings:
 
-- Keep **Context window** at 16,384 for ordinary media and cloud-enabled paper
-  calls. Restricted repository and local-only paper calls raise it to 65,536
-  automatically.
+- Keep **Context window** at 16,384 as the minimum for ordinary media,
+  repository, and paper calls. Synapse raises it only when a particular prompt
+  and output budget require more room, subject to the model's native limit.
 - Set **Thinking** to **off** for predictable latency and structured output.
   Restricted runs enforce this setting automatically.
 - Keep **JSON enforcement** enabled.

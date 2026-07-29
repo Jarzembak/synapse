@@ -292,7 +292,9 @@ def test_paper_cache_signatures_include_effective_local_generation_settings(
         local_only=True, json_format=True,
     )
     assert execution["provider_settings"] == {
-        "num_ctx": llm.REPOSITORY_NUM_CTX,
+        "configured_context_minimum": 8_192,
+        "context_policy": llm.LOCAL_CONTEXT_POLICY_VERSION,
+        "automatic_context_cap": llm.LOCAL_AUTOMATIC_CONTEXT_CAP,
         "think": False,
         "json_mode": True,
     }

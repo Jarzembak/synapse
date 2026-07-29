@@ -66,7 +66,8 @@ class Settings(BaseSettings):
     repository_max_compression_ratio: int = 200
     repository_max_map_chunks: int = 64
     repository_max_map_input_chars: int = 800_000
-    repository_local_model: str = "qwen3:8b"
+    repository_local_model: str = "qwen3.5:4b-q4_K_M"
+    repository_reduce_model: str = "qwen3.5:4b-q4_K_M"
     # Research-paper v1 intentionally fails at explicit, reviewable limits.
     # Inputs inside these limits are mapped completely; the paper pipeline
     # never converts an oversized source into a hidden prefix/sample.
@@ -122,13 +123,22 @@ FUNCTION_DEFAULTS: dict[str, dict[str, str]] = {
     "library_qa":     {"provider": "anthropic", "model": "claude-sonnet-5"},
     # Every repository job enforces the local boundary independently of these
     # defaults at the LLM call boundary, regardless of GitHub visibility.
-    "repository_map":          {"provider": "ollama", "model": "qwen3:8b"},
-    "repository_inventory":    {"provider": "ollama", "model": "qwen3:8b"},
-    "repository_overview":     {"provider": "ollama", "model": "qwen3:8b"},
-    "repository_usage":        {"provider": "ollama", "model": "qwen3:8b"},
-    "repository_architecture": {"provider": "ollama", "model": "qwen3:8b"},
-    "repository_expertise":    {"provider": "ollama", "model": "qwen3:8b"},
-    "repository_environment":  {"provider": "ollama", "model": "qwen3:8b"},
+    "repository_map":          {
+        "provider": "ollama", "model": "qwen3.5:4b-q4_K_M"},
+    "repository_reduce":       {
+        "provider": "ollama", "model": "qwen3.5:4b-q4_K_M"},
+    "repository_inventory":    {
+        "provider": "ollama", "model": "qwen3.5:4b-q4_K_M"},
+    "repository_overview":     {
+        "provider": "ollama", "model": "qwen3.5:4b-q4_K_M"},
+    "repository_usage":        {
+        "provider": "ollama", "model": "qwen3.5:4b-q4_K_M"},
+    "repository_architecture": {
+        "provider": "ollama", "model": "qwen3.5:4b-q4_K_M"},
+    "repository_expertise":    {
+        "provider": "ollama", "model": "qwen3.5:4b-q4_K_M"},
+    "repository_environment":  {
+        "provider": "ollama", "model": "qwen3.5:4b-q4_K_M"},
     # Paper leaf maps are deliberately local by default. Cloud-enabled paper
     # projects may use the configured synthesis models, while project_scope()
     # forces every function back to the validated local model when local_only

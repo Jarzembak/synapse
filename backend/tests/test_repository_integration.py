@@ -12,7 +12,8 @@ from app.db import get_session
 from app.main import app
 from app.models import (
     Artifact, Job, Project, QuickRef, QuickRefSource, RepositoryChunk,
-    RepositoryFile, RepositorySnapshot, RepositorySource, Tag,
+    RepositoryFile, RepositorySnapshot, RepositorySource,
+    RepositorySynthesisCache, Tag,
 )
 from app.tasks import audio, cloud, quickref
 from app.trusted_origin import (
@@ -191,6 +192,18 @@ def test_project_delete_removes_repository_rows_and_snapshot(client):
     history_dir = library.settings.library_dir / ".history" / "projects" / "repo-delete-lifecycle"
     history_dir.mkdir(parents=True, exist_ok=True)
     (history_dir / "summary.md.old.md").write_text("private history", encoding="utf-8")
+    with get_session() as session:
+        session.add(RepositorySynthesisCache(
+            snapshot_id=snapshot_id,
+            purpose="shared_analysis",
+            input_hash="delete-input",
+            config_hash="delete-config",
+            provider="ollama",
+            model="delete-model",
+            body='{"summary":"cached","evidence_ids":["EDELETE"]}',
+            evidence_ids='["EDELETE"]',
+        ))
+        session.commit()
 
     response = client.delete(f"/api/projects/{project_id}")
     assert response.status_code == 200
@@ -202,6 +215,10 @@ def test_project_delete_removes_repository_rows_and_snapshot(client):
         assert session.get(RepositorySnapshot, snapshot_id) is None
         assert not session.exec(
             select(RepositoryFile).where(RepositoryFile.snapshot_id == snapshot_id)
+        ).first()
+        assert not session.exec(
+            select(RepositorySynthesisCache).where(
+                RepositorySynthesisCache.snapshot_id == snapshot_id)
         ).first()
 
 

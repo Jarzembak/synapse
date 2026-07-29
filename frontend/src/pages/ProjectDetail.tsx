@@ -16,6 +16,9 @@ import {
 } from "../api";
 import { useEventSource } from "../useEventSource";
 import { StreamStatus, useStreamStatus } from "../useStreamStatus";
+import JobFailureDetails, {
+  hasJobFailureDetails,
+} from "../components/JobFailureDetails";
 import MediaAuthentication from "../components/MediaAuthentication";
 import MediaStoragePolicy from "../components/MediaStoragePolicy";
 import PaperProjectPanel from "../components/PaperProjectPanel";
@@ -856,7 +859,9 @@ export default function ProjectDetail() {
                         {step.job.progress && <> - progress: {step.job.progress}</>}
                         {step.job.updated && <> - updated {fmtTime(step.job.updated)}</>}
                       </p>
-                      {step.job.error && <pre className="error">{step.job.error}</pre>}
+                      {hasJobFailureDetails(step.job) && (
+                        <JobFailureDetails job={step.job} />
+                      )}
                     </>
                   ) : (
                     <p className="meta">not run yet</p>

@@ -197,6 +197,7 @@ export interface RepositoryPreflight {
   local_only: boolean;
   provider?: "ollama" | "local";
   local_model?: string;
+  reduce_model?: string;
   warnings?: string[];
 }
 
@@ -289,10 +290,62 @@ export interface GitHubCredentialStatus {
 
 export interface RepositorySettings {
   local_model: string;
+  reduce_model: string;
   limits: RepositoryLimits;
   default_exclusions: string[];
   host: "github.com";
   static_only: true;
+}
+
+export interface JobDiagnosticModel {
+  provider?: string | null;
+  model?: string | null;
+  digest?: string | null;
+}
+
+export interface JobDiagnosticContext {
+  requested?: number | null;
+  effective?: number | null;
+  native?: number | null;
+  timeout_seconds?: number | null;
+  max_output_tokens?: number | null;
+}
+
+export interface JobDiagnosticReduction {
+  purpose?: string | null;
+  level?: number | null;
+  batch?: number | null;
+  batch_count?: number | null;
+  items?: number | null;
+  input_chars?: number | null;
+  subdivision_depth?: number | null;
+  complete?: boolean | null;
+}
+
+export interface JobDiagnosticCache {
+  leaf_maps_reused?: number | null;
+  leaf_maps_new?: number | null;
+  legacy_leaf_maps_reused?: number | null;
+  reductions_reused?: number | null;
+  reductions_new?: number | null;
+}
+
+export interface JobDiagnosticAttempt {
+  outcome?: string | null;
+  level?: number | null;
+  batch?: number | null;
+  depth?: number | null;
+  detail?: string | null;
+}
+
+export interface JobDiagnostics {
+  stage?: string | null;
+  effective_model?: JobDiagnosticModel | null;
+  context?: JobDiagnosticContext | null;
+  reduction?: JobDiagnosticReduction | null;
+  cache?: JobDiagnosticCache | null;
+  attempts?: JobDiagnosticAttempt[] | null;
+  cause?: string | null;
 }
 
 export interface Job {
@@ -307,6 +360,7 @@ export interface Job {
   status: string;
   progress: string;
   error: string;
+  diagnostics?: JobDiagnostics | string | null;
   created?: string;
   updated?: string;
   started?: string | null;

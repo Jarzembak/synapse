@@ -292,9 +292,11 @@ LOCAL_CFG = {"num_ctx": 8192, "keep_alive": "10m", "think": "off",
 def bypass_ollama_safety(monkeypatch):
     """Keep transport-contract tests independent of installed model inventory."""
     from app import local_model_safety
+    from app import llm
 
     monkeypatch.setattr(
         local_model_safety, "ensure_model_safe", lambda *args, **kwargs: {})
+    monkeypatch.setattr(llm, "_known_native_context", lambda _model: 0)
 
 
 def test_strip_think():
@@ -355,12 +357,11 @@ def test_ollama_payload_mapping(monkeypatch, bypass_ollama_safety):
     assert payload["messages"][0] == {"role": "system", "content": "sys"}
 
 
-def test_ollama_restricted_floors_context_timeout_and_disables_think(
+def test_ollama_restricted_plans_context_timeout_and_disables_think(
     monkeypatch, bypass_ollama_safety,
 ):
-    """Repository (local-only) calls must not inherit the general-purpose
-    num_ctx/timeout tuned for transcript chunks, and never spend budget on
-    hidden reasoning."""
+    """Restricted calls retain the long timeout without reserving 65k for a
+    small prompt, and never spend their output budget on hidden reasoning."""
     from app import llm
 
     captured = {}
@@ -382,7 +383,7 @@ def test_ollama_restricted_floors_context_timeout_and_disables_think(
                         lambda group: {**LOCAL_CFG, "think": "on"})
     llm._ollama("sys", "user", "qwen3:8b", 512, None, restricted=True)
     payload = captured["payload"]
-    assert payload["options"]["num_ctx"] == llm.REPOSITORY_NUM_CTX
+    assert payload["options"]["num_ctx"] == LOCAL_CFG["num_ctx"]
     assert payload["think"] is False  # forced off even with think: "on"
     assert captured["timeout"].read == llm.REPOSITORY_TIMEOUT_SECONDS
 

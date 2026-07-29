@@ -181,6 +181,28 @@ def _job_model_functions(job: Job, project: Project | None) -> tuple[str, ...]:
         else STEP_FUNCTION
     )
     function = functions.get(job.task)
+    if (
+        project.source_type == "github"
+        and job.task in {
+            "repo_inventory",
+            "summarize",
+            "repo_usage",
+            "repo_architecture",
+            "repo_expertise",
+            "repo_environment",
+            "deepdive_claude",
+            "deepdive_gemini",
+        }
+        and function
+    ):
+        # These jobs map leaf evidence, run the independently configured
+        # reducer, and then write their final artifact. Deployment telemetry
+        # must report every local model the active job may have loaded.
+        return tuple(dict.fromkeys((
+            "repository_map",
+            "repository_reduce",
+            function,
+        )))
     return (function,) if function else ()
 
 
@@ -381,30 +403,47 @@ def _preflight() -> dict:
     except Exception as exc:
         add("embedding model", False, str(exc), required=False)
     # Repository analysis is hard-pinned to local Ollama; once a GitHub project
-    # exists the configured repository model becomes a required check.
+    # exists both independently configured repository models are required.
     if ollama_models is None:
         if repository_projects_exist:
             add("repository model", False, "Ollama is unreachable", required=True)
+            add(
+                "repository reducer model",
+                False,
+                "Ollama is unreachable",
+                required=True,
+            )
     else:
         try:
-            from ..repository import repository_local_model
-
-            repo_model = repository_local_model()
-            repo_model_installed = any(
-                name == repo_model or name.startswith(repo_model + ":")
-                for name in ollama_models)
-            add(
-                "repository model",
-                repo_model_installed,
-                f"{repo_model} "
-                f"{'is installed' if repo_model_installed else 'must be pulled before repository analysis'}",
-                required=repository_projects_exist,
+            from ..repository import (
+                repository_local_model,
+                repository_reduce_model,
             )
+
+            for check_name, configured_model in (
+                ("repository model", repository_local_model()),
+                ("repository reducer model", repository_reduce_model()),
+            ):
+                installed = any(
+                    name == configured_model
+                    or name.startswith(configured_model + ":")
+                    for name in ollama_models
+                )
+                add(
+                    check_name,
+                    installed,
+                    f"{configured_model} "
+                    f"{'is installed' if installed else 'must be pulled before repository analysis'}",
+                    required=repository_projects_exist,
+                )
         except Exception as exc:
             # fail as a diagnostic row, not a 500 — this endpoint exists to
             # report broken environments (bad model name, DB unavailable, …)
             add(
                 "repository model", False, str(exc),
+                required=repository_projects_exist)
+            add(
+                "repository reducer model", False, str(exc),
                 required=repository_projects_exist)
     add("Anthropic key", bool(settings.anthropic_api_key),
         "configured" if settings.anthropic_api_key else "not configured", required=False)

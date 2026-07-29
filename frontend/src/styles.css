@@ -150,6 +150,22 @@ button.primary, .button-link { background: var(--accent); color: var(--accent-co
 .jobstatus.partial { background: var(--panel2); color: var(--text); border: 1px solid var(--border2); }
 .jobstatus.new { background: var(--panel2); color: var(--muted); border: 1px solid var(--border2); }
 .job-error-row pre { max-height: 220px; overflow: auto; font-size: 0.72rem; margin: 0; }
+.job-diagnostics { max-width: 920px; padding: 0.25rem 0.15rem 0.4rem; }
+.job-diagnostics h4 { margin: 0 0 0.4rem; color: var(--danger); }
+.job-diagnostics-cause { margin: 0 0 0.7rem; color: var(--text); font-weight: 600; }
+.job-diagnostic-facts { display: grid; grid-template-columns: max-content minmax(0, 1fr);
+  gap: 0.3rem 0.8rem; margin: 0; font-size: 0.85rem; }
+.job-diagnostic-facts dt { color: var(--muted); font-weight: 700; }
+.job-diagnostic-facts dd { margin: 0; overflow-wrap: anywhere; }
+.job-diagnostic-attempts { margin-top: 0.75rem; font-size: 0.82rem; }
+.job-diagnostic-attempts h5 { margin: 0; font-size: 0.82rem; }
+.job-diagnostic-attempts ol { margin: 0.3rem 0 0; padding-left: 1.25rem; }
+.job-diagnostic-attempts li + li { margin-top: 0.2rem; }
+.job-diagnostics-skipped { margin: 0.75rem 0 0; padding: 0.45rem 0.6rem;
+  border-left: 3px solid var(--warning); background: var(--panel2); }
+.job-technical-error { margin-top: 0.75rem; font-size: 0.8rem; color: var(--muted); }
+.job-technical-error summary { cursor: pointer; }
+.job-technical-error pre { margin-top: 0.4rem; }
 .table-scroll { max-width: 100%; overflow-x: auto; }
 .table-scroll:focus-visible { outline-offset: -3px; }
 .muted { color: var(--muted); }

@@ -17,7 +17,8 @@ from .models import (
     Artifact, ArtifactTag, Job, PaperChunk, PaperChunkEmbedding,
     PaperMemoryRevision, PaperPartEvidence, PaperSeries, PaperSeriesPart,
     PaperSource, PaperSynthesisCache, Project, QuickRef, QuickRefSource,
-    RepositoryChunk, RepositoryFile, RepositorySnapshot, RepositorySource, Tag,
+    RepositoryChunk, RepositoryFile, RepositorySnapshot, RepositorySource,
+    RepositorySynthesisCache, Tag,
 )
 from .settings_store import get_setting
 
@@ -216,6 +217,9 @@ def health_report(session: Session) -> dict:
            if file.snapshot_id not in repository_snapshot_ids]
         + [f"chunk:{chunk.id}" for chunk in session.exec(select(RepositoryChunk)).all()
            if chunk.file_id not in repository_file_ids]
+        + [f"cache:{cache.id}" for cache in session.exec(
+            select(RepositorySynthesisCache)).all()
+           if cache.snapshot_id not in repository_snapshot_ids]
         + [f"snapshot-directory:{snapshot.id}" for snapshot in repository_snapshots
            if missing_snapshot_directory(snapshot)]
     )

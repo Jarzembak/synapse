@@ -274,6 +274,19 @@ def repository_local_model() -> str:
         str(get_setting("repository.local_model") or settings.repository_local_model))
 
 
+def repository_reduce_model() -> str:
+    """Return the independently configurable local reduction model.
+
+    Existing installations may deliberately keep their leaf-map model so
+    content-addressed summaries remain reusable while assigning a smaller,
+    faster model to hierarchical reduction.
+    """
+    configured = get_setting("repository.reduce_model")
+    default = getattr(
+        settings, "repository_reduce_model", settings.repository_local_model)
+    return validate_repository_local_model(str(configured or default))
+
+
 def repository_scan_config_hash(
     source: RepositorySource, *, settings_snapshot: dict | None = None,
 ) -> str:

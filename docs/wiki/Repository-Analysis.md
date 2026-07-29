@@ -42,7 +42,8 @@ written to a project, artifact, command, URL, or log.
 All repository analysis is local-only in this release, including public
 repositories:
 
-- chat steps use the configured repository Ollama model;
+- evidence mapping and final writing use the configured repository Ollama
+  model, while hierarchical reduction has an independent local-model setting;
 - podcast audio uses local Piper TTS;
 - repository artifacts are excluded from cloud sync;
 - repository excerpts cannot be sent to cloud or OpenAI-compatible providers;
@@ -53,9 +54,20 @@ Compose sets `OLLAMA_NO_CLOUD=1`. If you provide another loopback Ollama
 daemon, launch it with the same setting. Environment HTTP proxies are bypassed
 for repository model calls.
 
-Compose requests a 65,536-token context allocation for repository work, though
-models may cap it at their native window. Synapse uses bounded hierarchical
-prompts rather than sending an unbounded repository in one request.
+Synapse sizes each Ollama context request from the actual prompt, output
+budget, and a safety margin, then respects the model's advertised native
+window. Short map and reduction calls therefore do not reserve an unnecessary
+64K key-value cache. Synapse still uses bounded hierarchical prompts rather
+than sending an unbounded repository in one request.
+
+Successful reductions are cached by the pinned snapshot, exact input, prompt,
+model tag and installed digest, parameters, resolved context settings, and
+reduction-contract version. The cache is shared by the
+inventory, overview, usage, architecture, knowledge, environment, and
+deep-dive guides. If a reduction times out or produces unusable structured
+output, Synapse subdivides that batch instead of repeating the same request.
+The Jobs and project pages show the effective model, context decision,
+reduction location, cache reuse, and subdivision history.
 
 ## Scope and coverage
 
@@ -79,16 +91,23 @@ commit automatically.
 2. Use **Update analysis** to capture a new snapshot and rebuild affected
    artifacts.
 
-Unchanged evidence summaries can be reused by content and configuration hash.
+Unchanged evidence summaries and successful hierarchical reductions can be
+reused by content and configuration hash.
+
+When upgrading a pre-v5 installation, Synapse preserves the existing mapping-model
+selection and compatible leaf maps, while the new reduction role adopts Qwen
+3.5 4B unless you explicitly select another reducer. Pre-v5 leaf maps did not
+record an immutable Ollama digest, so their reuse is counted and labeled in
+coverage diagnostics. Newly generated maps are bound to the installed digest.
 
 ## Capacity and backups
 
-The default model download is approximately 5 GB before runtime and context
-cache overhead. CPU-only analysis of a large repository can take hours. Each
-retained commit may consume up to the configured 512 MiB compressed and 1 GiB
-expanded limits.
+The default repository model download is approximately 3.4 GB before runtime
+and context-cache overhead. CPU-only analysis of a large repository can still
+take hours. Each retained commit may consume up to the configured 512 MiB
+compressed and 1 GiB expanded limits.
 
-The System startup checks report whether the configured repository model is
+The System startup checks report whether both configured repository models are
 installed.
 
 Repository origin is sticky even after project deletion or a derived

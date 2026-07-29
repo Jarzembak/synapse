@@ -250,7 +250,7 @@ def test_blocked_model_requires_digest_and_explicit_acknowledgement(
     ).status_code == 409
 
 
-def test_repository_model_assignment_uses_restricted_context(
+def test_repository_model_assignments_use_adaptive_admission_context(
     client,
     monkeypatch,
 ):
@@ -264,13 +264,22 @@ def test_repository_model_assignment_uses_restricted_context(
     )
     response = client.put(
         "/api/repositories/settings",
-        json={"local_model": "repository-safe:latest"},
+        json={
+            "local_model": "repository-safe:latest",
+            "reduce_model": "repository-reducer-safe:latest",
+        },
     )
     assert response.status_code == 200
-    assert captured == [(
-        "repository-safe:latest",
-        {"role": "completion", "requested_context": 65_536},
-    )]
+    assert captured == [
+        (
+            "repository-safe:latest",
+            {"role": "completion", "requested_context": 32_768},
+        ),
+        (
+            "repository-reducer-safe:latest",
+            {"role": "completion", "requested_context": 32_768},
+        ),
+    ]
 
 
 def test_remote_ollama_does_not_use_local_resource_numbers(monkeypatch):

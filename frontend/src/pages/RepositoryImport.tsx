@@ -341,8 +341,12 @@ export default function RepositoryImport() {
               <li><b>Secrets:</b> likely credentials are excluded before model context is built and their values are never displayed.</li>
               <li>
                 <b>Local-only:</b> public and private repository excerpts stay on this machine.
-                Every model step is forced through Ollama
+                {" "}Mapping and final writing are forced through Ollama
                 {inspection.local_model ? <> using <code>{inspection.local_model}</code></> : null},
+                {" "}and hierarchical reductions use
+                {inspection.reduce_model
+                  ? <> <code>{inspection.reduce_model}</code></>
+                  : " the configured local reducer"},
                 regardless of the global model matrix, and derived artifacts are not cloud-synced.
               </li>
               <li><b>Git features:</b> submodules and Git LFS pointers are reported but their contents are not fetched.</li>

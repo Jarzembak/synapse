@@ -309,6 +309,7 @@ def effective_config(step: str, project: Project | None = None) -> dict:
             local_sig: dict = {}
             if provider == "ollama":
                 local_sig["num_ctx"] = local.get("num_ctx")
+                local_sig["context_policy"] = llm.LOCAL_CONTEXT_POLICY_VERSION
                 if not repository:
                     # repository steps force think off, so the knob cannot
                     # change their output
@@ -345,16 +346,28 @@ def effective_config(step: str, project: Project | None = None) -> dict:
     if step == "quickref":
         value["categories"] = get_setting("quickref.custom_categories") or []
     if repository:
+        from .tasks.repository import repository_analysis_signature
+
         with llm.project_scope(project.id, local_only=True):
             map_provider, map_model = llm.resolve_model("repository_map")
+            reduce_provider, reduce_model = llm.resolve_model("repository_reduce")
         value["repository"] = {
-            "local_model": get_setting("repository.local_model", "qwen3:8b"),
+            "local_model": get_setting(
+                "repository.local_model", llm.settings.repository_local_model),
+            "reduce_model_setting": get_setting(
+                "repository.reduce_model", llm.settings.repository_reduce_model),
             "static_only": True,
             "reasoning_effort": "none",
             "source": _source_signature(project),
-            "analysis": get_setting("repository.analysis") or {},
+            "analysis": repository_analysis_signature(),
             "map_model": {"provider": map_provider, "model": map_model,
                           "params": get_setting("params.repository_map") or {}},
+            "reduce_model": {
+                "provider": reduce_provider,
+                "model": reduce_model,
+                "params": get_setting("params.repository_reduce") or {},
+            },
+            "context_policy": llm.LOCAL_CONTEXT_POLICY_VERSION,
         }
     if paper and project:
         models = {}

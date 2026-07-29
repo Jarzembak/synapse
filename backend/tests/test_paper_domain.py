@@ -635,7 +635,7 @@ def test_schema_v3_job_scope_indexes_allow_independent_tracks():
         version = session.exec(text(
             "SELECT MAX(version) FROM schema_version"
         )).one()[0]
-        assert version == 4
+        assert version == 5
 
         # The application test database is shared with later integration
         # modules.  Do not leave intentionally-created active jobs behind and
@@ -698,7 +698,7 @@ def test_v2_upgrade_adds_paper_scope_without_rewriting_old_rows(tmp_path):
         ).scalar() == "done"
         assert connection.exec_driver_sql(
             "SELECT MAX(version) FROM schema_version"
-        ).scalar() == 4
+        ).scalar() == 5
 
 
 def test_v3_upgrade_adds_media_storage_without_rewriting_existing_rows(tmp_path):
@@ -751,7 +751,7 @@ def test_v3_upgrade_adds_media_storage_without_rewriting_existing_rows(tmp_path)
         _migrate(connection)
         assert connection.exec_driver_sql(
             "SELECT MAX(version) FROM schema_version"
-        ).scalar() == 4
+        ).scalar() == 5
         tables = {
             row[0] for row in connection.exec_driver_sql(
                 "SELECT name FROM sqlite_master WHERE type='table'"

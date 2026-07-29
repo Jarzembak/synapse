@@ -52,10 +52,12 @@ cp .env.example .env
 docker compose up --build
 ```
 
-In another terminal, install the default local chat model:
+In another terminal, install the default general-purpose and dense-analysis
+local models:
 
 ```bash
 docker compose exec ollama ollama pull qwen3:8b
+docker compose exec ollama ollama pull qwen3.5:4b-q4_K_M
 ```
 
 For optional semantic search, also install the default embedding model:
@@ -110,8 +112,9 @@ starting profile:
 | Semantic search | `nomic-embed-text`; `qwen3-embedding:0.6b` is a larger multilingual and code-retrieval alternative |
 | Transcription and podcast audio | `distil-large-v3` for English ASR and Piper for local TTS |
 
-Repository and local-only paper work reserve a 64K context window, so the 4B
-model leaves substantially more VRAM for context than the 9B model. See the
+Repository and local-only paper calls now reserve context according to each
+prompt and output budget instead of allocating 64K for every request. The 4B
+model leaves substantially more VRAM for dense calls than the 9B model. See the
 [per-step assignments and tuning notes](docs/wiki/Models-and-Providers.md#rtx-5060-laptop-gpu-8-gb-profile).
 
 ### Create your first project
