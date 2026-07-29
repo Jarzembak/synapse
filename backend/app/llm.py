@@ -16,9 +16,11 @@ mode) is tuned from Settings → Advanced → Local models (`advanced("local")`)
 """
 from __future__ import annotations
 
+import copy
 import ipaddress
 import json
 import logging
+import math
 import re
 import time
 from contextlib import contextmanager
@@ -34,15 +36,23 @@ log = logging.getLogger("synapse.llm")
 
 MAX_TOKENS = 16384
 LOCAL_PROVIDERS = {"ollama", "openai_compat"}
-# Repository evidence prompts are sized for the 64k window the bundled Ollama
-# service allocates (OLLAMA_CONTEXT_LENGTH), and repository generation may run
-# CPU-only; restricted calls must not inherit the smaller general-purpose
-# context window or timeout tuned for transcript chunks.
+# Automatic context growth is bounded so one small request cannot reserve a
+# model's entire advertised window. Explicitly configured larger minima remain
+# valid and native model metadata is always the final ceiling.
+LOCAL_CONTEXT_BUCKETS = (
+    2_048, 4_096, 8_192, 12_288, 16_384, 24_576, 32_768, 40_960, 49_152, 65_536,
+)
+LOCAL_AUTOMATIC_CONTEXT_CAP = 65_536
+# Backward-compatible name consumed by older safety/provenance code. It is now
+# an automatic planning cap, not an unconditional context floor.
 REPOSITORY_NUM_CTX = 65536
 REPOSITORY_TIMEOUT_SECONDS = 1800.0
+LOCAL_CONTEXT_POLICY_VERSION = 2
 _usage: ContextVar[tuple[int, int]] = ContextVar("llm_usage", default=(0, 0))
 _project_scope: ContextVar[tuple[int | None, bool | None]] = ContextVar(
     "llm_project_scope", default=(None, None))
+_last_diagnostics: ContextVar[dict | None] = ContextVar(
+    "llm_last_call_diagnostics", default=None)
 
 
 @contextmanager
@@ -129,13 +139,19 @@ def _repository_local_only() -> bool:
     return _project_local_only()
 
 
-def _local_model() -> str:
-    configured = get_setting("repository.local_model", "qwen3:8b") or "qwen3:8b"
+def _local_model(function: str) -> str:
+    if function == "repository_reduce":
+        key = "repository.reduce_model"
+        default = settings.repository_reduce_model
+    else:
+        key = "repository.local_model"
+        default = settings.repository_local_model
+    configured = get_setting(key, default) or default
     if isinstance(configured, dict):
         provider = configured.get("provider", "ollama")
         model = configured.get("model", "")
         if provider != "ollama":
-            raise RuntimeError("repository.local_model must use the ollama provider")
+            raise RuntimeError(f"{key} must use the ollama provider")
     else:
         model = str(configured or "")
     try:
@@ -190,7 +206,7 @@ def _enforce_local_provider(function: str, provider: str, model: str,
         return ("piper", "en_US-ryan-medium") if restricted else (provider, model)
     if restricted:
         require_local_ollama_endpoint()
-        return "ollama", _local_model()
+        return "ollama", _local_model(function)
     if provider == "ollama":
         return provider, model
     return provider, model
@@ -208,6 +224,49 @@ class LLMHTTPError(RuntimeError):
 class EmptyResponseError(RuntimeError):
     """Model returned no usable text — local models do this sporadically, so
     it is treated as transient and retried."""
+
+
+class ContextWindowError(RuntimeError):
+    """A prompt cannot fit without truncation in the model's usable window."""
+
+    def __init__(
+        self,
+        *,
+        required_context: int,
+        native_context: int,
+        effective_context: int,
+    ):
+        self.required_context = required_context
+        self.native_context = native_context
+        self.effective_context = effective_context
+        ceiling = native_context or effective_context
+        super().__init__(
+            f"the request needs approximately {required_context:,} context "
+            f"tokens, but the model can use only {ceiling:,}; subdivide the "
+            "input or lower the output-token budget"
+        )
+
+
+def last_call_diagnostics() -> dict:
+    """Return a detached snapshot of the most recent call in this context.
+
+    The context-local storage keeps concurrent worker tasks isolated. Existing
+    callers can ignore it; repository orchestration can persist the snapshot on
+    a Job after a failure or a successful adaptive batch.
+    """
+    return copy.deepcopy(_last_diagnostics.get() or {})
+
+
+def _update_diagnostics(**values) -> None:
+    current = copy.deepcopy(_last_diagnostics.get() or {})
+    current.update(values)
+    _last_diagnostics.set(current)
+
+
+def _append_attempt(value: dict) -> None:
+    current = copy.deepcopy(_last_diagnostics.get() or {})
+    current.setdefault("attempts", []).append(value)
+    _last_diagnostics.set(current)
 
 
 def _record_call(function: str, provider: str, model: str, started: float,
@@ -274,6 +333,7 @@ def complete(
     model: str | None = None,
     json_format: bool = False,
     local_only: bool = False,
+    transient_attempts: int | None = None,
 ) -> str:
     restricted = bool(local_only or _project_local_only())
     if provider is None or model is None:
@@ -290,13 +350,36 @@ def complete(
     output = ""
     error: Exception | None = None
     _usage.set((0, 0))
-    attempts = max(1, min(int(get_setting("llm.transient_attempts", 3) or 3), 5))
+    _last_diagnostics.set({
+        "function": function,
+        "provider": provider,
+        "model": model,
+        "requested_context": None,
+        "effective_context": None,
+        "native_context": None,
+        "timeout_seconds": None,
+        "max_output_tokens": max_tokens,
+        "attempts": [],
+    })
+    if transient_attempts is None:
+        attempts = max(
+            1,
+            min(int(get_setting("llm.transient_attempts", 3) or 3), 5),
+        )
+    else:
+        if isinstance(transient_attempts, bool):
+            raise ValueError("transient_attempts must be an integer from 1 to 5")
+        attempts = int(transient_attempts)
+        if not 1 <= attempts <= 5:
+            raise ValueError("transient_attempts must be an integer from 1 to 5")
     try:
         for attempt in range(attempts):
+            attempt_started = time.monotonic()
             try:
                 if provider == "ollama":
                     output = _ollama(system, user, model, max_tokens, temperature,
-                                     json_format, restricted=restricted)
+                                     json_format, restricted=restricted,
+                                     function=function)
                 elif provider == "openai_compat":
                     output = _openai_compat(system, user, model, max_tokens,
                                             temperature, json_format)
@@ -313,12 +396,38 @@ def complete(
                 if not output.strip():
                     raise EmptyResponseError(
                         f"{provider}/{model} returned an empty response")
+                _append_attempt({
+                    "attempt": attempt + 1,
+                    "status": "ok",
+                    "duration_seconds": round(
+                        time.monotonic() - attempt_started, 3),
+                    "transient": False,
+                    "retry_delay_seconds": 0,
+                })
                 return output
             except Exception as exc:
                 error = exc
-                if attempt + 1 >= attempts or not _is_transient(exc):
+                transient = _is_transient(exc)
+                will_retry = attempt + 1 < attempts and transient
+                delay = min(8, 2 ** attempt) if will_retry else 0
+                status = getattr(exc, "status_code", None)
+                if status is None:
+                    status = getattr(
+                        getattr(exc, "response", None), "status_code", None)
+                _append_attempt({
+                    "attempt": attempt + 1,
+                    "status": "error",
+                    "duration_seconds": round(
+                        time.monotonic() - attempt_started, 3),
+                    "transient": transient,
+                    "error_type": exc.__class__.__name__,
+                    "error": str(exc)[:1000],
+                    "error_message": str(exc)[:1000],
+                    "status_code": status,
+                    "retry_delay_seconds": delay,
+                })
+                if not will_retry:
                     raise
-                delay = min(8, 2 ** attempt)
                 log.warning("transient %s failure (%s); retrying in %ss",
                             function, exc, delay)
                 time.sleep(delay)
@@ -384,32 +493,165 @@ def _local_cfg() -> dict:
     return advanced("local")
 
 
+def _estimate_input_tokens(system: str, user: str) -> int:
+    """Conservatively estimate mixed prose/code tokens without a tokenizer."""
+    text = system + "\n" + user
+    if not text:
+        return 1
+    # Code, JSON, CJK text, emoji, and identifiers tokenize more densely than
+    # ordinary English prose. UTF-8 bytes protect non-ASCII inputs while the
+    # 2.5-byte bound leaves headroom for punctuation-heavy source code.
+    byte_estimate = math.ceil(len(text.encode("utf-8")) / 2.5)
+    word_estimate = math.ceil(len(re.findall(r"\S+", text)) * 1.35)
+    return max(1, byte_estimate, word_estimate)
+
+
+def _bucket_context(target: int, *, configured_minimum: int) -> int:
+    cap = max(configured_minimum, LOCAL_AUTOMATIC_CONTEXT_CAP)
+    for bucket in LOCAL_CONTEXT_BUCKETS:
+        if bucket >= target and bucket >= configured_minimum:
+            return min(bucket, cap)
+    return cap
+
+
+def _known_native_context(model: str) -> int:
+    """Read installed-model metadata before resource assessment when possible."""
+    try:
+        from .local_model_safety import inspect_model
+
+        inventory, row = inspect_model(model)
+        if inventory.get("ok") and row:
+            return max(0, int(row.get("native_context_tokens") or 0))
+    except Exception:
+        log.debug("could not inspect %s native context", model, exc_info=True)
+    return 0
+
+
+def _ollama_context_plan(
+    system: str,
+    user: str,
+    max_tokens: int,
+    *,
+    configured_context: int,
+    native_context: int = 0,
+) -> dict[str, int]:
+    input_tokens = _estimate_input_tokens(system, user)
+    output_tokens = max(1, int(max_tokens))
+    safety_margin = max(
+        512,
+        math.ceil(input_tokens * 0.10),
+        math.ceil(output_tokens * 0.10),
+    )
+    required = input_tokens + output_tokens + safety_margin
+    configured_minimum = max(1_024, int(configured_context))
+    requested = _bucket_context(
+        max(configured_minimum, required),
+        configured_minimum=configured_minimum,
+    )
+    effective = min(requested, native_context) if native_context else requested
+    return {
+        "estimated_input_tokens": input_tokens,
+        "safety_margin_tokens": safety_margin,
+        "required_context": required,
+        "requested_context": requested,
+        "effective_context": effective,
+        "native_context": native_context,
+    }
+
+
 def _ollama(system: str, user: str, model: str, max_tokens: int,
             temperature: float | None, json_format: bool = False,
-            *, restricted: bool = False) -> str:
+            *, restricted: bool = False, function: str = "") -> str:
     """Ollama's native /api/chat. The native API (unlike its OpenAI-compat
     shim) accepts per-call options — critically num_ctx, without which long
     transcript chunks are silently truncated at the server's default window."""
     cfg = _local_cfg()
-    options: dict = {"num_predict": max_tokens, "num_ctx": int(cfg["num_ctx"])}
+    native_context = _known_native_context(model)
+    context_plan = _ollama_context_plan(
+        system,
+        user,
+        max_tokens,
+        configured_context=int(cfg["num_ctx"]),
+        native_context=native_context,
+    )
+    options: dict = {
+        "num_predict": max_tokens,
+        "num_ctx": context_plan["effective_context"],
+    }
     timeout_seconds = float(cfg["timeout_seconds"])
     if restricted:
-        # Repository (local-only) calls: per-request options override the
-        # server's OLLAMA_CONTEXT_LENGTH, so floor them at the window and
-        # timeout the repository evidence budgets were sized for.
-        options["num_ctx"] = max(options["num_ctx"], REPOSITORY_NUM_CTX)
+        # Repository and local-only paper work may run with CPU offload. Keep
+        # their established long-request timeout, while sizing memory from the
+        # actual prompt and output budget instead of reserving 65k every time.
         timeout_seconds = max(timeout_seconds, REPOSITORY_TIMEOUT_SECONDS)
+    _update_diagnostics(
+        function=function,
+        requested_context=context_plan["requested_context"],
+        effective_context=context_plan["effective_context"],
+        native_context=context_plan["native_context"] or None,
+        timeout_seconds=timeout_seconds,
+        max_output_tokens=max_tokens,
+        estimated_input_tokens=context_plan["estimated_input_tokens"],
+        safety_margin_tokens=context_plan["safety_margin_tokens"],
+        required_context=context_plan["required_context"],
+    )
+    if context_plan["required_context"] > context_plan["effective_context"]:
+        # When native metadata already proves the request cannot fit, expose a
+        # subdividable context error before resource admission can mask it.
+        raise ContextWindowError(
+            required_context=context_plan["required_context"],
+            native_context=context_plan["native_context"],
+            effective_context=context_plan["effective_context"],
+        )
     # Recheck immediately before the model call.  Assignment-time checks can be
     # stale after another application consumes memory or a tag is updated to a
     # different digest.  Remote Ollama hosts retain capability checking but
     # report resource status as unavailable rather than using this host's RAM.
     from .local_model_safety import ensure_model_safe
 
-    ensure_model_safe(
+    safety = ensure_model_safe(
         model,
         role="completion",
         requested_context=options["num_ctx"],
     )
+    _update_diagnostics(model_digest=safety.get("digest") or None)
+    discovered_native = max(
+        native_context,
+        int(safety.get("native_context_tokens") or 0),
+    )
+    if discovered_native and discovered_native != native_context:
+        context_plan = _ollama_context_plan(
+            system,
+            user,
+            max_tokens,
+            configured_context=int(cfg["num_ctx"]),
+            native_context=discovered_native,
+        )
+        options["num_ctx"] = context_plan["effective_context"]
+        if options["num_ctx"] != context_plan["requested_context"]:
+            # Reassess resources against the context Ollama will actually use.
+            ensure_model_safe(
+                model,
+                role="completion",
+                requested_context=options["num_ctx"],
+            )
+    _update_diagnostics(
+        function=function,
+        requested_context=context_plan["requested_context"],
+        effective_context=context_plan["effective_context"],
+        native_context=context_plan["native_context"] or None,
+        timeout_seconds=timeout_seconds,
+        max_output_tokens=max_tokens,
+        estimated_input_tokens=context_plan["estimated_input_tokens"],
+        safety_margin_tokens=context_plan["safety_margin_tokens"],
+        required_context=context_plan["required_context"],
+    )
+    if context_plan["required_context"] > context_plan["effective_context"]:
+        raise ContextWindowError(
+            required_context=context_plan["required_context"],
+            native_context=context_plan["native_context"],
+            effective_context=context_plan["effective_context"],
+        )
     if temperature is not None:
         options["temperature"] = temperature
     payload: dict = {

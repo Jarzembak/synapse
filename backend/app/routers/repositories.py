@@ -22,6 +22,7 @@ from ..repository import (
     preflight_repository,
     read_repository_file,
     repository_local_model,
+    repository_reduce_model,
     repository_scan_settings,
     repository_source_for_project,
     set_github_token,
@@ -67,6 +68,7 @@ def clear_credentials():
 
 class RepositorySettingsRequest(BaseModel):
     local_model: str | None = None
+    reduce_model: str | None = None
     limits: dict[str, int] | None = None
     default_exclusions: list[str] | None = None
 
@@ -76,6 +78,7 @@ def _settings_payload() -> dict:
     exclusions = scan.pop("default_exclusions")
     return {
         "local_model": repository_local_model(),
+        "reduce_model": repository_reduce_model(),
         "limits": scan,
         "default_exclusions": exclusions,
         "host": "github.com",
@@ -92,7 +95,11 @@ def get_repository_settings():
 def save_repository_settings(req: RepositorySettingsRequest):
     current = repository_scan_settings()
     updates: dict[str, object] = {}
-    if req.local_model is not None:
+    requested_models = {
+        "repository.local_model": req.local_model,
+        "repository.reduce_model": req.reduce_model,
+    }
+    if any(value is not None for value in requested_models.values()):
         # Report the established shared-model lock before a potentially slow
         # inventory probe. The actual write repeats this transactional check
         # so a job that starts during validation still prevents the update.
@@ -100,22 +107,29 @@ def save_repository_settings(req: RepositorySettingsRequest):
             assert_no_shared_local_model_jobs()
         except RuntimeError as exc:
             raise HTTPException(409, str(exc)) from exc
-        try:
-            model = validate_repository_local_model(req.local_model)
-        except ValueError as exc:
-            raise HTTPException(422, str(exc)) from exc
-        try:
-            ensure_model_safe(
-                model,
-                role="completion",
-                requested_context=65_536,
-            )
-        except LocalModelSafetyError as exc:
-            raise HTTPException(
-                status_code=exc.http_status,
-                detail=exc.detail(),
-            ) from exc
-        updates["repository.local_model"] = model
+        for key, value in requested_models.items():
+            if value is None:
+                continue
+            try:
+                model = validate_repository_local_model(value)
+            except ValueError as exc:
+                raise HTTPException(422, str(exc)) from exc
+            try:
+                # Repository calls now size context to the actual prompt. A
+                # 32K admission check covers the largest normal synthesis
+                # request without forcing every short map/reduction call to
+                # reserve a 64K key-value cache.
+                ensure_model_safe(
+                    model,
+                    role="completion",
+                    requested_context=32_768,
+                )
+            except LocalModelSafetyError as exc:
+                raise HTTPException(
+                    status_code=exc.http_status,
+                    detail=exc.detail(),
+                ) from exc
+            updates[key] = model
 
     ranges = {
         "max_download_bytes": (1024 * 1024, 5 * 1024 * 1024 * 1024),
@@ -214,6 +228,7 @@ def preflight(req: RepositoryPreflightRequest):
         "limits": data["limits"],
         "provider": "ollama",
         "local_model": repository_local_model(),
+        "reduce_model": repository_reduce_model(),
         "static_only": True,
         "warnings": data["warnings"],
     }

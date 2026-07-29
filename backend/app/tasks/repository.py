@@ -15,11 +15,15 @@ from collections import defaultdict, deque
 from pathlib import PurePosixPath
 from urllib.parse import quote
 
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import select
 
 from .. import library, llm, repository as repository_store
+from ..config import advanced
 from ..db import get_session
-from ..models import Artifact, Job, RepositoryChunk
+from ..models import (
+    Artifact, Job, RepositoryChunk, RepositorySynthesisCache, utcnow,
+)
 from ..settings_store import get_setting
 from .celery_app import celery
 from .common import artifact_body, auto_tag, get_project, pipeline_task, progress
@@ -39,6 +43,24 @@ _IMPORTANT_NAMES = {
 _MANIFEST_SUFFIXES = {
     ".lock", ".toml", ".yaml", ".yml", ".json", ".ini", ".cfg",
 }
+_SHARED_REDUCTION_PURPOSE = "shared_analysis"
+_MAP_CONTRACT_VERSION = 2
+_REDUCTION_CONTRACT_VERSION = 2
+_MAX_REDUCTION_LEVELS = 12
+_MAX_DIAGNOSTIC_ATTEMPTS = 48
+_MAX_DIAGNOSTIC_DETAIL_CHARS = 500
+
+
+class RepositoryMapContractError(RuntimeError):
+    """The model returned no usable structure for an admitted evidence chunk."""
+
+
+class RepositoryReductionContractError(RuntimeError):
+    """The model returned parseable data that violates the lossless contract."""
+
+
+class RepositoryReductionOversizedError(RuntimeError):
+    """The model returned data too large to make hierarchical progress."""
 
 
 def _digest(value) -> str:
@@ -76,11 +98,24 @@ def _analysis_limits() -> dict[str, int]:
         "max_new_map_calls": bounded(
             "max_new_map_calls", int(scan["max_map_chunks"]), 1, 10000),
         "reduce_batch_chars": bounded(
-            "reduce_batch_chars", 48_000, 8_000, 200_000),
+            "reduce_batch_chars", 20_000, 4_000, 200_000),
+        "reduce_max_tokens": bounded(
+            "reduce_max_tokens", 1_600, 400, 4_000),
+        "reduce_max_subdivision_depth": bounded(
+            "reduce_max_subdivision_depth", 6, 1, 10),
         # Conservative room for a substantial model response within common
         # local-model context windows. Every final synthesis source shares it.
         "final_input_chars": bounded(
             "final_input_chars", 64_000, 32_000, 160_000),
+    }
+
+
+def repository_analysis_signature() -> dict:
+    """Return resolved, output-affecting repository analysis contracts."""
+    return {
+        "limits": _analysis_limits(),
+        "map_contract_version": _MAP_CONTRACT_VERSION,
+        "reduction_contract_version": _REDUCTION_CONTRACT_VERSION,
     }
 
 
@@ -194,15 +229,55 @@ def _snapshot_bundle(project_id: int) -> tuple[object, object, list[dict]]:
     return source, snapshot, list(evidence)
 
 
-def _map_config_hash(provider: str, model: str) -> str:
-    return _digest({
-        "schema": 1,
+def _installed_model_digest(provider: str, model: str) -> str:
+    """Return immutable local-model identity for cache signatures."""
+    if provider != "ollama":
+        return "not_applicable"
+    try:
+        from ..local_model_safety import inspect_model
+
+        inventory, row = inspect_model(model)
+        if inventory.get("ok") and row:
+            return str(row.get("digest") or "digest_unavailable")
+    except Exception:
+        log.debug("could not inspect repository model digest", exc_info=True)
+    # Successful work produced while inventory is temporarily unavailable gets
+    # a distinct key and is safely recomputed once the digest becomes known.
+    return "digest_unavailable"
+
+
+def _map_config_hash(
+    provider: str,
+    model: str,
+    *,
+    contract_version: int = _MAP_CONTRACT_VERSION,
+    model_digest: str | None = None,
+) -> str:
+    value = {
+        "schema": contract_version,
         "provider": provider,
         "model": model,
         "params": get_setting("params.repository_map") or {},
         "reasoning_effort": "none",
         "map_prompt": _digest(get_prompt("repository_map")),
-    })
+    }
+    if contract_version >= 2:
+        local = advanced("local") if provider == "ollama" else {}
+        value.update({
+            "model_digest": (
+                model_digest
+                if model_digest is not None
+                else _installed_model_digest(provider, model)
+            ),
+            "local": ({
+                "configured_context_minimum": local.get("num_ctx"),
+                "context_policy": llm.LOCAL_CONTEXT_POLICY_VERSION,
+                "automatic_context_cap": llm.LOCAL_AUTOMATIC_CONTEXT_CAP,
+                "json_mode": local.get("json_mode"),
+                "think": False,
+            } if provider == "ollama" else {}),
+        })
+    return _digest(value)
 
 
 def _map_item_config_hash(base_hash: str, item: dict) -> str:
@@ -224,6 +299,9 @@ def _clean_strings(value) -> list[str]:
 
 
 def _sanitize_map(raw: dict, item: dict) -> dict:
+    if not isinstance(raw, dict):
+        raise RepositoryMapContractError(
+            "repository evidence mapping did not return a JSON object")
     evidence_id = str(item["evidence_id"])
     facts = []
     for fact in raw.get("facts", []) if isinstance(raw, dict) else []:
@@ -235,7 +313,7 @@ def _sanitize_map(raw: dict, item: dict) -> dict:
         if claim:
             facts.append({"claim": claim, "kind": kind,
                           "evidence_ids": [evidence_id]})
-    return {
+    sanitized = {
         "evidence_id": evidence_id,
         "evidence_ids": [evidence_id],
         "path": str(item.get("path") or ""),
@@ -249,6 +327,10 @@ def _sanitize_map(raw: dict, item: dict) -> dict:
         "commands": _clean_strings(raw.get("commands")),
         "knowledge": _clean_strings(raw.get("knowledge")),
     }
+    if not sanitized["summary"]:
+        raise RepositoryMapContractError(
+            f"repository evidence mapping returned no usable summary for {evidence_id}")
+    return sanitized
 
 
 def _chunk_for_item(session, item: dict) -> RepositoryChunk | None:
@@ -260,31 +342,164 @@ def _chunk_for_item(session, item: dict) -> RepositoryChunk | None:
     )).first()
 
 
+def _update_job_diagnostics(job_id: int, patch: dict) -> None:
+    """Merge bounded structured diagnostics without disturbing job state."""
+    if job_id <= 0:
+        return
+    try:
+        with get_session() as session:
+            job = session.get(Job, job_id)
+            if job is None:
+                return
+            diagnostics = _json(job.diagnostics, {})
+            for key, value in patch.items():
+                if key == "attempts":
+                    previous = diagnostics.get("attempts")
+                    attempts = list(previous) if isinstance(previous, list) else []
+                    for item in value if isinstance(value, list) else []:
+                        if not isinstance(item, dict):
+                            continue
+                        bounded = dict(item)
+                        bounded["detail"] = str(
+                            bounded.get("detail") or ""
+                        )[:_MAX_DIAGNOSTIC_DETAIL_CHARS]
+                        attempts.append(bounded)
+                    diagnostics["attempts"] = attempts[-_MAX_DIAGNOSTIC_ATTEMPTS:]
+                elif isinstance(value, dict):
+                    previous = diagnostics.get(key)
+                    merged = dict(previous) if isinstance(previous, dict) else {}
+                    merged.update(value)
+                    diagnostics[key] = merged
+                else:
+                    diagnostics[key] = value
+            job.diagnostics = json.dumps(
+                diagnostics, sort_keys=True, separators=(",", ":"), default=str)
+            job.updated = utcnow()
+            session.add(job)
+            session.commit()
+    except Exception:
+        # Diagnostics must never replace the actual pipeline outcome.
+        log.warning(
+            "could not persist repository diagnostics for job %s",
+            job_id,
+            exc_info=True,
+        )
+
+
+def _last_llm_diagnostics() -> dict:
+    getter = getattr(llm, "last_call_diagnostics", None)
+    if not callable(getter):
+        return {}
+    try:
+        value = getter()
+        return value if isinstance(value, dict) else {}
+    except Exception:
+        return {}
+
+
+def _diagnostic_context(call: dict, max_tokens: int) -> dict:
+    return {
+        "requested": call.get("requested_context"),
+        "effective": call.get("effective_context"),
+        "native": call.get("native_context"),
+        "timeout_seconds": call.get("timeout_seconds"),
+        "max_output_tokens": int(
+            call.get("max_output_tokens") or max_tokens),
+    }
+
+
+def _call_detail(exc: Exception | None, call: dict) -> str:
+    details: list[str] = []
+    if exc is not None:
+        details.append(f"{exc.__class__.__name__}: {exc}")
+    attempts = call.get("attempts")
+    if isinstance(attempts, list) and attempts:
+        latest = attempts[-1]
+        if isinstance(latest, dict):
+            status = latest.get("status")
+            error_type = latest.get("error_type")
+            message = latest.get("error_message") or latest.get("error")
+            status_code = latest.get("status_code")
+            rendered = ", ".join(
+                str(value) for value in (
+                    status,
+                    error_type,
+                    f"HTTP {status_code}" if status_code else None,
+                    message,
+                ) if value
+            )
+            if rendered:
+                details.append(rendered)
+    return " | ".join(details)[:_MAX_DIAGNOSTIC_DETAIL_CHARS]
+
+
 def _map_evidence(job_id: int, project_id: int, evidence: list[dict]) -> tuple[list[dict], dict]:
     selected, coverage = _select_evidence(evidence)
     provider, model = llm.resolve_model("repository_map")
-    config_hash = _map_config_hash(provider, model)
+    model_digest = _installed_model_digest(provider, model)
+    config_hash = _map_config_hash(
+        provider, model, model_digest=model_digest)
+    legacy_config_hash = _map_config_hash(
+        provider, model, contract_version=1)
     summaries: list[dict] = []
     new_calls = 0
     reused = 0
+    legacy_reused = 0
     skipped_uncached = 0
     max_new_calls = coverage["limits"]["max_new_map_calls"]
+    _update_job_diagnostics(job_id, {
+        "stage": "repository_map",
+        "effective_model": {
+            "provider": provider,
+            "model": model,
+            "digest": model_digest,
+        },
+        "cache": {
+            "leaf_maps_reused": 0,
+            "leaf_maps_new": 0,
+            "legacy_leaf_maps_reused": 0,
+        },
+        "cause": "",
+    })
 
     for position, item in enumerate(selected, 1):
         item_config_hash = _map_item_config_hash(config_hash, item)
+        legacy_item_config_hash = _map_item_config_hash(
+            legacy_config_hash, item)
         with get_session() as session:
             chunk = _chunk_for_item(session, item)
             if chunk is None:
                 raise RuntimeError(
                     f"repository evidence {item.get('evidence_id')!r} has no indexed chunk")
             cached = repository_store.get_chunk_summary(chunk, item_config_hash)
+            cached_is_legacy = False
+            if cached is None and legacy_item_config_hash != item_config_hash:
+                cached = repository_store.get_chunk_summary(
+                    chunk, legacy_item_config_hash)
+                cached_is_legacy = cached is not None
             chunk_body = str(chunk.body)
         if cached:
             data = cached.get("data") if isinstance(cached, dict) else None
             if isinstance(data, dict):
-                summaries.append(_sanitize_map(data, item))
-                reused += 1
-                continue
+                try:
+                    cached_summary = _sanitize_map(data, item)
+                except RepositoryMapContractError:
+                    log.warning(
+                        "ignoring invalid cached repository map for evidence %s",
+                        item.get("evidence_id"),
+                    )
+                else:
+                    summaries.append(cached_summary)
+                    reused += 1
+                    legacy_reused += int(cached_is_legacy)
+                    _update_job_diagnostics(job_id, {
+                        "cache": {
+                            "leaf_maps_reused": reused,
+                            "leaf_maps_new": new_calls,
+                            "legacy_leaf_maps_reused": legacy_reused,
+                        },
+                    })
+                    continue
         if new_calls >= max_new_calls:
             skipped_uncached += 1
             continue
@@ -298,15 +513,32 @@ def _map_evidence(job_id: int, project_id: int, evidence: list[dict]) -> tuple[l
             "kind": item.get("kind"),
             "symbol": item.get("symbol"),
         }
-        raw = llm.complete_json(
-            "repository_map", get_prompt("repository_map"),
-            "EVIDENCE METADATA:\n" + json.dumps(header, sort_keys=True)
-             + "\n\nBEGIN UNTRUSTED REPOSITORY EXCERPT\n"
-            + chunk_body
-            + "\nEND UNTRUSTED REPOSITORY EXCERPT",
-            max_tokens=1_600, provider=provider, model=model,
-        )
-        summary = _sanitize_map(raw if isinstance(raw, dict) else {}, item)
+        try:
+            raw = llm.complete_json(
+                "repository_map", get_prompt("repository_map"),
+                "EVIDENCE METADATA:\n" + json.dumps(header, sort_keys=True)
+                 + "\n\nBEGIN UNTRUSTED REPOSITORY EXCERPT\n"
+                + chunk_body
+                + "\nEND UNTRUSTED REPOSITORY EXCERPT",
+                max_tokens=1_600, provider=provider, model=model,
+            )
+            summary = _sanitize_map(raw, item)
+        except Exception as exc:
+            call = _last_llm_diagnostics()
+            outcome, _can_subdivide = _reduction_failure(exc, call)
+            detail = _call_detail(exc, call)
+            _update_job_diagnostics(job_id, {
+                "context": _diagnostic_context(call, 1_600),
+                "attempts": [{
+                    "outcome": f"map_{outcome}",
+                    "detail": (
+                        f"evidence {position}/{len(selected)} "
+                        f"({item.get('evidence_id')}): {detail}"
+                    ),
+                }],
+                "cause": detail or outcome,
+            })
+            raise
         with get_session() as session:
             chunk = _chunk_for_item(session, item)
             if chunk is None:
@@ -317,19 +549,48 @@ def _map_evidence(job_id: int, project_id: int, evidence: list[dict]) -> tuple[l
             session.commit()
         summaries.append(summary)
         new_calls += 1
+        call = _last_llm_diagnostics()
+        _update_job_diagnostics(job_id, {
+            "context": _diagnostic_context(call, 1_600),
+            "cache": {
+                "leaf_maps_reused": reused,
+                "leaf_maps_new": new_calls,
+                "legacy_leaf_maps_reused": legacy_reused,
+            },
+            "cause": "",
+        })
 
     if skipped_uncached:
         coverage["warnings"].append(
             f"{skipped_uncached} selected chunks had no reusable summary and exceeded the "
             "new-model-call budget; increase repository.analysis.max_new_map_calls and rerun.")
+    if legacy_reused:
+        coverage["warnings"].append(
+            f"{legacy_reused} compatible pre-v5 leaf maps were reused. Their "
+            "historical Ollama digest was not recorded; newly generated maps "
+            "are pinned to the current model digest.")
     coverage["analyzed_evidence_chunks"] = len(summaries)
     coverage["skipped_evidence_chunks"] = len(evidence) - len(summaries)
     coverage["analyzed_files"] = len({item.get("path") for item in summaries})
     coverage["cache"] = {
         "reused_chunk_summaries": reused,
         "new_chunk_summaries": new_calls,
+        "legacy_chunk_summaries": legacy_reused,
         "summary_config_hash": config_hash,
     }
+    coverage.setdefault("model_execution", {})["map"] = {
+        "provider": provider,
+        "model": model,
+        "digest": model_digest,
+        "contract_version": _MAP_CONTRACT_VERSION,
+    }
+    _update_job_diagnostics(job_id, {
+        "cache": {
+            "leaf_maps_reused": reused,
+            "leaf_maps_new": new_calls,
+            "legacy_leaf_maps_reused": legacy_reused,
+        },
+    })
     if not summaries and evidence:
         raise RuntimeError("repository analysis budget produced no evidence summaries")
     return summaries, coverage
@@ -359,36 +620,54 @@ def _nested_evidence_ids(value) -> set[str]:
     return found
 
 
-def _sanitize_reduce(raw: dict, allowed: set[str], fallback: list[dict]) -> dict:
+def _sanitize_reduce(raw: dict, allowed: set[str]) -> dict:
+    if not isinstance(raw, dict):
+        raise RepositoryReductionContractError(
+            "repository reduction did not return a JSON object")
+    if not allowed:
+        raise RepositoryReductionContractError(
+            "repository reduction received no evidence identifiers")
+    explicit_ids = _nested_evidence_ids(raw)
+    unknown = sorted(explicit_ids - allowed)
+    if unknown:
+        raise RepositoryReductionContractError(
+            "repository reduction invented evidence identifiers: "
+            + ", ".join(unknown[:10]))
+    missing = sorted(allowed - explicit_ids)
+    if missing:
+        raise RepositoryReductionContractError(
+            "repository reduction omitted supporting evidence identifiers: "
+            + ", ".join(missing[:10]))
+
     facts = []
-    used: set[str] = set()
-    for fact in raw.get("facts", []) if isinstance(raw, dict) else []:
+    for fact in raw.get("facts", []):
         if not isinstance(fact, dict):
             continue
         ids = [str(value) for value in fact.get("evidence_ids", [])
                if str(value) in allowed]
         claim = str(fact.get("claim") or "").strip()
         if claim and ids:
-            used.update(ids)
             facts.append({"claim": claim,
                           "kind": str(fact.get("kind") or "observation"),
                           "evidence_ids": sorted(set(ids))})
-    root_ids = [str(value) for value in raw.get("evidence_ids", [])
-                if str(value) in allowed] if isinstance(raw, dict) else []
-    used.update(root_ids)
-    # A reducer may omit ids from its JSON despite following the facts.  Keep
-    # the valid union as a lossless citation backstop, never an invented id.
-    if not used:
-        used.update(value for item in fallback for value in _evidence_ids(item))
-    return {
+    sanitized = {
         "summary": str(raw.get("summary") or "").strip(),
         "facts": facts,
         "symbols": _clean_strings(raw.get("symbols")),
         "dependencies": _clean_strings(raw.get("dependencies")),
         "commands": _clean_strings(raw.get("commands")),
         "knowledge": _clean_strings(raw.get("knowledge")),
-        "evidence_ids": sorted(used),
+        # The root ledger is always the exact input union. Facts retain their
+        # narrower direct support, while later reductions cannot silently lose
+        # evidence that was summarized at an earlier level.
+        "evidence_ids": sorted(allowed),
     }
+    if not (sanitized["summary"] or sanitized["facts"]
+            or sanitized["symbols"] or sanitized["dependencies"]
+            or sanitized["commands"] or sanitized["knowledge"]):
+        raise RepositoryReductionContractError(
+            "repository reduction returned no structured content")
+    return sanitized
 
 
 def _batches(items: list[dict], max_chars: int) -> list[list[dict]]:
@@ -407,37 +686,411 @@ def _batches(items: list[dict], max_chars: int) -> list[list[dict]]:
     return batches
 
 
-def _hierarchical_context(job_id: int, summaries: list[dict], purpose: str) -> list[dict]:
+def _reduction_config_hash(
+    provider: str,
+    model: str,
+    max_tokens: int,
+    *,
+    model_digest: str | None = None,
+) -> str:
+    local = advanced("local") if provider == "ollama" else {}
+    return _digest({
+        "schema": _REDUCTION_CONTRACT_VERSION,
+        "provider": provider,
+        "model": model,
+        "model_digest": (
+            model_digest
+            if model_digest is not None
+            else _installed_model_digest(provider, model)
+        ),
+        "params": get_setting("params.repository_reduce") or {},
+        "max_tokens": max_tokens,
+        "prompt": _digest(get_prompt("repository_reduce")),
+        "local": ({
+            "configured_context_minimum": local.get("num_ctx"),
+            "context_policy": llm.LOCAL_CONTEXT_POLICY_VERSION,
+            "automatic_context_cap": llm.LOCAL_AUTOMATIC_CONTEXT_CAP,
+            "json_mode": local.get("json_mode"),
+            "think": False,
+        } if provider == "ollama" else {}),
+    })
+
+
+def _cached_reduction(snapshot_id: int, batch: list[dict],
+                      config_hash: str) -> dict | None:
+    input_hash = _digest(batch)
+    allowed = {value for item in batch for value in _evidence_ids(item)}
+    with get_session() as session:
+        cached = session.exec(select(RepositorySynthesisCache).where(
+            RepositorySynthesisCache.snapshot_id == snapshot_id,
+            RepositorySynthesisCache.purpose == _SHARED_REDUCTION_PURPOSE,
+            RepositorySynthesisCache.input_hash == input_hash,
+            RepositorySynthesisCache.config_hash == config_hash,
+        )).first()
+        if cached is None:
+            return None
+        raw = _json(cached.body, {})
+    try:
+        result = _sanitize_reduce(raw, allowed)
+    except RepositoryReductionContractError:
+        log.warning(
+            "ignoring invalid repository reduction cache row %s",
+            getattr(cached, "id", None),
+        )
+        return None
+    if set(_json(cached.evidence_ids, [])) != allowed:
+        log.warning(
+            "ignoring repository reduction cache row %s with a mismatched evidence ledger",
+            getattr(cached, "id", None),
+        )
+        return None
+    return result
+
+
+def _store_reduction(snapshot_id: int, batch: list[dict], config_hash: str,
+                     provider: str, model: str, result: dict) -> None:
+    input_hash = _digest(batch)
+    with get_session() as session:
+        cached = session.exec(select(RepositorySynthesisCache).where(
+            RepositorySynthesisCache.snapshot_id == snapshot_id,
+            RepositorySynthesisCache.purpose == _SHARED_REDUCTION_PURPOSE,
+            RepositorySynthesisCache.input_hash == input_hash,
+            RepositorySynthesisCache.config_hash == config_hash,
+        )).first()
+        if cached is None:
+            cached = RepositorySynthesisCache(
+                snapshot_id=snapshot_id,
+                purpose=_SHARED_REDUCTION_PURPOSE,
+                input_hash=input_hash,
+                config_hash=config_hash,
+            )
+        cached.provider = provider
+        cached.model = model
+        cached.body = json.dumps(
+            result, sort_keys=True, separators=(",", ":"), default=str)
+        cached.evidence_ids = json.dumps(
+            _evidence_ids(result), sort_keys=True, separators=(",", ":"))
+        cached.updated = utcnow()
+        session.add(cached)
+        try:
+            session.commit()
+        except IntegrityError:
+            # An unusual duplicate delivery or recovery race may have written
+            # the same content-addressed key after our initial lookup. The
+            # winner is equivalent for cache identity, so verify it exists
+            # rather than failing after the model work already succeeded.
+            session.rollback()
+            winner = session.exec(select(RepositorySynthesisCache.id).where(
+                RepositorySynthesisCache.snapshot_id == snapshot_id,
+                RepositorySynthesisCache.purpose == _SHARED_REDUCTION_PURPOSE,
+                RepositorySynthesisCache.input_hash == input_hash,
+                RepositorySynthesisCache.config_hash == config_hash,
+            )).first()
+            if winner is None:
+                raise
+
+
+def _split_batch(batch: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Split near the serialized midpoint without slicing any evidence item."""
+    if len(batch) < 2:
+        return batch, []
+    sizes = [len(json.dumps(item, sort_keys=True, default=str)) for item in batch]
+    midpoint = sum(sizes) / 2
+    running = 0
+    split_at = 1
+    for index, size in enumerate(sizes[:-1], 1):
+        running += size
+        split_at = index
+        if running >= midpoint:
+            break
+    return batch[:split_at], batch[split_at:]
+
+
+def _reduction_failure(exc: Exception, call: dict) -> tuple[str, bool]:
+    if isinstance(exc, (RepositoryMapContractError,
+                        RepositoryReductionContractError)):
+        return "invalid_structure", True
+    if isinstance(exc, RepositoryReductionOversizedError):
+        return "oversized", True
+    if exc.__class__.__name__ == "ContextWindowError":
+        return "context_window", True
+    text_parts = [exc.__class__.__name__, str(exc)]
+    for attempt in call.get("attempts", []) if isinstance(call, dict) else []:
+        if isinstance(attempt, dict):
+            text_parts.extend(str(attempt.get(key) or "") for key in (
+                "status", "error_type", "error_message", "error"))
+    text = " ".join(text_parts).casefold()
+    if "timeout" in text or "timed out" in text:
+        return "timeout", True
+    if isinstance(exc, json.JSONDecodeError) or (
+            isinstance(exc, ValueError) and "json" in text):
+        return "invalid_json", True
+    return "provider_error", False
+
+
+def _reduce_batch_adaptive(
+    job_id: int,
+    snapshot_id: int,
+    purpose: str,
+    level: int,
+    batch_number: int,
+    batch_count: int,
+    batch: list[dict],
+    *,
+    depth: int,
+    limit: int,
+    max_tokens: int,
+    max_depth: int,
+    provider: str,
+    model: str,
+    config_hash: str,
+    cache_state: dict,
+) -> list[dict]:
+    input_json = json.dumps(
+        batch, sort_keys=True, separators=(",", ":"), default=str)
+    reduction_state = {
+        "purpose": purpose,
+        "level": level,
+        "batch": batch_number,
+        "batch_count": batch_count,
+        "items": len(batch),
+        "input_chars": len(input_json),
+        "subdivision_depth": depth,
+    }
+    _update_job_diagnostics(job_id, {
+        "reduction": reduction_state,
+        "cache": cache_state,
+    })
+    depth_suffix = f", subdivision {depth}" if depth else ""
+    progress(
+        job_id,
+        f"reducing {purpose} evidence level {level}, "
+        f"batch {batch_number}/{batch_count}{depth_suffix}",
+    )
+
+    cached = _cached_reduction(snapshot_id, batch, config_hash)
+    if cached is not None:
+        cache_state["reductions_reused"] += 1
+        _update_job_diagnostics(job_id, {
+            "reduction": reduction_state,
+            "cache": cache_state,
+        })
+        return [cached]
+
+    call: dict = {}
+    try:
+        raw = llm.complete_json(
+            "repository_reduce",
+            get_prompt("repository_reduce"),
+            input_json,
+            max_tokens=max_tokens,
+            provider=provider,
+            model=model,
+            retries=0,
+            transient_attempts=1,
+        )
+        call = _last_llm_diagnostics()
+        allowed = {
+            value for item in batch for value in _evidence_ids(item)
+        }
+        result = _sanitize_reduce(raw, allowed)
+        output_chars = len(json.dumps(
+            result, sort_keys=True, separators=(",", ":"), default=str))
+        if output_chars > limit or (
+                len(batch) > 1 and output_chars >= len(input_json)):
+            raise RepositoryReductionOversizedError(
+                f"repository reduction produced {output_chars} characters "
+                f"from {len(input_json)} input characters")
+    except Exception as exc:
+        call = _last_llm_diagnostics() or call
+        outcome, can_subdivide = _reduction_failure(exc, call)
+        detail = _call_detail(exc, call)
+        _update_job_diagnostics(job_id, {
+            "context": _diagnostic_context(call, max_tokens),
+            "reduction": reduction_state,
+            "attempts": [{
+                "outcome": outcome,
+                "level": level,
+                "batch": batch_number,
+                "depth": depth,
+                "detail": detail,
+            }],
+            "cause": detail or outcome,
+        })
+        if can_subdivide and len(batch) > 1 and depth < max_depth:
+            left, right = _split_batch(batch)
+            _update_job_diagnostics(job_id, {
+                "attempts": [{
+                    "outcome": "subdivided",
+                    "level": level,
+                    "batch": batch_number,
+                    "depth": depth,
+                    "detail": (
+                        f"split {len(batch)} items into "
+                        f"{len(left)} and {len(right)} after {outcome}"
+                    ),
+                }],
+            })
+            return (
+                _reduce_batch_adaptive(
+                    job_id, snapshot_id, purpose, level, batch_number,
+                    batch_count, left, depth=depth + 1, limit=limit,
+                    max_tokens=max_tokens, max_depth=max_depth,
+                    provider=provider, model=model, config_hash=config_hash,
+                    cache_state=cache_state,
+                )
+                + _reduce_batch_adaptive(
+                    job_id, snapshot_id, purpose, level, batch_number,
+                    batch_count, right, depth=depth + 1, limit=limit,
+                    max_tokens=max_tokens, max_depth=max_depth,
+                    provider=provider, model=model, config_hash=config_hash,
+                    cache_state=cache_state,
+                )
+            )
+        evidence = sorted({
+            value for item in batch for value in _evidence_ids(item)
+        })
+        boundary = (
+            "single evidence summary cannot be reduced"
+            if len(batch) == 1
+            else f"subdivision depth {max_depth} was exhausted"
+        )
+        raise RuntimeError(
+            f"repository reduction failed at level {level}, batch "
+            f"{batch_number}/{batch_count}: {boundary}; outcome={outcome}; "
+            f"evidence_ids={','.join(evidence[:10])}; "
+            f"detail={detail or str(exc)[:_MAX_DIAGNOSTIC_DETAIL_CHARS]}"
+        ) from exc
+
+    _store_reduction(
+        snapshot_id, batch, config_hash, provider, model, result)
+    cache_state["reductions_new"] += 1
+    _update_job_diagnostics(job_id, {
+        "context": _diagnostic_context(call, max_tokens),
+        "reduction": reduction_state,
+        "cache": cache_state,
+        "attempts": [{
+            "outcome": "ok",
+            "level": level,
+            "batch": batch_number,
+            "depth": depth,
+            "detail": _call_detail(None, call),
+        }],
+        "cause": "",
+    })
+    return [result]
+
+
+def _hierarchical_context(
+    job_id: int,
+    snapshot_id: int,
+    summaries: list[dict],
+    purpose: str,
+    coverage: dict,
+) -> list[dict]:
     limits = _analysis_limits()
     limit = min(limits["reduce_batch_chars"], limits["final_input_chars"] // 2)
     items = list(summaries)
     level = 0
-    provider, model = llm.resolve_model("repository_map")
-    while len(_batches(items, limit)) > 1:
-        level += 1
+    provider, model = llm.resolve_model("repository_reduce")
+    model_digest = _installed_model_digest(provider, model)
+    max_tokens = limits["reduce_max_tokens"]
+    max_depth = limits["reduce_max_subdivision_depth"]
+    config_hash = _reduction_config_hash(
+        provider, model, max_tokens, model_digest=model_digest)
+    coverage.setdefault("model_execution", {})["reduction"] = {
+        "provider": provider,
+        "model": model,
+        "digest": model_digest,
+        "contract_version": _REDUCTION_CONTRACT_VERSION,
+    }
+    map_cache = coverage.get("cache") if isinstance(coverage, dict) else {}
+    map_cache = map_cache if isinstance(map_cache, dict) else {}
+    cache_state = {
+        "leaf_maps_reused": int(
+            map_cache.get("reused_chunk_summaries") or 0),
+        "leaf_maps_new": int(map_cache.get("new_chunk_summaries") or 0),
+        "retained_leaf_maps": len(items),
+        "reductions_reused": 0,
+        "reductions_new": 0,
+    }
+    _update_job_diagnostics(job_id, {
+        "stage": "repository_reduce",
+        "effective_model": {
+            "provider": provider,
+            "model": model,
+            "digest": model_digest,
+        },
+        "context": {
+            "requested": None,
+            "effective": None,
+            "native": None,
+            "timeout_seconds": None,
+            "max_output_tokens": max_tokens,
+        },
+        "reduction": {
+            "purpose": purpose,
+            "level": 0,
+            "batch": 0,
+            "batch_count": 0,
+            "items": len(items),
+            "input_chars": len(json.dumps(items, default=str)),
+            "subdivision_depth": 0,
+        },
+        "cache": cache_state,
+        "attempts": [],
+        "cause": "",
+    })
+    while True:
         batches = _batches(items, limit)
+        has_oversized_item = any(
+            len(json.dumps(item, sort_keys=True, default=str)) > limit
+            for item in items
+        )
+        if len(batches) <= 1 and not has_oversized_item:
+            break
+        level += 1
+        if level > _MAX_REDUCTION_LEVELS:
+            cause = (
+                "repository reduction exceeded the bounded hierarchical "
+                f"depth of {_MAX_REDUCTION_LEVELS} levels"
+            )
+            _update_job_diagnostics(job_id, {"cause": cause})
+            raise RuntimeError(cause)
         reduced: list[dict] = []
         for index, batch in enumerate(batches, 1):
-            progress(job_id, f"reducing {purpose} evidence level {level}, "
-                    f"batch {index}/{len(batches)}")
-            allowed = {value for item in batch for value in _evidence_ids(item)}
-            raw = llm.complete_json(
-                "repository_map",
-                get_prompt("repository_reduce")
-                + f"\nThis reduction is preparing evidence for: {purpose}.",
-                json.dumps(batch, sort_keys=True), max_tokens=3500,
-                provider=provider, model=model,
+            reduced.extend(_reduce_batch_adaptive(
+                job_id, snapshot_id, purpose, level, index, len(batches), batch,
+                depth=0, limit=limit, max_tokens=max_tokens,
+                max_depth=max_depth, provider=provider, model=model,
+                config_hash=config_hash, cache_state=cache_state,
+            ))
+        old_size = len(json.dumps(
+            items, sort_keys=True, separators=(",", ":"), default=str))
+        new_size = len(json.dumps(
+            reduced, sort_keys=True, separators=(",", ":"), default=str))
+        if len(reduced) >= len(items) and new_size >= old_size:
+            cause = (
+                "repository reduction made no bounded progress; "
+                "a single structured summary may exceed the reduction budget"
             )
-            reduced.append(_sanitize_reduce(
-                raw if isinstance(raw, dict) else {}, allowed, batch))
-        if len(reduced) >= len(items):
-            # This can occur only when every item individually exceeds the
-            # configured batch size. Map outputs are generation-bounded, but
-            # fail transparently rather than truncating one.
-            raise RuntimeError(
-                "structured evidence summaries exceed the reduction batch budget; "
-                "increase repository.analysis.reduce_batch_chars")
+            _update_job_diagnostics(job_id, {"cause": cause})
+            raise RuntimeError(cause)
         items = reduced
+    _update_job_diagnostics(job_id, {
+        "reduction": {
+            "purpose": purpose,
+            "level": level,
+            "batch": 0,
+            "batch_count": 0,
+            "items": len(items),
+            "input_chars": len(json.dumps(items, default=str)),
+            "subdivision_depth": 0,
+            "complete": True,
+        },
+        "cache": cache_state,
+        "cause": "",
+    })
     return items
 
 
@@ -466,7 +1119,8 @@ def _repository_context(job_id: int, project_id: int, purpose: str) -> tuple[obj
             "exclusion_reason_counts", {}),
         "omitted_link_count": int(scan_coverage.get("omitted_link_count") or 0),
     })
-    context = _hierarchical_context(job_id, summaries, purpose)
+    context = _hierarchical_context(
+        job_id, snapshot.id, summaries, purpose, coverage)
     return source, snapshot, context, coverage
 
 
@@ -665,7 +1319,24 @@ def generate_repository_document(job_id: int, project_id: int, *,
         coverage.setdefault("warnings", []).append(facts_warning)
     metadata = _source_metadata(source, snapshot, coverage)
     provider, model = llm.resolve_model(function)
+    writer_digest = _installed_model_digest(provider, model)
     progress(job_id, f"writing {title_prefix.lower()} ({model})")
+    _update_job_diagnostics(job_id, {
+        "stage": "repository_final_write",
+        "effective_model": {
+            "provider": provider,
+            "model": model,
+            "digest": writer_digest,
+        },
+        "context": {
+            "requested": None,
+            "effective": None,
+            "native": None,
+            "timeout_seconds": None,
+            "max_output_tokens": 4_000,
+        },
+        "cause": "",
+    })
     base = (
         "PINNED REPOSITORY METADATA:\n"
         + json.dumps(metadata, sort_keys=True, default=str)
@@ -688,21 +1359,58 @@ def generate_repository_document(job_id: int, project_id: int, *,
         raise RuntimeError(
             "repository synthesis context exceeds the configured final input budget; "
             "reduce repository.analysis.reduce_batch_chars")
-    body = llm.complete(
-        function, get_prompt(prompt_name), user,
-        provider=provider, model=model, max_tokens=4_000).strip()
+    try:
+        body = llm.complete(
+            function, get_prompt(prompt_name), user,
+            provider=provider, model=model, max_tokens=4_000).strip()
+    except Exception as exc:
+        call = _last_llm_diagnostics()
+        outcome, _can_subdivide = _reduction_failure(exc, call)
+        detail = _call_detail(exc, call)
+        _update_job_diagnostics(job_id, {
+            "context": _diagnostic_context(call, 4_000),
+            "attempts": [{
+                "outcome": f"final_{outcome}",
+                "detail": detail,
+            }],
+            "cause": detail or outcome,
+        })
+        raise
+    call = _last_llm_diagnostics()
+    coverage.setdefault("model_execution", {})["final_write"] = {
+        "provider": provider,
+        "model": model,
+        "digest": call.get("model_digest") or writer_digest,
+    }
+    _update_job_diagnostics(job_id, {
+        "context": _diagnostic_context(call, 4_000),
+        "cause": "",
+    })
     _source, _snapshot, evidence = _snapshot_bundle(project_id)
     supplied_ids = {
         value for item in context for value in _evidence_ids(item)
     } | _nested_evidence_ids(facts)
     evidence = [item for item in evidence
                 if str(item.get("evidence_id")) in supplied_ids]
-    body, citation_count = _validate_and_render_citations(
-        body, source, snapshot, evidence, require=True)
+    _update_job_diagnostics(job_id, {
+        "stage": "repository_citation_validation",
+    })
+    try:
+        body, citation_count = _validate_and_render_citations(
+            body, source, snapshot, evidence, require=True)
+    except Exception as exc:
+        _update_job_diagnostics(job_id, {
+            "cause": f"{exc.__class__.__name__}: {exc}",
+        })
+        raise
     if additional_warnings:
         coverage.setdefault("warnings", []).extend(additional_warnings)
     if artifact_type == "repo_inventory":
         body = _coverage_notice(coverage) + "\n\n" + body
+    _update_job_diagnostics(job_id, {
+        "stage": "repository_artifact_write",
+        "cause": "",
+    })
     return _write_repository_artifact(
         project_id, artifact_type, title_prefix, body, provider=provider,
         model=model, source=source, snapshot=snapshot, coverage=coverage,

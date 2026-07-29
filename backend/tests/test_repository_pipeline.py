@@ -4,13 +4,15 @@ import json
 from types import SimpleNamespace
 
 import pytest
+from sqlalchemy import create_engine
+from sqlmodel import SQLModel, Session, select
 
 from app import llm, repository as repository_store
 from app.context import current_job_id
-from app.db import get_session
+from app.db import _migrate, get_session
 from app.models import (
     Job, Project, RepositoryChunk, RepositoryFile, RepositorySnapshot,
-    RepositorySource,
+    RepositorySource, RepositorySynthesisCache, Setting,
 )
 from app.settings_store import get_setting, set_setting
 from app.tasks import repository as repository_tasks
@@ -237,3 +239,558 @@ def test_synthesis_coverage_uses_snapshot_denominator_and_prioritizes_scan_cover
     assert "3/10 snapshot files" in notice
     assert "6 files produced evidence" in notice
     assert "4 were excluded" in notice
+
+
+def _reduction_limits() -> dict[str, int]:
+    return {
+        "max_chunks": 64,
+        "max_input_chars": 800_000,
+        "max_new_map_calls": 64,
+        "reduce_batch_chars": 900,
+        "reduce_max_tokens": 800,
+        "reduce_max_subdivision_depth": 4,
+        "final_input_chars": 4_000,
+    }
+
+
+def test_repository_active_job_telemetry_includes_map_reduce_and_writer():
+    from app.routers.system import _job_model_functions
+
+    project = Project(
+        id=101,
+        slug="repository-telemetry",
+        title="Repository telemetry",
+        source="https://github.com/acme/example",
+        source_type="github",
+    )
+    job = Job(
+        id=202,
+        project_id=project.id,
+        task="repo_inventory",
+        status="running",
+    )
+
+    assert _job_model_functions(job, project) == (
+        "repository_map",
+        "repository_reduce",
+        "repository_inventory",
+    )
+
+
+def test_repository_provenance_records_resolved_limits_and_contract_versions():
+    from app import provenance
+
+    project, _snapshot_id = _ready_snapshot("repository-contract-provenance")
+    with get_session() as session:
+        current = session.get(Project, project.id)
+        config = provenance.effective_config("repo_inventory", current)
+
+    analysis = config["repository"]["analysis"]
+    assert analysis["limits"]["reduce_batch_chars"] >= 4_000
+    assert analysis["limits"]["reduce_max_tokens"] >= 400
+    assert analysis["map_contract_version"] == repository_tasks._MAP_CONTRACT_VERSION
+    assert (
+        analysis["reduction_contract_version"]
+        == repository_tasks._REDUCTION_CONTRACT_VERSION
+    )
+
+
+def test_repository_map_reuses_valid_legacy_rows_and_recomputes_empty_rows(
+        monkeypatch):
+    project, snapshot_id = _ready_snapshot("map-contract-cache-upgrade")
+    monkeypatch.setattr(
+        llm, "resolve_model",
+        lambda function: ("ollama", "legacy-map-model")
+        if function == "repository_map"
+        else pytest.fail(f"unexpected model function {function}"),
+    )
+    monkeypatch.setattr(
+        repository_tasks,
+        "_installed_model_digest",
+        lambda _provider, _model: "sha256:current-map-model",
+    )
+    legacy_base = repository_tasks._map_config_hash(
+        "ollama", "legacy-map-model", contract_version=1)
+    evidence: list[dict] = []
+    with get_session() as session:
+        repository_file = RepositoryFile(
+            snapshot_id=snapshot_id,
+            path="src/example.py",
+            content_hash="map-contract-file",
+            line_count=2,
+        )
+        session.add(repository_file)
+        session.commit()
+        session.refresh(repository_file)
+        for index, summary_json in enumerate((
+            json.dumps({
+                "summary": "Valid legacy map.",
+                "role": "legacy role",
+                "facts": [],
+                "symbols": [],
+                "dependencies": [],
+                "commands": [],
+                "knowledge": [],
+            }),
+            "{}",
+        )):
+            item = {
+                "evidence_id": f"EMAPCONTRACT{index}",
+                "path": "src/example.py",
+                "start_line": index + 1,
+                "end_line": index + 1,
+                "kind": "code",
+                "symbol": "",
+            }
+            chunk = RepositoryChunk(
+                file_id=repository_file.id,
+                chunk_index=index,
+                evidence_id=item["evidence_id"],
+                start_line=item["start_line"],
+                end_line=item["end_line"],
+                kind="code",
+                body=f"value_{index} = {index}",
+                body_hash=f"map-contract-body-{index}",
+                content_hash=f"map-contract-body-{index}",
+                summary_text="legacy cache row",
+                summary_json=summary_json,
+                summary_config_hash=repository_tasks._map_item_config_hash(
+                    legacy_base, item),
+            )
+            session.add(chunk)
+            session.commit()
+            session.refresh(chunk)
+            evidence.append({**item, "chunk_id": chunk.id})
+
+    calls: list[str] = []
+
+    def complete_json(_function, _system, user, **_kwargs):
+        calls.append(user)
+        return {
+            "summary": "Recomputed non-empty map.",
+            "role": "current role",
+            "facts": [],
+            "symbols": [],
+            "dependencies": [],
+            "commands": [],
+            "knowledge": [],
+        }
+
+    monkeypatch.setattr(llm, "complete_json", complete_json)
+    monkeypatch.setattr(llm, "last_call_diagnostics", lambda: {
+        "requested_context": 8_192,
+        "effective_context": 8_192,
+        "native_context": 32_768,
+        "timeout_seconds": 120,
+        "max_output_tokens": 1_600,
+        "attempts": [{"status": "ok"}],
+    })
+    summaries, coverage = repository_tasks._map_evidence(
+        0, project.id, evidence)
+
+    assert len(summaries) == 2
+    assert len(calls) == 1
+    assert coverage["cache"]["reused_chunk_summaries"] == 1
+    assert coverage["cache"]["legacy_chunk_summaries"] == 1
+    assert coverage["cache"]["new_chunk_summaries"] == 1
+    assert any("historical Ollama digest" in warning
+               for warning in coverage["warnings"])
+    with get_session() as session:
+        recomputed = session.exec(select(RepositoryChunk).where(
+            RepositoryChunk.evidence_id == "EMAPCONTRACT1"
+        )).one()
+        assert recomputed.summary_text == "Recomputed non-empty map."
+        assert recomputed.summary_config_hash != repository_tasks._map_item_config_hash(
+            legacy_base, evidence[1])
+
+
+def test_repository_map_rejects_empty_live_contract():
+    with pytest.raises(
+        repository_tasks.RepositoryMapContractError,
+        match="no usable summary",
+    ):
+        repository_tasks._sanitize_map({}, {
+            "evidence_id": "EEMPTYMAP",
+            "path": "empty.py",
+            "start_line": 1,
+            "end_line": 1,
+        })
+
+
+def _reduction_reply(batch: list[dict]) -> dict:
+    evidence_ids = sorted(repository_tasks._nested_evidence_ids(batch))
+    return {
+        "summary": "Bounded summary.",
+        "facts": [],
+        "symbols": [],
+        "dependencies": [],
+        "commands": [],
+        "knowledge": [],
+        "evidence_ids": evidence_ids,
+    }
+
+
+def _reduction_summaries(count: int = 4, body_chars: int = 300) -> list[dict]:
+    return [{
+        "summary": f"summary-{index}-" + ("x" * body_chars),
+        "facts": [],
+        "symbols": [],
+        "dependencies": [],
+        "commands": [],
+        "knowledge": [],
+        "evidence_ids": [f"EREDUCE{index:04d}"],
+    } for index in range(count)]
+
+
+def _ready_snapshot(slug: str):
+    project, source = _repository_project(slug)
+    with get_session() as session:
+        snapshot = RepositorySnapshot(
+            source_id=source.id,
+            requested_ref="main",
+            resolved_sha=("d" * 36) + f"{source.id:04d}"[-4:],
+            status="ready",
+        )
+        session.add(snapshot)
+        session.commit()
+        session.refresh(snapshot)
+        snapshot_id = snapshot.id
+        source_row = session.get(RepositorySource, source.id)
+        source_row.current_snapshot_id = snapshot_id
+        session.add(source_row)
+        session.commit()
+    return project, snapshot_id
+
+
+def test_repository_reductions_are_cached_across_document_purposes(monkeypatch):
+    project, snapshot_id = _ready_snapshot("shared-reduction-cache")
+    summaries = _reduction_summaries()
+    calls: list[dict] = []
+    monkeypatch.setattr(repository_tasks, "_analysis_limits", _reduction_limits)
+    monkeypatch.setattr(
+        llm, "resolve_model",
+        lambda function: ("ollama", "repository-reducer")
+        if function == "repository_reduce"
+        else pytest.fail(f"unexpected model function {function}"),
+    )
+
+    def complete_json(function, _system, user, **kwargs):
+        assert function == "repository_reduce"
+        assert kwargs["transient_attempts"] == 1
+        assert kwargs["retries"] == 0
+        batch = json.loads(user)
+        calls.append(batch)
+        return _reduction_reply(batch)
+
+    monkeypatch.setattr(llm, "complete_json", complete_json)
+    monkeypatch.setattr(llm, "last_call_diagnostics", lambda: {
+        "provider": "ollama",
+        "model": "repository-reducer",
+        "requested_context": 2_048,
+        "effective_context": 4_096,
+        "native_context": 32_768,
+        "timeout_seconds": 300,
+        "max_output_tokens": 800,
+        "attempts": [{"status": "ok"}],
+    })
+    with get_session() as session:
+        first_job = Job(
+            project_id=project.id, task="repo_inventory", status="running")
+        second_job = Job(
+            project_id=project.id, task="repo_usage", status="running")
+        session.add(first_job)
+        session.add(second_job)
+        session.commit()
+        session.refresh(first_job)
+        session.refresh(second_job)
+        first_job_id, second_job_id = first_job.id, second_job.id
+
+    first = repository_tasks._hierarchical_context(
+        first_job_id, snapshot_id, summaries, "repo_inventory",
+        {"cache": {
+            "reused_chunk_summaries": 3,
+            "new_chunk_summaries": 1,
+        }},
+    )
+    first_call_count = len(calls)
+    second = repository_tasks._hierarchical_context(
+        second_job_id, snapshot_id, summaries, "repo_usage",
+        {"cache": {
+            "reused_chunk_summaries": 4,
+            "new_chunk_summaries": 0,
+        }},
+    )
+    assert first == second
+    assert first_call_count > 0
+    assert len(calls) == first_call_count
+    assert repository_tasks._nested_evidence_ids(first) == {
+        f"EREDUCE{index:04d}" for index in range(4)
+    }
+    with get_session() as session:
+        cache_rows = session.exec(select(RepositorySynthesisCache).where(
+            RepositorySynthesisCache.snapshot_id == snapshot_id
+        )).all()
+        assert len(cache_rows) == first_call_count
+        assert {row.purpose for row in cache_rows} == {"shared_analysis"}
+        first_diagnostics = json.loads(session.get(Job, first_job_id).diagnostics)
+        second_diagnostics = json.loads(session.get(Job, second_job_id).diagnostics)
+        assert first_diagnostics["effective_model"] == {
+            "provider": "ollama",
+            "model": "repository-reducer",
+            "digest": "digest_unavailable",
+        }
+        assert first_diagnostics["cache"]["reductions_new"] == first_call_count
+        assert first_diagnostics["cache"]["retained_leaf_maps"] == 4
+        assert second_diagnostics["cache"]["reductions_reused"] == first_call_count
+        assert second_diagnostics["cache"]["leaf_maps_reused"] == 4
+        for job_id in (first_job_id, second_job_id):
+            job = session.get(Job, job_id)
+            job.status = "done"
+            session.add(job)
+        session.commit()
+
+
+def test_repository_timeout_subdivides_without_repeating_identical_batch(monkeypatch):
+    project, snapshot_id = _ready_snapshot("adaptive-reduction-timeout")
+    summaries = _reduction_summaries()
+    attempted_inputs: list[list[dict]] = []
+    latest = {"attempts": []}
+    monkeypatch.setattr(repository_tasks, "_analysis_limits", _reduction_limits)
+    monkeypatch.setattr(
+        llm, "resolve_model",
+        lambda _function: ("ollama", "repository-reducer"),
+    )
+
+    def complete_json(_function, _system, user, **kwargs):
+        assert kwargs["transient_attempts"] == 1
+        assert kwargs["retries"] == 0
+        batch = json.loads(user)
+        attempted_inputs.append(batch)
+        if len(batch) > 1:
+            latest.clear()
+            latest.update({
+                "requested_context": 2_048,
+                "effective_context": 4_096,
+                "native_context": 32_768,
+                "timeout_seconds": 60,
+                "max_output_tokens": 800,
+                "attempts": [{
+                    "status": "error",
+                    "error_type": "ReadTimeout",
+                    "error": "timed out",
+                }],
+            })
+            raise TimeoutError("repository reduction timed out")
+        latest.clear()
+        latest.update({
+            "requested_context": 2_048,
+            "effective_context": 4_096,
+            "native_context": 32_768,
+            "timeout_seconds": 60,
+            "max_output_tokens": 800,
+            "attempts": [{"status": "ok"}],
+        })
+        return _reduction_reply(batch)
+
+    monkeypatch.setattr(llm, "complete_json", complete_json)
+    monkeypatch.setattr(
+        llm, "last_call_diagnostics", lambda: dict(latest))
+    with get_session() as session:
+        job = Job(
+            project_id=project.id, task="repo_inventory", status="running")
+        session.add(job)
+        session.commit()
+        session.refresh(job)
+        job_id = job.id
+
+    result = repository_tasks._hierarchical_context(
+        job_id, snapshot_id, summaries, "repo_inventory",
+        {"cache": {
+            "reused_chunk_summaries": 4,
+            "new_chunk_summaries": 0,
+        }},
+    )
+    assert repository_tasks._nested_evidence_ids(result) == {
+        f"EREDUCE{index:04d}" for index in range(4)
+    }
+    attempted_hashes = [
+        repository_tasks._digest(batch) for batch in attempted_inputs
+    ]
+    assert len(attempted_hashes) == len(set(attempted_hashes))
+    assert any(len(batch) > 1 for batch in attempted_inputs)
+    assert any(len(batch) == 1 for batch in attempted_inputs)
+    with get_session() as session:
+        job = session.get(Job, job_id)
+        diagnostics = json.loads(job.diagnostics)
+        outcomes = [item["outcome"] for item in diagnostics["attempts"]]
+        assert "timeout" in outcomes
+        assert "subdivided" in outcomes
+        assert "ok" in outcomes
+        assert diagnostics["cause"] == ""
+        assert diagnostics["context"]["effective"] == 4_096
+        job.status = "done"
+        session.add(job)
+        session.commit()
+
+
+def test_repository_single_item_contract_failure_is_transparent(monkeypatch):
+    _project, snapshot_id = _ready_snapshot("single-reduction-failure")
+    summaries = _reduction_summaries(count=1, body_chars=1_500)
+    monkeypatch.setattr(repository_tasks, "_analysis_limits", _reduction_limits)
+    monkeypatch.setattr(
+        llm, "resolve_model",
+        lambda _function: ("ollama", "repository-reducer"),
+    )
+    monkeypatch.setattr(llm, "complete_json", lambda *_args, **_kwargs: {
+        "summary": "Evidence ledger was omitted.",
+        "facts": [],
+        "symbols": [],
+        "dependencies": [],
+        "commands": [],
+        "knowledge": [],
+        "evidence_ids": [],
+    })
+    monkeypatch.setattr(llm, "last_call_diagnostics", lambda: {
+        "attempts": [{"status": "ok"}],
+    })
+    with pytest.raises(RuntimeError, match="single evidence summary cannot be reduced"):
+        repository_tasks._hierarchical_context(
+            0, snapshot_id, summaries, "repo_inventory", {"cache": {}})
+
+
+def test_v4_upgrade_adds_repository_cache_and_diagnostics_without_losing_rows(
+        tmp_path):
+    upgrade_engine = create_engine(f"sqlite:///{tmp_path / 'v4-repository.sqlite3'}")
+    with upgrade_engine.begin() as connection:
+        connection.exec_driver_sql(
+            "CREATE TABLE schema_version (version INTEGER NOT NULL, "
+            "applied TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+        )
+        connection.exec_driver_sql(
+            "INSERT INTO schema_version(version) VALUES (4)")
+        connection.exec_driver_sql(
+            "CREATE TABLE project (id INTEGER PRIMARY KEY, slug VARCHAR, "
+            "title VARCHAR, source VARCHAR, source_type VARCHAR, "
+            "status VARCHAR DEFAULT 'new', deleting BOOLEAN DEFAULT 0, "
+            "created DATETIME)"
+        )
+        connection.exec_driver_sql(
+            "CREATE TABLE job (id INTEGER PRIMARY KEY, project_id INTEGER, "
+            "paper_series_id INTEGER, paper_part_id INTEGER, task VARCHAR, "
+            "status VARCHAR, progress VARCHAR, error VARCHAR, celery_id VARCHAR, "
+            "parent_job_id INTEGER, options VARCHAR DEFAULT '{}', "
+            "started DATETIME, finished DATETIME, heartbeat DATETIME, "
+            "created DATETIME, updated DATETIME)"
+        )
+        connection.exec_driver_sql(
+            "INSERT INTO project(id,slug,title,source,source_type,status,deleting) "
+            "VALUES (1,'legacy-repo','Legacy repository','https://github.com/x/y',"
+            "'github','done',0)"
+        )
+        connection.exec_driver_sql(
+            "INSERT INTO job(id,project_id,task,status,progress,error,celery_id,options) "
+            "VALUES (7,1,'repo_inventory','error','reducing','timeout','','{}')"
+        )
+    SQLModel.metadata.create_all(upgrade_engine)
+    with Session(upgrade_engine) as session:
+        source = RepositorySource(
+            project_id=1,
+            owner="x",
+            repository="y",
+            canonical_url="https://github.com/x/y",
+            local_only=True,
+        )
+        session.add(source)
+        session.commit()
+        session.refresh(source)
+        snapshot = RepositorySnapshot(
+            source_id=source.id,
+            resolved_sha="e" * 40,
+            status="ready",
+        )
+        session.add(snapshot)
+        session.commit()
+        session.refresh(snapshot)
+        repository_file = RepositoryFile(
+            snapshot_id=snapshot.id,
+            path="README.md",
+            content_hash="file",
+        )
+        session.add(repository_file)
+        session.commit()
+        session.refresh(repository_file)
+        session.add(RepositoryChunk(
+            file_id=repository_file.id,
+            chunk_index=0,
+            evidence_id="ELEGACY",
+            start_line=1,
+            end_line=1,
+            body="legacy mapped evidence",
+            body_hash="body",
+            content_hash="body",
+            summary_text="legacy map",
+            summary_json='{"summary":"legacy map"}',
+            summary_config_hash="legacy-qwen3-8b-map",
+        ))
+        session.commit()
+    with upgrade_engine.begin() as connection:
+        _migrate(connection)
+        _migrate(connection)
+        assert connection.exec_driver_sql(
+            "SELECT MAX(version) FROM schema_version"
+        ).scalar() == 5
+        job_columns = {
+            row[1] for row in connection.exec_driver_sql(
+                "PRAGMA table_info('job')")
+        }
+        assert "diagnostics" in job_columns
+        assert connection.exec_driver_sql(
+            "SELECT status,progress,error,diagnostics FROM job WHERE id=7"
+        ).one() == ("error", "reducing", "timeout", "{}")
+        tables = {
+            row[0] for row in connection.exec_driver_sql(
+                "SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        assert "repositorysynthesiscache" in tables
+        indexes = {
+            row[1] for row in connection.exec_driver_sql(
+                "PRAGMA index_list('repositorysynthesiscache')")
+        }
+        assert "uq_repository_synthesis_cache_key" in indexes
+        assert connection.exec_driver_sql(
+            "SELECT value FROM setting "
+            "WHERE key='repository.local_model'"
+        ).scalar() == '"qwen3:8b"'
+        assert connection.exec_driver_sql(
+            "SELECT value FROM setting "
+            "WHERE key='repository.reduce_model'"
+        ).first() is None
+
+
+def test_v4_upgrade_preserves_explicit_mapper_and_adopts_new_reducer_default(
+        tmp_path):
+    upgrade_engine = create_engine(f"sqlite:///{tmp_path / 'v4-model.sqlite3'}")
+    SQLModel.metadata.create_all(upgrade_engine)
+    with Session(upgrade_engine) as session:
+        session.add(Setting(
+            key="repository.local_model",
+            value=json.dumps("administrator-choice:latest"),
+        ))
+        session.commit()
+    with upgrade_engine.begin() as connection:
+        connection.exec_driver_sql(
+            "CREATE TABLE IF NOT EXISTS schema_version "
+            "(version INTEGER NOT NULL, "
+            "applied TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+        )
+        connection.exec_driver_sql(
+            "INSERT INTO schema_version(version) VALUES (4)")
+        _migrate(connection)
+        assert connection.exec_driver_sql(
+            "SELECT value FROM setting "
+            "WHERE key='repository.local_model'"
+        ).scalar() == json.dumps("administrator-choice:latest")
+        assert connection.exec_driver_sql(
+            "SELECT value FROM setting "
+            "WHERE key='repository.reduce_model'"
+        ).first() is None

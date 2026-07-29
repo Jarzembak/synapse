@@ -102,6 +102,11 @@ class Job(SQLModel, table=True):
     celery_id: str = ""
     parent_job_id: int | None = Field(default=None, index=True)
     options: str = "{}"  # JSON run options (profile / explicit step set)
+    # Structured, user-displayable execution details. This remains separate
+    # from the concise progress and sanitized traceback fields so long-running
+    # hierarchical jobs can explain model selection, cache reuse, retries, and
+    # adaptive subdivision without parsing log text.
+    diagnostics: str = "{}"
     started: datetime | None = None
     finished: datetime | None = None
     heartbeat: datetime | None = None
@@ -322,6 +327,29 @@ class RepositoryChunk(SQLModel, table=True):
     summary_json: str = "{}"
     summary_config_hash: str = Field(default="", index=True)
     created: datetime = Field(default_factory=utcnow)
+
+
+class RepositorySynthesisCache(SQLModel, table=True):
+    """Content-addressed, snapshot-pinned repository reductions.
+
+    Reductions are deliberately output-independent. ``purpose`` currently
+    identifies the shared repository evidence contract rather than an
+    artifact type, allowing inventory, usage, architecture, and deep-dive
+    generation to reuse the same successful hierarchical work.
+    """
+
+    id: int | None = Field(default=None, primary_key=True)
+    snapshot_id: int = Field(
+        foreign_key="repositorysnapshot.id", index=True)
+    purpose: str = Field(default="shared_analysis", index=True)
+    input_hash: str = Field(index=True)
+    config_hash: str = Field(index=True)
+    provider: str = ""
+    model: str = ""
+    body: str = "{}"
+    evidence_ids: str = "[]"
+    created: datetime = Field(default_factory=utcnow)
+    updated: datetime = Field(default_factory=utcnow)
 
 
 class PaperSource(SQLModel, table=True):

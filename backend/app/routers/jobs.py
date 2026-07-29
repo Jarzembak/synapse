@@ -47,6 +47,7 @@ def _serialize(job: Job, titles: dict[int, str]) -> dict:
         "task_label": _label(job.task),
         "project_title": titles.get(job.project_id or 0, ""),
         "status": job.status, "progress": job.progress, "error": job.error,
+        "diagnostics": job.diagnostics,
         "created": job.created.isoformat(),
         "updated": job.updated.isoformat(),
         "started": job.started.isoformat() if job.started else None,

@@ -198,7 +198,10 @@ requirements, uncertainty, and every supporting evidence id. Never add facts fro
 knowledge. Return JSON:
 {"summary": "...", "facts": [{"claim": "...", "kind": "...",
  "evidence_ids": ["..."]}], "symbols": ["..."], "dependencies": ["..."],
- "commands": ["..."], "knowledge": ["..."], "evidence_ids": ["..."]}."""
+ "commands": ["..."], "knowledge": ["..."], "evidence_ids": ["..."]}.
+The top-level evidence_ids array must equal the exact set union of every evidence_id and
+evidence_ids value in the input, with no omissions, additions, or duplicates. Verify that
+exact union before returning."""
 
 REPOSITORY_CITATION_RULES = """
 

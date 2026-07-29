@@ -218,9 +218,10 @@ def paper_model_execution_signature(
     """Describe the output-affecting settings used for one paper model call.
 
     Paper caches cannot key only on provider/model: Ollama's context window and
-    thinking mode alter the generated evidence map, and native JSON enforcement
-    changes structured map/reduction/planning calls.  Record the *effective*
-    restricted values rather than the mutable UI values they override.
+    context policy and thinking mode alter the generated evidence map, and
+    native JSON enforcement changes structured map/reduction/planning calls.
+    Record the configured context minimum plus the adaptive-policy version so
+    caches become stale when sizing behavior changes.
     """
     value: dict[str, Any] = {
         "provider": provider,
@@ -241,9 +242,10 @@ def paper_model_execution_signature(
     provider_settings: dict[str, Any] = {}
     if provider == "ollama":
         num_ctx = int(local.get("num_ctx") or 16_384)
-        provider_settings["num_ctx"] = (
-            max(num_ctx, llm.REPOSITORY_NUM_CTX) if local_only else num_ctx
-        )
+        provider_settings["configured_context_minimum"] = num_ctx
+        provider_settings["context_policy"] = llm.LOCAL_CONTEXT_POLICY_VERSION
+        provider_settings["automatic_context_cap"] = (
+            llm.LOCAL_AUTOMATIC_CONTEXT_CAP)
         provider_settings["think"] = (
             False if local_only else local.get("think", "auto")
         )

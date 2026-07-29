@@ -121,6 +121,8 @@ def test_private_preflight_and_create_are_local_only(client, monkeypatch):
     assert data["source"]["local_only"] is True
     assert data["source"]["commit_sha"] == "1" * 40
     assert data["coverage_preview"]["eligible_files"] == 2
+    assert data["local_model"]
+    assert data["reduce_model"]
 
     moved = client.post("/api/repositories", json={
         **request, "analyze": False, "expected_sha": "2" * 40,
@@ -437,10 +439,14 @@ def test_repository_settings_expose_map_budgets(client):
     payload = client.get("/api/repositories/settings").json()
     assert payload["static_only"] is True
     assert payload["local_model"]
+    assert payload["reduce_model"]
     assert payload["limits"]["max_map_chunks"] > 0
     assert payload["limits"]["max_map_input_chars"] > 0
     assert client.put("/api/repositories/settings", json={
         "local_model": "gpt-oss:120b-cloud",
+    }).status_code == 422
+    assert client.put("/api/repositories/settings", json={
+        "reduce_model": "gpt-oss:120b-cloud",
     }).status_code == 422
 
 

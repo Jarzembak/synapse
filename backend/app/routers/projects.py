@@ -18,7 +18,7 @@ from ..models import (
     MediaLease, MediaObject, ProjectMediaPolicy, PaperPartEvidence,
     PaperSeries, PaperSeriesPart, PaperSource,
     PaperSynthesisCache, Project, RepositoryChunk, RepositoryFile,
-    RepositorySnapshot, RepositorySource, utcnow,
+    RepositorySnapshot, RepositorySource, RepositorySynthesisCache, utcnow,
 )
 from .. import library
 from .. import media_storage as media_storage_service
@@ -1155,6 +1155,13 @@ def delete_project(project_id: int):
                         RepositorySnapshot.source_id == repository_source.id)
                 ).all()
                 snapshot_ids = [snapshot.id for snapshot in snapshots]
+                if snapshot_ids:
+                    for cache in session.exec(
+                        select(RepositorySynthesisCache).where(
+                            RepositorySynthesisCache.snapshot_id.in_(snapshot_ids))
+                    ).all():
+                        session.delete(cache)
+                    session.flush()
                 files = session.exec(
                     select(RepositoryFile).where(
                         RepositoryFile.snapshot_id.in_(snapshot_ids))

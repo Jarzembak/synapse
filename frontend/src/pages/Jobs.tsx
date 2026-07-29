@@ -1,6 +1,9 @@
 import { useState } from "react";
 import { Link } from "react-router";
 import { api, fmtTime, Job } from "../api";
+import JobFailureDetails, {
+  hasJobFailureDetails,
+} from "../components/JobFailureDetails";
 import { useEventSource } from "../useEventSource";
 import { StreamStatus, useStreamStatus } from "../useStreamStatus";
 
@@ -41,6 +44,7 @@ function JobRow({
 }) {
   const [open, setOpen] = useState(false);
   const errorId = `job-error-${job.id}`;
+  const hasFailure = hasJobFailureDetails(job);
 
   return (
     <>
@@ -65,7 +69,7 @@ function JobRow({
           {job.updated ? <time dateTime={job.updated}>{fmtTime(job.updated)}</time> : ""}
         </td>
         <td className="jobactions">
-          {job.error && (
+          {hasFailure && (
             <button
               type="button"
               className="linkish"
@@ -90,9 +94,9 @@ function JobRow({
           )}
         </td>
       </tr>
-      {open && job.error && (
+      {open && hasFailure && (
         <tr className="job-error-row" id={errorId}>
-          <td colSpan={6}><pre className="error">{job.error}</pre></td>
+          <td colSpan={6}><JobFailureDetails job={job} /></td>
         </tr>
       )}
     </>

@@ -1,0 +1,335 @@
+import {
+  Job,
+  JobDiagnosticAttempt,
+  JobDiagnostics,
+} from "../api";
+
+type UnknownRecord = Record<string, unknown>;
+
+function isRecord(value: unknown): value is UnknownRecord {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function textValue(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function numberValue(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value !== "string" || !value.trim()) return undefined;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function booleanValue(value: unknown): boolean | undefined {
+  return typeof value === "boolean" ? value : undefined;
+}
+
+function parseAttempt(value: unknown): JobDiagnosticAttempt | null {
+  if (!isRecord(value)) return null;
+  const attempt: JobDiagnosticAttempt = {
+    outcome: textValue(value.outcome),
+    level: numberValue(value.level),
+    batch: numberValue(value.batch),
+    depth: numberValue(value.depth),
+    detail: textValue(value.detail),
+  };
+  return Object.values(attempt).some((item) => item !== undefined) ? attempt : null;
+}
+
+function parseDiagnosticsObject(value: UnknownRecord): JobDiagnostics | null {
+  const effectiveModel = isRecord(value.effective_model)
+    ? {
+        provider: textValue(value.effective_model.provider),
+        model: textValue(value.effective_model.model),
+        digest: textValue(value.effective_model.digest),
+      }
+    : undefined;
+  const context = isRecord(value.context)
+    ? {
+        requested: numberValue(value.context.requested),
+        effective: numberValue(value.context.effective),
+        native: numberValue(value.context.native),
+        timeout_seconds: numberValue(value.context.timeout_seconds),
+        max_output_tokens: numberValue(value.context.max_output_tokens),
+      }
+    : undefined;
+  const reduction = isRecord(value.reduction)
+    ? {
+        purpose: textValue(value.reduction.purpose),
+        level: numberValue(value.reduction.level),
+        batch: numberValue(value.reduction.batch),
+        batch_count: numberValue(value.reduction.batch_count),
+        items: numberValue(value.reduction.items),
+        input_chars: numberValue(value.reduction.input_chars),
+        subdivision_depth: numberValue(value.reduction.subdivision_depth),
+        complete: booleanValue(value.reduction.complete),
+      }
+    : undefined;
+  const cache = isRecord(value.cache)
+    ? {
+        leaf_maps_reused: numberValue(value.cache.leaf_maps_reused),
+        leaf_maps_new: numberValue(value.cache.leaf_maps_new),
+        legacy_leaf_maps_reused: numberValue(value.cache.legacy_leaf_maps_reused),
+        reductions_reused: numberValue(value.cache.reductions_reused),
+        reductions_new: numberValue(value.cache.reductions_new),
+      }
+    : undefined;
+  const attempts = Array.isArray(value.attempts)
+    ? value.attempts.map(parseAttempt).filter((item): item is JobDiagnosticAttempt => item !== null)
+    : undefined;
+  const diagnostics: JobDiagnostics = {
+    stage: textValue(value.stage),
+    effective_model: effectiveModel
+      && Object.values(effectiveModel).some((item) => item !== undefined)
+      ? effectiveModel
+      : undefined,
+    context: context && Object.values(context).some((item) => item !== undefined)
+      ? context
+      : undefined,
+    reduction: reduction && Object.values(reduction).some((item) => item !== undefined)
+      ? reduction
+      : undefined,
+    cache: cache && Object.values(cache).some((item) => item !== undefined)
+      ? cache
+      : undefined,
+    attempts: attempts?.length ? attempts : undefined,
+    cause: textValue(value.cause),
+  };
+  return Object.values(diagnostics).some((item) => item !== undefined) ? diagnostics : null;
+}
+
+export function parseJobDiagnostics(value: unknown): JobDiagnostics | null {
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+    try {
+      return parseJobDiagnostics(JSON.parse(trimmed));
+    } catch {
+      return { cause: trimmed };
+    }
+  }
+  return isRecord(value) ? parseDiagnosticsObject(value) : null;
+}
+
+export function hasJobFailureDetails(job: Job): boolean {
+  return job.status === "error"
+    && Boolean(job.error.trim() || parseJobDiagnostics(job.diagnostics));
+}
+
+function formatName(value: string): string {
+  return value.replaceAll("_", " ");
+}
+
+function formatCount(value: number): string {
+  return value.toLocaleString("en-US", { maximumFractionDigits: 0 });
+}
+
+function summarizeError(error: string): string {
+  const lines = error.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  if (!lines.length) return "";
+  return lines[0].toLowerCase().startsWith("traceback") && lines.length > 1
+    ? lines[lines.length - 1]
+    : lines[0];
+}
+
+function contextSummary(diagnostics: JobDiagnostics): string | null {
+  const context = diagnostics.context;
+  if (!context) return null;
+  const parts = [
+    context.requested !== undefined && context.requested !== null
+      ? `requested ${formatCount(context.requested)} tokens`
+      : "",
+    context.effective !== undefined && context.effective !== null
+      ? `effective ${formatCount(context.effective)} tokens`
+      : "",
+    context.native !== undefined && context.native !== null
+      ? `model native ${formatCount(context.native)} tokens`
+      : "",
+    context.timeout_seconds !== undefined && context.timeout_seconds !== null
+      ? `timeout ${formatCount(context.timeout_seconds)} seconds`
+      : "",
+    context.max_output_tokens !== undefined && context.max_output_tokens !== null
+      ? `maximum output ${formatCount(context.max_output_tokens)} tokens`
+      : "",
+  ].filter(Boolean);
+  return parts.length ? parts.join("; ") : null;
+}
+
+function reductionSummary(diagnostics: JobDiagnostics): string | null {
+  const reduction = diagnostics.reduction;
+  if (!reduction) return null;
+  const parts = [
+    reduction.purpose
+      ? `${reduction.complete ? "completed " : ""}${formatName(reduction.purpose)}`
+      : "",
+    reduction.level !== undefined && reduction.level !== null
+      ? `level ${formatCount(reduction.level)}`
+      : "",
+    reduction.batch !== undefined && reduction.batch !== null
+      ? `batch ${formatCount(reduction.batch)}${
+          reduction.batch_count !== undefined && reduction.batch_count !== null
+            ? ` of ${formatCount(reduction.batch_count)}`
+            : ""
+        }`
+      : "",
+    reduction.items !== undefined && reduction.items !== null
+      ? `${formatCount(reduction.items)} input items`
+      : "",
+    reduction.input_chars !== undefined && reduction.input_chars !== null
+      ? `${formatCount(reduction.input_chars)} input characters`
+      : "",
+    reduction.subdivision_depth !== undefined && reduction.subdivision_depth !== null
+      ? `subdivision depth ${formatCount(reduction.subdivision_depth)}`
+      : "",
+  ].filter(Boolean);
+  return parts.length ? parts.join("; ") : null;
+}
+
+function cacheSummary(diagnostics: JobDiagnostics): string | null {
+  const cache = diagnostics.cache;
+  if (!cache) return null;
+  const parts = [
+    cache.leaf_maps_reused !== undefined && cache.leaf_maps_reused !== null
+      ? `${formatCount(cache.leaf_maps_reused)} leaf maps reused`
+      : "",
+    cache.leaf_maps_new !== undefined && cache.leaf_maps_new !== null
+      ? `${formatCount(cache.leaf_maps_new)} leaf maps generated`
+      : "",
+    cache.legacy_leaf_maps_reused !== undefined
+      && cache.legacy_leaf_maps_reused !== null
+      && cache.legacy_leaf_maps_reused > 0
+      ? `${formatCount(cache.legacy_leaf_maps_reused)} legacy leaf maps reused`
+      : "",
+    cache.reductions_reused !== undefined && cache.reductions_reused !== null
+      ? `${formatCount(cache.reductions_reused)} reductions reused`
+      : "",
+    cache.reductions_new !== undefined && cache.reductions_new !== null
+      ? `${formatCount(cache.reductions_new)} reductions generated`
+      : "",
+  ].filter(Boolean);
+  return parts.length ? parts.join("; ") : null;
+}
+
+function attemptSummary(attempt: JobDiagnosticAttempt): string {
+  const location = [
+    attempt.level !== undefined && attempt.level !== null
+      ? `level ${formatCount(attempt.level)}`
+      : "",
+    attempt.batch !== undefined && attempt.batch !== null
+      ? `batch ${formatCount(attempt.batch)}`
+      : "",
+    attempt.depth !== undefined && attempt.depth !== null
+      ? `depth ${formatCount(attempt.depth)}`
+      : "",
+  ].filter(Boolean).join(", ");
+  const prefix = attempt.outcome ? formatName(attempt.outcome) : "attempt";
+  return `${prefix}${location ? ` (${location})` : ""}${attempt.detail ? `: ${attempt.detail}` : ""}`;
+}
+
+function inventoryFailure(job: Job, diagnostics: JobDiagnostics | null): boolean {
+  const values = [
+    job.task,
+    job.error,
+    diagnostics?.stage,
+    diagnostics?.reduction?.purpose,
+  ].filter((value): value is string => typeof value === "string");
+  return job.status === "error" && values.some((value) => {
+    const normalized = value.toLowerCase().replaceAll("_", " ");
+    return normalized.includes("repo inventory") || normalized.includes("repository inventory");
+  });
+}
+
+export default function JobFailureDetails({ job }: { job: Job }) {
+  const diagnostics = parseJobDiagnostics(job.diagnostics);
+  const cause = diagnostics?.cause || summarizeError(job.error);
+  const model = diagnostics?.effective_model;
+  const modelSummary = [model?.provider, model?.model].filter(Boolean).join("/");
+  const modelDigest = model?.digest && model.digest !== "digest_unavailable"
+    ? model.digest.slice(0, 12)
+    : "";
+  const context = diagnostics ? contextSummary(diagnostics) : null;
+  const reduction = diagnostics ? reductionSummary(diagnostics) : null;
+  const cache = diagnostics ? cacheSummary(diagnostics) : null;
+  const technicalError = job.error.trim();
+  const hasStructuredDetails = Boolean(
+    diagnostics?.stage
+    || modelSummary
+    || context
+    || reduction
+    || cache
+    || diagnostics?.attempts?.length,
+  );
+  const showTechnicalError = Boolean(
+    technicalError && (hasStructuredDetails || technicalError !== cause || technicalError.includes("\n")),
+  );
+
+  return (
+    <section className="job-diagnostics" aria-label="Failure diagnostics">
+      <h4>Why this job failed</h4>
+      {cause && <p className="job-diagnostics-cause">{cause}</p>}
+
+      {hasStructuredDetails && (
+        <dl className="job-diagnostic-facts">
+          {diagnostics?.stage && (
+            <>
+              <dt>Stage</dt>
+              <dd>{formatName(diagnostics.stage)}</dd>
+            </>
+          )}
+          {modelSummary && (
+            <>
+              <dt>Effective model</dt>
+              <dd>
+                <code>{modelSummary}</code>
+                {modelDigest ? <> (digest <code>{modelDigest}</code>)</> : null}
+              </dd>
+            </>
+          )}
+          {context && (
+            <>
+              <dt>Context</dt>
+              <dd>{context}</dd>
+            </>
+          )}
+          {reduction && (
+            <>
+              <dt>Reduction</dt>
+              <dd>{reduction}</dd>
+            </>
+          )}
+          {cache && (
+            <>
+              <dt>Cached work</dt>
+              <dd>{cache}</dd>
+            </>
+          )}
+        </dl>
+      )}
+
+      {diagnostics?.attempts && diagnostics.attempts.length > 0 && (
+        <div className="job-diagnostic-attempts">
+          <h5>Model attempt and adaptive subdivision history</h5>
+          <ol>
+            {diagnostics.attempts.map((attempt, index) => (
+              <li key={`${index}-${attempt.outcome ?? "attempt"}`}>{attemptSummary(attempt)}</li>
+            ))}
+          </ol>
+        </div>
+      )}
+
+      {inventoryFailure(job, diagnostics) && (
+        <p className="job-diagnostics-skipped">
+          Later repository analysis jobs were skipped because repository inventory failed.
+        </p>
+      )}
+
+      {showTechnicalError && (
+        <details className="job-technical-error">
+          <summary>Technical error details</summary>
+          <pre className="error">{technicalError}</pre>
+        </details>
+      )}
+    </section>
+  );
+}

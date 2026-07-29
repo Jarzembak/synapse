@@ -17,7 +17,12 @@ const loadResponses: Record<string, unknown> = {
     provider_options: { correct: ["ollama", "openai"] },
   },
   "/settings/provider-models": {
-    ollama: { configured: true, ok: true, models: ["qwen3:8b"], detail: "" },
+    ollama: {
+      configured: true,
+      ok: true,
+      models: ["qwen3:8b", "qwen3.5:4b-q4_K_M"],
+      detail: "",
+    },
     openai: { configured: true, ok: true, models: ["gpt-5.4", "gpt-5-mini"], detail: "" },
   },
   "/settings/ollama/models": {
@@ -121,7 +126,14 @@ const loadResponses: Record<string, unknown> = {
     include_repositories: false,
   },
   "/repositories/credentials": { configured: false },
-  "/repositories/settings": null,
+  "/repositories/settings": {
+    local_model: "qwen3:8b",
+    reduce_model: "qwen3.5:4b-q4_K_M",
+    limits: {},
+    default_exclusions: [],
+    host: "github.com",
+    static_only: true,
+  },
   "/settings/glossary": { terms: [] },
   "/tags": [],
   "/settings/download": { max_height: 1080 },
@@ -144,7 +156,15 @@ const loadResponses: Record<string, unknown> = {
 beforeEach(() => {
   apiMock.mockReset();
   apiMock.mockImplementation(async (path: string, options?: RequestInit) => {
-    if (options) return { ok: true };
+    if (options) {
+      if (path === "/repositories/settings" && options.body) {
+        return {
+          ...(loadResponses["/repositories/settings"] as Record<string, unknown>),
+          ...JSON.parse(options.body as string),
+        };
+      }
+      return { ok: true };
+    }
     if (path === "/settings/ollama/models?refresh=true") {
       return loadResponses["/settings/ollama/models"];
     }
@@ -192,6 +212,36 @@ describe("Settings integration", () => {
     expect(status).toHaveTextContent("Repositories: 4 evidence chunks");
     expect(status).toHaveTextContent("Papers: 3 evidence chunks / 2 embedded");
     expect(status).toHaveTextContent("rebuild pending or incomplete");
+  });
+
+  it("assigns repository mapping and reduction models independently", async () => {
+    const user = userEvent.setup();
+    render(<Settings />);
+
+    const heading = await screen.findByRole("heading", {
+      name: "Local repository analysis",
+    });
+    const card = heading.closest(".card");
+    expect(card).not.toBeNull();
+    const modelSelectors = within(card as HTMLElement).getAllByRole("combobox");
+    expect(modelSelectors).toHaveLength(2);
+    expect(modelSelectors[0]).toHaveValue("qwen3:8b");
+    expect(modelSelectors[1]).toHaveValue("qwen3.5:4b-q4_K_M");
+
+    await user.selectOptions(modelSelectors[0], "qwen3.5:4b-q4_K_M");
+    await user.selectOptions(modelSelectors[1], "qwen3:8b");
+    await user.click(screen.getByRole("button", {
+      name: "Save repository settings",
+    }));
+
+    await waitFor(() => {
+      const request = apiMock.mock.calls.find(([path, options]) =>
+        path === "/repositories/settings" && options?.method === "PUT");
+      expect(JSON.parse(request![1].body as string)).toMatchObject({
+        local_model: "qwen3.5:4b-q4_K_M",
+        reduce_model: "qwen3:8b",
+      });
+    });
   });
 
   it("discloses that backups do not hydrate cloud-primary media", async () => {

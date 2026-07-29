@@ -527,6 +527,11 @@ def model_catalog(*, refresh: bool = False) -> dict:
             requested_context=general_context,
             resources=assessment_resources,
         )
+        row["repository_assessment"] = resource_assessment(
+            model,
+            requested_context=max(general_context, 32_768),
+            resources=assessment_resources,
+        )
         row["restricted_assessment"] = resource_assessment(
             model,
             requested_context=max(general_context, 65_536),

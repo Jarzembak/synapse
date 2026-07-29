@@ -1130,7 +1130,7 @@ def test_schema_v4_contains_media_storage_tables():
                 "SELECT name FROM sqlite_master WHERE type='table'"
             )).all()
         }
-    assert version == 4
+    assert version == 5
     assert {
         "mediastoragetarget",
         "projectmediapolicy",

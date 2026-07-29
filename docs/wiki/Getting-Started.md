@@ -33,11 +33,13 @@ In another terminal, once the containers are running:
 
 ```bash
 docker compose exec ollama ollama pull qwen3:8b
+docker compose exec ollama ollama pull qwen3.5:4b-q4_K_M
 ```
 
-This is the default local chat model and is also required by repository
-analysis. If you enable Hybrid semantic search, install the default embedding
-model too:
+The 8B model remains the general local-chat default. The smaller Qwen 3.5 model
+is the default for repository mapping and hierarchical reduction because it
+leaves more GPU memory for dense context. If you enable Hybrid semantic search,
+install the default embedding model too:
 
 ```bash
 docker compose exec ollama ollama pull nomic-embed-text

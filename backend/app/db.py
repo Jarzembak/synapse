@@ -61,6 +61,7 @@ def _migrate(conn) -> None:
     _add_column(conn, "tag", "restricted", "BOOLEAN NOT NULL DEFAULT 0")
     _add_column(conn, "job", "parent_job_id", "INTEGER")
     _add_column(conn, "job", "options", "VARCHAR NOT NULL DEFAULT '{}'")
+    _add_column(conn, "job", "diagnostics", "VARCHAR NOT NULL DEFAULT '{}'")
     _add_column(conn, "job", "paper_series_id", "INTEGER")
     _add_column(conn, "job", "paper_part_id", "INTEGER")
     for name in ("started", "finished", "heartbeat"):
@@ -171,6 +172,8 @@ def _migrate(conn) -> None:
         "ON repositorychunk(body_hash)",
         "CREATE INDEX IF NOT EXISTS ix_repository_source_cloud_purge "
         "ON repositorysource(cloud_purge_pending)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_repository_synthesis_cache_key "
+        "ON repositorysynthesiscache(snapshot_id, purpose, input_hash, config_hash)",
         "CREATE UNIQUE INDEX IF NOT EXISTS uq_paper_source_project "
         "ON papersource(project_id)",
         "CREATE INDEX IF NOT EXISTS ix_paper_source_hash "
@@ -225,6 +228,31 @@ def _migrate(conn) -> None:
         current = 3
     if current < 4:
         conn.exec_driver_sql("INSERT INTO schema_version(version) VALUES (4)")
+        current = 4
+    if current < 5:
+        # Preserve the effective mapper used by pre-v5 installations whose
+        # chunk summaries already depend on the former qwen3:8b fallback. An
+        # explicitly selected map model remains untouched. The new reducer
+        # setting stays absent unless an administrator already chose one, so
+        # every upgrade adopts the independent 4B reducer default without
+        # invalidating compatible leaf maps.
+        if _columns(conn, "setting"):
+            local_row = conn.exec_driver_sql(
+                "SELECT value FROM setting WHERE key='repository.local_model'"
+            ).first()
+            has_cached_maps = False
+            if (_columns(conn, "repositorychunk")
+                    and "summary_config_hash" in _columns(conn, "repositorychunk")):
+                has_cached_maps = bool(conn.exec_driver_sql(
+                    "SELECT 1 FROM repositorychunk "
+                    "WHERE summary_config_hash <> '' LIMIT 1"
+                ).first())
+            if local_row is None and has_cached_maps:
+                conn.exec_driver_sql(
+                    "INSERT INTO setting(key, value) "
+                    "VALUES ('repository.local_model', '\"qwen3:8b\"')"
+                )
+        conn.exec_driver_sql("INSERT INTO schema_version(version) VALUES (5)")
 
 
 def init_db() -> None:
