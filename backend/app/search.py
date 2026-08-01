@@ -52,6 +52,7 @@ def embed_texts(values: list[str], model: str | None = None, *,
             selected_model,
             role="embedding",
             requested_context=2_048,
+            refresh=True,
         )
         # Restricted embeddings must not inherit an outbound proxy. Keep public
         # remote-Ollama compatibility while explicitly bypassing proxy env vars

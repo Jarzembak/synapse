@@ -25,6 +25,26 @@ function booleanValue(value: unknown): boolean | undefined {
   return typeof value === "boolean" ? value : undefined;
 }
 
+function stringArray(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const values = value.map(textValue).filter((item): item is string => Boolean(item));
+  return values.length ? values : undefined;
+}
+
+function parseResidentTransition(value: unknown) {
+  if (!isRecord(value)) return undefined;
+  const transition = {
+    required: booleanValue(value.required),
+    resident_models: stringArray(value.resident_models),
+    replaced_models: stringArray(value.replaced_models),
+    reclaimable_ram_bytes: numberValue(value.reclaimable_ram_bytes),
+    reclaimable_vram_bytes: numberValue(value.reclaimable_vram_bytes),
+  };
+  return Object.values(transition).some((item) => item !== undefined)
+    ? transition
+    : undefined;
+}
+
 function parseAttempt(value: unknown): JobDiagnosticAttempt | null {
   if (!isRecord(value)) return null;
   const attempt: JobDiagnosticAttempt = {
@@ -45,13 +65,38 @@ function parseDiagnosticsObject(value: UnknownRecord): JobDiagnostics | null {
         digest: textValue(value.effective_model.digest),
       }
     : undefined;
-  const context = isRecord(value.context)
+  const contextRecord = isRecord(value.context) ? value.context : undefined;
+  const safetyRecord = contextRecord && isRecord(contextRecord.safety_assessment)
+    ? contextRecord.safety_assessment
+    : undefined;
+  const nestedTransition = safetyRecord
+    ? parseResidentTransition(safetyRecord.resident_transition)
+    : undefined;
+  const residentTransition = contextRecord
+    ? parseResidentTransition(contextRecord.resident_transition) || nestedTransition
+    : undefined;
+  const safetyAssessment = safetyRecord
     ? {
-        requested: numberValue(value.context.requested),
-        effective: numberValue(value.context.effective),
-        native: numberValue(value.context.native),
-        timeout_seconds: numberValue(value.context.timeout_seconds),
-        max_output_tokens: numberValue(value.context.max_output_tokens),
+        tier: textValue(safetyRecord.tier),
+        message: textValue(safetyRecord.message),
+        requested_context_tokens: numberValue(safetyRecord.requested_context_tokens),
+        estimated_total_bytes: numberValue(safetyRecord.estimated_total_bytes),
+        acknowledged: booleanValue(safetyRecord.acknowledged),
+        resident_transition: nestedTransition,
+      }
+    : undefined;
+  const context = contextRecord
+    ? {
+        requested: numberValue(contextRecord.requested),
+        effective: numberValue(contextRecord.effective),
+        native: numberValue(contextRecord.native),
+        timeout_seconds: numberValue(contextRecord.timeout_seconds),
+        max_output_tokens: numberValue(contextRecord.max_output_tokens),
+        safety_assessment: safetyAssessment
+          && Object.values(safetyAssessment).some((item) => item !== undefined)
+          ? safetyAssessment
+          : undefined,
+        resident_transition: residentTransition,
       }
     : undefined;
   const reduction = isRecord(value.reduction)
@@ -125,6 +170,13 @@ function formatCount(value: number): string {
   return value.toLocaleString("en-US", { maximumFractionDigits: 0 });
 }
 
+function formatBytes(value: number): string {
+  const gib = value / 1024 ** 3;
+  if (gib >= 1) return `${gib.toLocaleString("en-US", { maximumFractionDigits: 1 })} GiB`;
+  const mib = value / 1024 ** 2;
+  return `${mib.toLocaleString("en-US", { maximumFractionDigits: 0 })} MiB`;
+}
+
 function summarizeError(error: string): string {
   const lines = error.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
   if (!lines.length) return "";
@@ -152,6 +204,47 @@ function contextSummary(diagnostics: JobDiagnostics): string | null {
     context.max_output_tokens !== undefined && context.max_output_tokens !== null
       ? `maximum output ${formatCount(context.max_output_tokens)} tokens`
       : "",
+  ].filter(Boolean);
+  return parts.length ? parts.join("; ") : null;
+}
+
+function safetySummary(diagnostics: JobDiagnostics): string | null {
+  const assessment = diagnostics.context?.safety_assessment;
+  if (!assessment) return null;
+  const parts = [
+    assessment.tier ? formatName(assessment.tier) : "",
+    assessment.message || "",
+    assessment.estimated_total_bytes !== undefined
+      && assessment.estimated_total_bytes !== null
+      ? `estimated requirement ${formatBytes(assessment.estimated_total_bytes)}`
+      : "",
+    assessment.acknowledged ? "administrator override acknowledged" : "",
+  ].filter(Boolean);
+  return parts.length ? parts.join("; ") : null;
+}
+
+function residentTransitionSummary(diagnostics: JobDiagnostics): string | null {
+  const transition = diagnostics.context?.resident_transition
+    || diagnostics.context?.safety_assessment?.resident_transition;
+  if (!transition) return null;
+  const models = transition.replaced_models?.length
+    ? transition.replaced_models
+    : transition.resident_models;
+  const reclaimable = [
+    transition.reclaimable_ram_bytes !== undefined
+      && transition.reclaimable_ram_bytes !== null
+      ? `${formatBytes(transition.reclaimable_ram_bytes)} RAM`
+      : "",
+    transition.reclaimable_vram_bytes !== undefined
+      && transition.reclaimable_vram_bytes !== null
+      ? `${formatBytes(transition.reclaimable_vram_bytes)} VRAM`
+      : "",
+  ].filter(Boolean).join(" and ");
+  const parts = [
+    models?.length
+      ? `${transition.required ? "replacement assessed for" : "resident capacity assessed for"} ${models.join(", ")}`
+      : "",
+    reclaimable ? `${reclaimable} reclaimable by Ollama` : "",
   ].filter(Boolean);
   return parts.length ? parts.join("; ") : null;
 }
@@ -249,6 +342,8 @@ export default function JobFailureDetails({ job }: { job: Job }) {
     ? model.digest.slice(0, 12)
     : "";
   const context = diagnostics ? contextSummary(diagnostics) : null;
+  const safety = diagnostics ? safetySummary(diagnostics) : null;
+  const residentTransition = diagnostics ? residentTransitionSummary(diagnostics) : null;
   const reduction = diagnostics ? reductionSummary(diagnostics) : null;
   const cache = diagnostics ? cacheSummary(diagnostics) : null;
   const technicalError = job.error.trim();
@@ -256,6 +351,8 @@ export default function JobFailureDetails({ job }: { job: Job }) {
     diagnostics?.stage
     || modelSummary
     || context
+    || safety
+    || residentTransition
     || reduction
     || cache
     || diagnostics?.attempts?.length,
@@ -290,6 +387,18 @@ export default function JobFailureDetails({ job }: { job: Job }) {
             <>
               <dt>Context</dt>
               <dd>{context}</dd>
+            </>
+          )}
+          {safety && (
+            <>
+              <dt>Resource admission</dt>
+              <dd>{safety}</dd>
+            </>
+          )}
+          {residentTransition && (
+            <>
+              <dt>Ollama residency</dt>
+              <dd>{residentTransition}</dd>
             </>
           )}
           {reduction && (

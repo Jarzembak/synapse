@@ -159,6 +159,106 @@ def test_ollama_rejects_truncating_plan_before_transport(
     assert diagnostics["native_context"] == 12_288
 
 
+def test_ollama_uses_fresh_smaller_native_context_at_transport(monkeypatch):
+    from app import local_model_safety
+
+    monkeypatch.setattr(llm, "_known_native_context", lambda _model: 40_960)
+    monkeypatch.setattr(llm, "advanced", lambda _group: dict(LOCAL_CFG))
+    admissions: list[dict] = []
+
+    def admit(*_args, **kwargs):
+        admissions.append(kwargs)
+        return {
+            "model": "mutable:latest",
+            "digest": "fresh-digest",
+            "native_context_tokens": 8_192,
+            "assessment": {"tier": "recommended"},
+        }
+
+    monkeypatch.setattr(local_model_safety, "ensure_model_safe", admit)
+    sent = []
+    monkeypatch.setattr(
+        llm.httpx,
+        "post",
+        lambda *args, **kwargs: sent.append((args, kwargs)),
+    )
+
+    with pytest.raises(llm.ContextWindowError) as raised:
+        llm._ollama(
+            "system",
+            "x" * 18_000,
+            "mutable:latest",
+            2_000,
+            None,
+            restricted=True,
+            function="repository_reduce",
+        )
+
+    assert raised.value.native_context == 8_192
+    assert admissions[0]["refresh"] is True
+    assert len(admissions) == 2
+    assert sent == []
+    diagnostics = llm.last_call_diagnostics()
+    assert diagnostics["model_digest"] == "fresh-digest"
+    assert diagnostics["native_context"] == 8_192
+
+
+def test_ollama_safety_failure_exposes_resident_transition(monkeypatch):
+    from app import local_model_safety
+
+    monkeypatch.setattr(llm, "_known_native_context", lambda _model: 40_960)
+    monkeypatch.setattr(llm, "advanced", lambda _group: dict(LOCAL_CFG))
+    transition = {
+        "required": True,
+        "resident_models": ["mapper:latest"],
+        "replaced_models": ["mapper:latest"],
+        "reclaimable_ram_bytes": 1024,
+        "reclaimable_vram_bytes": 2048,
+    }
+
+    def reject(*_args, **kwargs):
+        assert kwargs["refresh"] is True
+        raise local_model_safety.LocalModelSafetyError(
+            "ollama_model_blocked",
+            "replacement still does not fit",
+            http_status=409,
+            model="reducer:latest",
+            digest="blocked-digest",
+            assessment={
+                "tier": "blocked",
+                "resident_transition": transition,
+            },
+        )
+
+    monkeypatch.setattr(local_model_safety, "ensure_model_safe", reject)
+    sent = []
+    monkeypatch.setattr(
+        llm.httpx,
+        "post",
+        lambda *args, **kwargs: sent.append((args, kwargs)),
+    )
+
+    with pytest.raises(
+        local_model_safety.LocalModelSafetyError,
+        match="replacement still does not fit",
+    ):
+        llm._ollama(
+            "system",
+            "small batch",
+            "reducer:latest",
+            512,
+            None,
+            restricted=True,
+            function="repository_reduce",
+        )
+
+    assert sent == []
+    diagnostics = llm.last_call_diagnostics()
+    assert diagnostics["model_digest"] == "blocked-digest"
+    assert diagnostics["safety_assessment"]["tier"] == "blocked"
+    assert diagnostics["resident_transition"] == transition
+
+
 def test_complete_exposes_call_plan_and_attempt_diagnostics(
     monkeypatch,
 ):
