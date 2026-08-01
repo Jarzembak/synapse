@@ -171,6 +171,91 @@ def test_evidence_map_cache_reuses_structured_summary(monkeypatch):
     assert second_coverage["cache"]["reused_chunk_summaries"] == 1
 
 
+@pytest.mark.parametrize(("runtime_digest", "error_pattern"), [
+    ("changed-map-digest", "changed digest"),
+    (None, "did not report a digest"),
+])
+def test_repository_map_unverified_digest_does_not_write_cache(
+    monkeypatch, runtime_digest, error_pattern,
+):
+    suffix = "missing" if runtime_digest is None else "changed"
+    project, source = _repository_project(f"map-digest-{suffix}")
+    with get_session() as session:
+        snapshot = RepositorySnapshot(
+            source_id=source.id,
+            requested_ref="main",
+            resolved_sha="9" * 40,
+            status="ready",
+        )
+        session.add(snapshot)
+        session.commit()
+        session.refresh(snapshot)
+        source_row = session.get(RepositorySource, source.id)
+        source_row.current_snapshot_id = snapshot.id
+        session.add(source_row)
+        repository_file = RepositoryFile(
+            snapshot_id=snapshot.id,
+            path="src/digest.py",
+            content_hash="digest-file",
+            line_count=1,
+        )
+        session.add(repository_file)
+        session.commit()
+        session.refresh(repository_file)
+        chunk = RepositoryChunk(
+            file_id=repository_file.id,
+            chunk_index=0,
+            evidence_id=f"EDIGESTMAP{suffix.upper()}",
+            start_line=1,
+            end_line=1,
+            body="VALUE = 1",
+            body_hash="digest-body",
+            content_hash="digest-body",
+        )
+        session.add(chunk)
+        session.commit()
+        session.refresh(chunk)
+        chunk_id = chunk.id
+        evidence = [{
+            "chunk_id": chunk.id,
+            "evidence_id": chunk.evidence_id,
+            "path": repository_file.path,
+            "start_line": 1,
+            "end_line": 1,
+            "body": chunk.body,
+            "kind": "source",
+            "symbol": "",
+        }]
+
+    monkeypatch.setattr(
+        llm, "resolve_model", lambda _function: ("ollama", "mutable-map"))
+    monkeypatch.setattr(
+        repository_tasks,
+        "_installed_model_digest",
+        lambda _provider, _model, **_kwargs: "pinned-map-digest",
+    )
+    monkeypatch.setattr(llm, "complete_json", lambda *_args, **_kwargs: {
+        "summary": "Valid map output.",
+        "facts": [],
+        "symbols": [],
+        "dependencies": [],
+        "commands": [],
+        "knowledge": [],
+    })
+    monkeypatch.setattr(llm, "last_call_diagnostics", lambda: {
+        "model_digest": runtime_digest,
+        "attempts": [{"status": "ok"}],
+    })
+
+    with pytest.raises(RuntimeError, match=error_pattern):
+        repository_tasks._map_evidence(0, project.id, evidence)
+
+    with get_session() as session:
+        stored = session.get(RepositoryChunk, chunk_id)
+        assert stored.summary_config_hash == ""
+        assert stored.summary_text == ""
+
+
 def test_repository_citations_are_validated_and_pinned_to_sha(monkeypatch):
     source = SimpleNamespace(canonical_url="https://github.com/example/demo")
     snapshot = SimpleNamespace(id=7, resolved_sha="b" * 40)
@@ -307,7 +392,7 @@ def test_repository_map_reuses_valid_legacy_rows_and_recomputes_empty_rows(
     monkeypatch.setattr(
         repository_tasks,
         "_installed_model_digest",
-        lambda _provider, _model: "sha256:current-map-model",
+        lambda _provider, _model, **_kwargs: "sha256:current-map-model",
     )
     legacy_base = repository_tasks._map_config_hash(
         "ollama", "legacy-map-model", contract_version=1)
@@ -383,6 +468,7 @@ def test_repository_map_reuses_valid_legacy_rows_and_recomputes_empty_rows(
         "native_context": 32_768,
         "timeout_seconds": 120,
         "max_output_tokens": 1_600,
+        "model_digest": "sha256:current-map-model",
         "attempts": [{"status": "ok"}],
     })
     summaries, coverage = repository_tasks._map_evidence(
@@ -547,7 +633,98 @@ def test_repository_reductions_are_cached_across_document_purposes(monkeypatch):
             job = session.get(Job, job_id)
             job.status = "done"
             session.add(job)
-        session.commit()
+            session.commit()
+
+
+@pytest.mark.parametrize(("runtime_digest", "error_pattern"), [
+    ("changed-reducer-digest", "changed digest"),
+    (None, "did not report a digest"),
+])
+def test_repository_reduction_unverified_digest_does_not_write_cache(
+    monkeypatch, runtime_digest, error_pattern,
+):
+    suffix = "missing" if runtime_digest is None else "changed"
+    _project, snapshot_id = _ready_snapshot(f"reduction-digest-{suffix}")
+    summaries = _reduction_summaries()
+    monkeypatch.setattr(repository_tasks, "_analysis_limits", _reduction_limits)
+    monkeypatch.setattr(
+        llm, "resolve_model", lambda _function: ("ollama", "mutable-reducer"))
+    monkeypatch.setattr(
+        repository_tasks,
+        "_installed_model_digest",
+        lambda _provider, _model, **_kwargs: "pinned-reducer-digest",
+    )
+    monkeypatch.setattr(
+        llm,
+        "complete_json",
+        lambda _function, _system, user, **_kwargs: _reduction_reply(
+            json.loads(user)),
+    )
+    monkeypatch.setattr(llm, "last_call_diagnostics", lambda: {
+        "model_digest": runtime_digest,
+        "attempts": [{"status": "ok"}],
+    })
+
+    with pytest.raises(RuntimeError, match=error_pattern):
+        repository_tasks._hierarchical_context(
+            0, snapshot_id, summaries, "repo_inventory", {"cache": {}})
+
+    with get_session() as session:
+        rows = session.exec(select(RepositorySynthesisCache).where(
+            RepositorySynthesisCache.snapshot_id == snapshot_id
+        )).all()
+        assert rows == []
+
+
+def test_repository_final_synthesis_missing_digest_does_not_write_artifact(
+    monkeypatch,
+):
+    source = SimpleNamespace(canonical_url="https://github.com/example/demo")
+    snapshot = SimpleNamespace(id=7, resolved_sha="b" * 40)
+    monkeypatch.setattr(
+        repository_tasks,
+        "_repository_context",
+        lambda *_args, **_kwargs: (source, snapshot, [], {}),
+    )
+    monkeypatch.setattr(
+        repository_tasks,
+        "_analysis_limits",
+        lambda: {"final_input_chars": 100_000},
+    )
+    monkeypatch.setattr(
+        repository_tasks, "_bounded_scan_facts", lambda *_args: ([], None))
+    monkeypatch.setattr(
+        repository_tasks, "_source_metadata", lambda *_args: {})
+    monkeypatch.setattr(
+        llm, "resolve_model", lambda _function: ("ollama", "mutable-writer"))
+    monkeypatch.setattr(
+        repository_tasks,
+        "_installed_model_digest",
+        lambda _provider, _model, **_kwargs: "pinned-writer-digest",
+    )
+    monkeypatch.setattr(repository_tasks, "progress", lambda *_args: None)
+    monkeypatch.setattr(
+        repository_tasks, "_update_job_diagnostics", lambda *_args: None)
+    monkeypatch.setattr(llm, "complete", lambda *_args, **_kwargs: "Draft")
+    monkeypatch.setattr(llm, "last_call_diagnostics", lambda: {
+        "attempts": [{"status": "ok"}],
+    })
+    monkeypatch.setattr(
+        repository_tasks,
+        "_write_repository_artifact",
+        lambda *_args, **_kwargs: pytest.fail(
+            "artifact was written without a verified model digest"),
+    )
+
+    with pytest.raises(RuntimeError, match="did not report a digest"):
+        repository_tasks.generate_repository_document(
+            1,
+            2,
+            artifact_type="repo_inventory",
+            function="repository_inventory",
+            prompt_name="repository_inventory",
+            title_prefix="Repository inventory",
+        )
 
 
 def test_repository_timeout_subdivides_without_repeating_identical_batch(monkeypatch):
@@ -656,6 +833,68 @@ def test_repository_single_item_contract_failure_is_transparent(monkeypatch):
     with pytest.raises(RuntimeError, match="single evidence summary cannot be reduced"):
         repository_tasks._hierarchical_context(
             0, snapshot_id, summaries, "repo_inventory", {"cache": {}})
+
+
+def test_repository_resource_safety_failure_does_not_subdivide(monkeypatch):
+    from app.local_model_safety import LocalModelSafetyError
+
+    _project, snapshot_id = _ready_snapshot("reduction-resource-safety")
+    summaries = _reduction_summaries(count=1, body_chars=1_500)
+    calls = 0
+    monkeypatch.setattr(repository_tasks, "_analysis_limits", _reduction_limits)
+    monkeypatch.setattr(
+        llm, "resolve_model",
+        lambda _function: ("ollama", "repository-reducer"),
+    )
+
+    def blocked(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        raise LocalModelSafetyError(
+            "ollama_model_blocked",
+            "replacement model still exceeds the safe resource budget",
+            http_status=409,
+            model="repository-reducer",
+            assessment={"tier": "blocked"},
+        )
+
+    monkeypatch.setattr(llm, "complete_json", blocked)
+    monkeypatch.setattr(llm, "last_call_diagnostics", lambda: {
+        "attempts": [{
+            "status": "error",
+            "error_type": "LocalModelSafetyError",
+            "error": "replacement model still exceeds the safe resource budget",
+        }],
+    })
+
+    with pytest.raises(RuntimeError) as raised:
+        repository_tasks._hierarchical_context(
+            0, snapshot_id, summaries, "repo_inventory", {"cache": {}})
+
+    message = str(raised.value)
+    assert calls == 1
+    assert "failure is not recoverable by subdivision" in message
+    assert "outcome=resource_safety" in message
+    assert "subdivision depth" not in message
+
+
+@pytest.mark.parametrize(("code", "outcome"), [
+    ("ollama_model_blocked", "resource_safety"),
+    ("ollama_model_not_installed", "model_not_installed"),
+    ("ollama_capability_mismatch", "capability_mismatch"),
+    ("future_safety_code", "model_safety"),
+])
+def test_repository_model_safety_outcomes_are_precise(code, outcome):
+    from app.local_model_safety import LocalModelSafetyError
+
+    error = LocalModelSafetyError(
+        code,
+        "model admission failed",
+        http_status=409,
+        model="fixture",
+    )
+
+    assert repository_tasks._reduction_failure(error, {}) == (outcome, False)
 
 
 def test_v4_upgrade_adds_repository_cache_and_diagnostics_without_losing_rows(

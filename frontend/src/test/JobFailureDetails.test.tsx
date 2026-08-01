@@ -111,6 +111,39 @@ describe("JobFailureDetails", () => {
       .not.toBeInTheDocument();
   });
 
+  it("shows resource admission and Ollama replacement diagnostics", () => {
+    const job = failedJob({
+      error: "model admission failed",
+      diagnostics: {
+        stage: "repository_reduce",
+        context: {
+          requested: 16384,
+          effective: 16384,
+          safety_assessment: {
+            tier: "blocked",
+            message: "The replacement model still exceeds the safe budget.",
+            estimated_total_bytes: 5 * 1024 ** 3,
+            resident_transition: {
+              required: true,
+              resident_models: ["mapper:latest"],
+              replaced_models: ["mapper:latest"],
+              reclaimable_ram_bytes: 1 * 1024 ** 3,
+              reclaimable_vram_bytes: 5 * 1024 ** 3,
+            },
+          },
+        },
+        cause: "The replacement model still exceeds the safe budget.",
+      },
+    });
+
+    render(<JobFailureDetails job={job} />);
+
+    expect(screen.getByText(/blocked; The replacement model still exceeds/))
+      .toHaveTextContent("estimated requirement 5 GiB");
+    expect(screen.getByText(/replacement assessed for mapper:latest/))
+      .toHaveTextContent("1 GiB RAM and 5 GiB VRAM reclaimable by Ollama");
+  });
+
   it("retains useful output for old jobs and malformed diagnostic strings", () => {
     expect(parseJobDiagnostics("model returned an empty response")).toEqual({
       cause: "model returned an empty response",

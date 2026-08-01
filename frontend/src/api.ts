@@ -303,12 +303,31 @@ export interface JobDiagnosticModel {
   digest?: string | null;
 }
 
+export interface JobDiagnosticResidentTransition {
+  required?: boolean | null;
+  resident_models?: string[] | null;
+  replaced_models?: string[] | null;
+  reclaimable_ram_bytes?: number | null;
+  reclaimable_vram_bytes?: number | null;
+}
+
+export interface JobDiagnosticSafetyAssessment {
+  tier?: string | null;
+  message?: string | null;
+  requested_context_tokens?: number | null;
+  estimated_total_bytes?: number | null;
+  acknowledged?: boolean | null;
+  resident_transition?: JobDiagnosticResidentTransition | null;
+}
+
 export interface JobDiagnosticContext {
   requested?: number | null;
   effective?: number | null;
   native?: number | null;
   timeout_seconds?: number | null;
   max_output_tokens?: number | null;
+  safety_assessment?: JobDiagnosticSafetyAssessment | null;
+  resident_transition?: JobDiagnosticResidentTransition | null;
 }
 
 export interface JobDiagnosticReduction {

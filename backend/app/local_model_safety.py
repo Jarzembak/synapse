@@ -375,35 +375,81 @@ def resource_assessment(
     }
 
 
+def _model_aliases(value: str) -> set[str]:
+    """Return equivalent Ollama names without mistaking a registry port for a tag."""
+    value = value.strip()
+    if not value:
+        return set()
+    aliases = {value}
+    final_component = value.rsplit("/", 1)[-1]
+    if ":" not in final_component:
+        aliases.add(value + ":latest")
+    elif final_component.endswith(":latest"):
+        aliases.add(value[:-len(":latest")])
+    return aliases
+
+
 def _canonical_model(rows: list[dict], requested: str) -> dict | None:
-    requested = requested.strip()
+    requested_names = _model_aliases(requested)
     for row in rows:
-        names = {str(row.get("name") or ""), str(row.get("model") or "")}
-        if requested in names:
-            return row
-        if ":" not in requested and requested + ":latest" in names:
+        names: set[str] = set()
+        for value in (row.get("name"), row.get("model")):
+            names.update(_model_aliases(str(value or "")))
+        if requested_names & names:
             return row
     return None
 
 
+def _resident_capacity(residents: list[dict] | dict | None) -> dict[str, object]:
+    """Describe memory Ollama can reclaim while scheduling another model."""
+    if isinstance(residents, dict):
+        residents = [residents]
+    rows = residents or []
+    ram_bytes = 0
+    vram_bytes = 0
+    models: list[str] = []
+    for resident in rows:
+        resident_size = max(0, int(resident.get("size") or 0))
+        resident_vram = max(0, int(resident.get("size_vram") or 0))
+        if resident_size:
+            resident_vram = min(resident_vram, resident_size)
+        resident_ram = max(0, resident_size - resident_vram)
+        ram_bytes += resident_ram
+        vram_bytes += resident_vram
+        name = str(resident.get("name") or resident.get("model") or "").strip()
+        if name and name not in models:
+            models.append(name)
+    return {
+        "models": models,
+        "ram_bytes": ram_bytes,
+        "vram_bytes": vram_bytes,
+    }
+
+
 def _resources_with_resident_capacity(
     resources: dict,
-    resident: dict | None,
+    residents: list[dict] | dict | None,
 ) -> dict:
-    """Avoid charging an already resident model's allocation a second time."""
-    if not resources.get("available") or not resident:
+    """Restore allocations that remain under Ollama scheduler control.
+
+    Runtime free-memory counters already include pressure from external
+    applications. Only allocations reported by Ollama's ``/api/ps`` are added
+    back, because Ollama can serialize a model transition and evict those
+    runners. Physical totals cap the restored values.
+    """
+    if not resources.get("available") or not residents:
         return resources
+    capacity = _resident_capacity(residents)
     adjusted = dict(resources)
-    resident_size = max(0, int(resident.get("size") or 0))
-    resident_vram = max(0, int(resident.get("size_vram") or 0))
-    resident_ram = max(0, resident_size - resident_vram)
     adjusted["vram_free_bytes"] = min(
         int(adjusted.get("vram_total_bytes") or 0),
-        int(adjusted.get("vram_free_bytes") or 0) + resident_vram,
+        int(adjusted.get("vram_free_bytes") or 0)
+        + int(capacity["vram_bytes"]),
     )
     adjusted["ram_available_bytes"] = min(
         int(adjusted.get("ram_total_bytes") or 0),
-        int(adjusted.get("ram_available_bytes") or 0) + resident_ram,
+        int(adjusted.get("ram_available_bytes") or 0)
+        + int(capacity["ram_bytes"]),
     )
     return adjusted
 
@@ -510,12 +556,12 @@ def model_catalog(*, refresh: bool = False) -> dict:
     general_context = max(1024, int(advanced("local")["num_ctx"]))
     profiles = _profiles()
     running = inventory.get("running_models") or []
+    assessment_resources = _resources_with_resident_capacity(resources, running)
+    result["ollama_reclaimable_capacity"] = _resident_capacity(running)
     rows = []
     for model in inventory["models"]:
         digest = model.get("digest") or ""
         resident = _canonical_model(running, model["name"])
-        assessment_resources = _resources_with_resident_capacity(
-            resources, resident)
         row = {
             key: value for key, value in model.items()
             if key != "model_info"
@@ -617,10 +663,8 @@ def acknowledge_blocked_model(
     actual_digest = str(row.get("digest") or "")
     if not actual_digest or digest != actual_digest:
         raise ValueError("the model digest changed; refresh the model catalog")
-    resources = _resources_with_resident_capacity(
-        runtime_resources(),
-        _canonical_model(inventory.get("running_models") or [], row["name"]),
-    )
+    running = inventory.get("running_models") or []
+    resources = _resources_with_resident_capacity(runtime_resources(), running)
     if not resources["available"]:
         raise ValueError(
             "remote Ollama resource overrides require a configured remote resource profile"
@@ -646,6 +690,33 @@ def acknowledge_blocked_model(
         requested_context=assessment["requested_context_tokens"],
         resources=resources,
     )
+
+
+def _validated_model_metadata(
+    row: dict,
+    *,
+    role: str,
+    requested_context: int,
+) -> tuple[set[str], int, str]:
+    """Validate one fresh installed-model row for its requested execution."""
+    capabilities = set(row.get("capabilities") or [])
+    required = "embedding" if role == "embedding" else "completion"
+    if capabilities and required not in capabilities:
+        raise LocalModelSafetyError(
+            "ollama_capability_mismatch",
+            f"Ollama model {row['name']!r} does not advertise the {required!r} capability",
+            http_status=422,
+            model=row["name"],
+            digest=row.get("digest") or "",
+        )
+    native_context = int(row.get("native_context_tokens") or 0)
+    warning = ""
+    if native_context and native_context < requested_context:
+        warning = (
+            f"the model advertises {native_context:,} context tokens, below "
+            f"the requested {requested_context:,}"
+        )
+    return capabilities, native_context, warning
 
 
 def ensure_model_safe(
@@ -680,32 +751,73 @@ def ensure_model_safe(
             http_status=422,
             model=model,
         )
-    capabilities = set(row.get("capabilities") or [])
-    required = "embedding" if role == "embedding" else "completion"
-    if capabilities and required not in capabilities:
-        raise LocalModelSafetyError(
-            "ollama_capability_mismatch",
-            f"Ollama model {row['name']!r} does not advertise the {required!r} capability",
-            http_status=422,
-            model=row["name"],
-            digest=row.get("digest") or "",
-        )
-    native_context = int(row.get("native_context_tokens") or 0)
-    warning = ""
-    if native_context and native_context < requested_context:
-        warning = (
-            f"the model advertises {native_context:,} context tokens, below "
-            f"the requested {requested_context:,}"
-        )
-    resources = _resources_with_resident_capacity(
-        runtime_resources(),
-        _canonical_model(inventory.get("running_models") or [], row["name"]),
+    capabilities, native_context, warning = _validated_model_metadata(
+        row,
+        role=role,
+        requested_context=requested_context,
     )
+    resources = runtime_resources()
     assessment = resource_assessment(
         row,
         requested_context=requested_context,
         resources=resources,
     )
+    resident_transition: dict[str, object] | None = None
+    if assessment["tier"] == "blocked" and inventory.get("local"):
+        # A cached inventory can predate the model that just finished a call.
+        # Refresh only after an apparent rejection, then assess the capacity
+        # available after Ollama replaces any managed resident runner. This
+        # does not forgive pressure from external processes and does not
+        # forcibly unload a model another request may still be using.
+        if refresh:
+            refreshed_inventory, refreshed_row = inventory, row
+        else:
+            refreshed_inventory, refreshed_row = inspect_model(model, refresh=True)
+        if refreshed_inventory.get("ok") and refreshed_row is None:
+            raise LocalModelSafetyError(
+                "ollama_model_not_installed",
+                f"Ollama model {model!r} is not installed",
+                http_status=422,
+                model=model,
+            )
+        if refreshed_inventory.get("ok") and refreshed_row is not None:
+            inventory, row = refreshed_inventory, refreshed_row
+            capabilities, native_context, warning = _validated_model_metadata(
+                row,
+                role=role,
+                requested_context=requested_context,
+            )
+            running = inventory.get("running_models") or []
+            capacity = _resident_capacity(running)
+            resources = _resources_with_resident_capacity(
+                runtime_resources(), running)
+            assessment = resource_assessment(
+                row,
+                requested_context=requested_context,
+                resources=resources,
+            )
+            other_models: list[str] = []
+            for resident_row in running:
+                if _canonical_model([resident_row], row["name"]) is not None:
+                    continue
+                resident_name = str(
+                    resident_row.get("name")
+                    or resident_row.get("model")
+                    or ""
+                ).strip()
+                if resident_name and resident_name not in other_models:
+                    other_models.append(resident_name)
+            resident_transition = {
+                "required": bool(other_models),
+                "resident_models": list(capacity["models"]),
+                "replaced_models": other_models,
+                "reclaimable_ram_bytes": int(capacity["ram_bytes"]),
+                "reclaimable_vram_bytes": int(capacity["vram_bytes"]),
+            }
+            assessment = {
+                **assessment,
+                "resident_transition": resident_transition,
+            }
     if assessment["tier"] == "blocked" and not assessment["acknowledged"]:
         raise LocalModelSafetyError(
             "ollama_model_blocked",
@@ -723,6 +835,7 @@ def ensure_model_safe(
         "native_context_tokens": native_context,
         "warning": warning,
         "assessment": assessment,
+        "resident_transition": resident_transition,
     }
 
 

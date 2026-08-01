@@ -383,6 +383,219 @@ def test_resident_model_allocation_is_not_charged_twice(monkeypatch):
     assert checked["assessment"]["tier"] != "blocked"
 
 
+def test_cached_ghost_resident_does_not_create_admission_capacity(monkeypatch):
+    from app import local_model_safety as safety
+
+    row = _row(name="ghost:latest", size=5 * GIB)
+    cached = _inventory(row)
+    cached["running_models"] = [{
+        "name": row["name"],
+        "size": 5 * GIB,
+        "size_vram": 5 * GIB,
+        "context_length": 8_192,
+    }]
+    refreshed = _inventory(row)
+    constrained = {
+        "available": True,
+        "reason": "",
+        "ram_total_bytes": 16 * GIB,
+        "ram_available_bytes": 3 * GIB,
+        "vram_total_bytes": 8 * GIB,
+        "vram_free_bytes": 2 * GIB,
+    }
+
+    monkeypatch.setattr(
+        safety,
+        "_fetch_inventory",
+        lambda refresh=False: refreshed if refresh else cached,
+    )
+    monkeypatch.setattr(safety, "runtime_resources", lambda: constrained)
+
+    with pytest.raises(safety.LocalModelSafetyError) as raised:
+        safety.ensure_model_safe(
+            row["name"], role="completion", requested_context=8_192)
+
+    assert raised.value.code == "ollama_model_blocked"
+    assert raised.value.assessment["resident_transition"] == {
+        "required": False,
+        "resident_models": [],
+        "replaced_models": [],
+        "reclaimable_ram_bytes": 0,
+        "reclaimable_vram_bytes": 0,
+    }
+
+
+def test_different_ollama_resident_is_reclaimable_for_model_transition(
+    monkeypatch,
+):
+    from app import local_model_safety as safety
+
+    reducer = _row(name="reducer:latest", size=4 * GIB)
+    inventory = _inventory(reducer)
+    inventory["running_models"] = [{
+        "name": "mapper:latest",
+        "size": 6 * GIB,
+        "size_vram": 5 * GIB,
+        "context_length": 16_384,
+    }]
+    constrained = {
+        "available": True,
+        "reason": "",
+        "ram_total_bytes": 16 * GIB,
+        "ram_available_bytes": 3 * GIB,
+        "vram_total_bytes": 8 * GIB,
+        "vram_free_bytes": 1 * GIB,
+    }
+    refreshes: list[bool] = []
+
+    def inventory_fixture(*, refresh=False):
+        refreshes.append(refresh)
+        return inventory
+
+    monkeypatch.setattr(safety, "_fetch_inventory", inventory_fixture)
+    monkeypatch.setattr(safety, "runtime_resources", lambda: constrained)
+
+    raw = safety.resource_assessment(
+        reducer, requested_context=16_384, resources=constrained)
+    assert raw["tier"] == "blocked"
+
+    checked = safety.ensure_model_safe(
+        reducer["name"], role="completion", requested_context=16_384)
+
+    assert refreshes == [False, True]
+    assert checked["assessment"]["tier"] != "blocked"
+    assert checked["resident_transition"] == {
+        "required": True,
+        "resident_models": ["mapper:latest"],
+        "replaced_models": ["mapper:latest"],
+        "reclaimable_ram_bytes": 1 * GIB,
+        "reclaimable_vram_bytes": 5 * GIB,
+    }
+
+
+def test_oversized_model_remains_blocked_after_resident_reclaim(monkeypatch):
+    from app import local_model_safety as safety
+
+    oversized = _row(name="oversized:latest", size=400 * GIB)
+    inventory = _inventory(oversized)
+    inventory["running_models"] = [{
+        "name": "mapper:latest",
+        "size": 6 * GIB,
+        "size_vram": 5 * GIB,
+        "context_length": 16_384,
+    }]
+    constrained = {
+        "available": True,
+        "reason": "",
+        "ram_total_bytes": 16 * GIB,
+        "ram_available_bytes": 3 * GIB,
+        "vram_total_bytes": 8 * GIB,
+        "vram_free_bytes": 1 * GIB,
+    }
+    monkeypatch.setattr(
+        safety, "_fetch_inventory", lambda refresh=False: inventory)
+    monkeypatch.setattr(safety, "runtime_resources", lambda: constrained)
+
+    with pytest.raises(safety.LocalModelSafetyError) as raised:
+        safety.ensure_model_safe(
+            oversized["name"], role="completion", requested_context=16_384)
+
+    assert raised.value.code == "ollama_model_blocked"
+    assert raised.value.assessment["tier"] == "blocked"
+    assert raised.value.assessment["resident_transition"]["required"] is True
+
+
+def test_refreshed_model_metadata_is_revalidated_before_transition(monkeypatch):
+    from app import local_model_safety as safety
+
+    stale = _row(name="mutable:latest", size=4 * GIB)
+    refreshed = _row(
+        name="mutable:latest",
+        digest="b" * 64,
+        size=4 * GIB,
+        capabilities=["embedding"],
+        context=2_048,
+    )
+    constrained = {
+        "available": True,
+        "reason": "",
+        "ram_total_bytes": 16 * GIB,
+        "ram_available_bytes": 3 * GIB,
+        "vram_total_bytes": 8 * GIB,
+        "vram_free_bytes": 1 * GIB,
+    }
+
+    def inventory_fixture(*, refresh=False):
+        return _inventory(refreshed if refresh else stale)
+
+    monkeypatch.setattr(safety, "_fetch_inventory", inventory_fixture)
+    monkeypatch.setattr(safety, "runtime_resources", lambda: constrained)
+
+    with pytest.raises(safety.LocalModelSafetyError) as raised:
+        safety.ensure_model_safe(
+            stale["name"], role="completion", requested_context=16_384)
+
+    assert raised.value.code == "ollama_capability_mismatch"
+    assert raised.value.digest == refreshed["digest"]
+
+
+def test_canonical_model_handles_default_tags_and_registry_ports():
+    from app import local_model_safety as safety
+
+    simple = {"name": "team/model:latest"}
+    registry = {"name": "registry:5000/team/model:latest"}
+
+    assert safety._canonical_model([simple], "team/model") is simple
+    assert safety._canonical_model([simple], "team/model:latest") is simple
+    assert safety._canonical_model(
+        [registry], "registry:5000/team/model") is registry
+
+
+def test_embedding_transport_forces_fresh_model_safety(monkeypatch):
+    from app import local_model_safety as safety
+    from app import search
+
+    admissions: list[dict] = []
+    monkeypatch.setattr(search, "embedding_provider", lambda: "ollama")
+    monkeypatch.setattr(
+        safety,
+        "ensure_model_safe",
+        lambda *_args, **kwargs: admissions.append(kwargs) or {},
+    )
+
+    class Response:
+        @staticmethod
+        def raise_for_status():
+            return None
+
+        @staticmethod
+        def json():
+            return {"embeddings": [[1.0, 2.0]]}
+
+    class Client:
+        def __init__(self, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        @staticmethod
+        def post(*_args, **_kwargs):
+            return Response()
+
+    monkeypatch.setattr(search.httpx, "Client", Client)
+
+    assert search.embed_texts(["evidence"], model="embed:latest") == [[1.0, 2.0]]
+    assert admissions == [{
+        "role": "embedding",
+        "requested_context": 2_048,
+        "refresh": True,
+    }]
+
+
 def test_benchmark_is_single_bounded_json_probe_and_persisted(monkeypatch):
     from app import local_model_safety as safety
 

@@ -21,6 +21,7 @@ from sqlmodel import select
 from .. import library, llm, repository as repository_store
 from ..config import advanced
 from ..db import get_session
+from ..local_model_safety import LocalModelSafetyError
 from ..models import (
     Artifact, Job, RepositoryChunk, RepositorySynthesisCache, utcnow,
 )
@@ -229,14 +230,19 @@ def _snapshot_bundle(project_id: int) -> tuple[object, object, list[dict]]:
     return source, snapshot, list(evidence)
 
 
-def _installed_model_digest(provider: str, model: str) -> str:
+def _installed_model_digest(
+    provider: str,
+    model: str,
+    *,
+    refresh: bool = False,
+) -> str:
     """Return immutable local-model identity for cache signatures."""
     if provider != "ollama":
         return "not_applicable"
     try:
         from ..local_model_safety import inspect_model
 
-        inventory, row = inspect_model(model)
+        inventory, row = inspect_model(model, refresh=refresh)
         if inventory.get("ok") and row:
             return str(row.get("digest") or "digest_unavailable")
     except Exception:
@@ -244,6 +250,30 @@ def _installed_model_digest(provider: str, model: str) -> str:
     # Successful work produced while inventory is temporarily unavailable gets
     # a distinct key and is safely recomputed once the digest becomes known.
     return "digest_unavailable"
+
+
+def _require_execution_digest(
+    provider: str,
+    model: str,
+    expected_digest: str,
+    call: dict,
+    *,
+    stage: str,
+) -> None:
+    """Refuse to cache work executed by weights other than the stage identity."""
+    if provider != "ollama":
+        return
+    actual_digest = str(call.get("model_digest") or "").strip()
+    if expected_digest != "digest_unavailable" and not actual_digest:
+        raise RuntimeError(
+            f"Ollama model {model!r} did not report a digest during {stage}; "
+            "no repository cache entry or artifact was written; rerun the step"
+        )
+    if actual_digest and actual_digest != expected_digest:
+        raise RuntimeError(
+            f"Ollama model {model!r} changed digest during {stage}; "
+            "no repository cache entry was written; rerun the step"
+        )
 
 
 def _map_config_hash(
@@ -405,6 +435,8 @@ def _diagnostic_context(call: dict, max_tokens: int) -> dict:
         "timeout_seconds": call.get("timeout_seconds"),
         "max_output_tokens": int(
             call.get("max_output_tokens") or max_tokens),
+        "safety_assessment": call.get("safety_assessment"),
+        "resident_transition": call.get("resident_transition"),
     }
 
 
@@ -436,7 +468,7 @@ def _call_detail(exc: Exception | None, call: dict) -> str:
 def _map_evidence(job_id: int, project_id: int, evidence: list[dict]) -> tuple[list[dict], dict]:
     selected, coverage = _select_evidence(evidence)
     provider, model = llm.resolve_model("repository_map")
-    model_digest = _installed_model_digest(provider, model)
+    model_digest = _installed_model_digest(provider, model, refresh=True)
     config_hash = _map_config_hash(
         provider, model, model_digest=model_digest)
     legacy_config_hash = _map_config_hash(
@@ -521,6 +553,14 @@ def _map_evidence(job_id: int, project_id: int, evidence: list[dict]) -> tuple[l
                 + chunk_body
                 + "\nEND UNTRUSTED REPOSITORY EXCERPT",
                 max_tokens=1_600, provider=provider, model=model,
+            )
+            call = _last_llm_diagnostics()
+            _require_execution_digest(
+                provider,
+                model,
+                model_digest,
+                call,
+                stage="repository evidence mapping",
             )
             summary = _sanitize_map(raw, item)
         except Exception as exc:
@@ -807,6 +847,12 @@ def _split_batch(batch: list[dict]) -> tuple[list[dict], list[dict]]:
 
 
 def _reduction_failure(exc: Exception, call: dict) -> tuple[str, bool]:
+    if isinstance(exc, LocalModelSafetyError):
+        return {
+            "ollama_model_blocked": "resource_safety",
+            "ollama_model_not_installed": "model_not_installed",
+            "ollama_capability_mismatch": "capability_mismatch",
+        }.get(exc.code, "model_safety"), False
     if isinstance(exc, (RepositoryMapContractError,
                         RepositoryReductionContractError)):
         return "invalid_structure", True
@@ -843,6 +889,7 @@ def _reduce_batch_adaptive(
     max_depth: int,
     provider: str,
     model: str,
+    model_digest: str,
     config_hash: str,
     cache_state: dict,
 ) -> list[dict]:
@@ -890,6 +937,13 @@ def _reduce_batch_adaptive(
             transient_attempts=1,
         )
         call = _last_llm_diagnostics()
+        _require_execution_digest(
+            provider,
+            model,
+            model_digest,
+            call,
+            stage="repository evidence reduction",
+        )
         allowed = {
             value for item in batch for value in _evidence_ids(item)
         }
@@ -936,25 +990,30 @@ def _reduce_batch_adaptive(
                     job_id, snapshot_id, purpose, level, batch_number,
                     batch_count, left, depth=depth + 1, limit=limit,
                     max_tokens=max_tokens, max_depth=max_depth,
-                    provider=provider, model=model, config_hash=config_hash,
+                    provider=provider, model=model, model_digest=model_digest,
+                    config_hash=config_hash,
                     cache_state=cache_state,
                 )
                 + _reduce_batch_adaptive(
                     job_id, snapshot_id, purpose, level, batch_number,
                     batch_count, right, depth=depth + 1, limit=limit,
                     max_tokens=max_tokens, max_depth=max_depth,
-                    provider=provider, model=model, config_hash=config_hash,
+                    provider=provider, model=model, model_digest=model_digest,
+                    config_hash=config_hash,
                     cache_state=cache_state,
                 )
             )
         evidence = sorted({
             value for item in batch for value in _evidence_ids(item)
         })
-        boundary = (
-            "single evidence summary cannot be reduced"
-            if len(batch) == 1
-            else f"subdivision depth {max_depth} was exhausted"
-        )
+        if not can_subdivide:
+            boundary = "failure is not recoverable by subdivision"
+        elif len(batch) == 1:
+            boundary = "single evidence summary cannot be reduced"
+        elif can_subdivide and depth >= max_depth:
+            boundary = f"subdivision depth {max_depth} was exhausted"
+        elif can_subdivide:
+            boundary = "the batch could not be divided further"
         raise RuntimeError(
             f"repository reduction failed at level {level}, batch "
             f"{batch_number}/{batch_count}: {boundary}; outcome={outcome}; "
@@ -993,7 +1052,7 @@ def _hierarchical_context(
     items = list(summaries)
     level = 0
     provider, model = llm.resolve_model("repository_reduce")
-    model_digest = _installed_model_digest(provider, model)
+    model_digest = _installed_model_digest(provider, model, refresh=True)
     max_tokens = limits["reduce_max_tokens"]
     max_depth = limits["reduce_max_subdivision_depth"]
     config_hash = _reduction_config_hash(
@@ -1063,7 +1122,8 @@ def _hierarchical_context(
                 job_id, snapshot_id, purpose, level, index, len(batches), batch,
                 depth=0, limit=limit, max_tokens=max_tokens,
                 max_depth=max_depth, provider=provider, model=model,
-                config_hash=config_hash, cache_state=cache_state,
+                model_digest=model_digest, config_hash=config_hash,
+                cache_state=cache_state,
             ))
         old_size = len(json.dumps(
             items, sort_keys=True, separators=(",", ":"), default=str))
@@ -1319,7 +1379,7 @@ def generate_repository_document(job_id: int, project_id: int, *,
         coverage.setdefault("warnings", []).append(facts_warning)
     metadata = _source_metadata(source, snapshot, coverage)
     provider, model = llm.resolve_model(function)
-    writer_digest = _installed_model_digest(provider, model)
+    writer_digest = _installed_model_digest(provider, model, refresh=True)
     progress(job_id, f"writing {title_prefix.lower()} ({model})")
     _update_job_diagnostics(job_id, {
         "stage": "repository_final_write",
@@ -1363,6 +1423,14 @@ def generate_repository_document(job_id: int, project_id: int, *,
         body = llm.complete(
             function, get_prompt(prompt_name), user,
             provider=provider, model=model, max_tokens=4_000).strip()
+        call = _last_llm_diagnostics()
+        _require_execution_digest(
+            provider,
+            model,
+            writer_digest,
+            call,
+            stage="repository final synthesis",
+        )
     except Exception as exc:
         call = _last_llm_diagnostics()
         outcome, _can_subdivide = _reduction_failure(exc, call)
@@ -1376,7 +1444,6 @@ def generate_repository_document(job_id: int, project_id: int, *,
             "cause": detail or outcome,
         })
         raise
-    call = _last_llm_diagnostics()
     coverage.setdefault("model_execution", {})["final_write"] = {
         "provider": provider,
         "model": model,

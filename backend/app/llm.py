@@ -607,18 +607,30 @@ def _ollama(system: str, user: str, model: str, max_tokens: int,
     # stale after another application consumes memory or a tag is updated to a
     # different digest.  Remote Ollama hosts retain capability checking but
     # report resource status as unavailable rather than using this host's RAM.
-    from .local_model_safety import ensure_model_safe
+    from .local_model_safety import LocalModelSafetyError, ensure_model_safe
 
-    safety = ensure_model_safe(
-        model,
-        role="completion",
-        requested_context=options["num_ctx"],
+    try:
+        safety = ensure_model_safe(
+            model,
+            role="completion",
+            requested_context=options["num_ctx"],
+            refresh=True,
+        )
+    except LocalModelSafetyError as exc:
+        failed_assessment = exc.assessment if isinstance(exc.assessment, dict) else {}
+        _update_diagnostics(
+            model_digest=exc.digest or None,
+            safety_assessment=exc.assessment,
+            resident_transition=failed_assessment.get("resident_transition"),
+        )
+        raise
+    _update_diagnostics(
+        model_digest=safety.get("digest") or None,
+        safety_assessment=safety.get("assessment"),
+        resident_transition=safety.get("resident_transition"),
     )
-    _update_diagnostics(model_digest=safety.get("digest") or None)
-    discovered_native = max(
-        native_context,
-        int(safety.get("native_context_tokens") or 0),
-    )
+    fresh_native_context = int(safety.get("native_context_tokens") or 0)
+    discovered_native = fresh_native_context or native_context
     if discovered_native and discovered_native != native_context:
         context_plan = _ollama_context_plan(
             system,
@@ -630,10 +642,26 @@ def _ollama(system: str, user: str, model: str, max_tokens: int,
         options["num_ctx"] = context_plan["effective_context"]
         if options["num_ctx"] != context_plan["requested_context"]:
             # Reassess resources against the context Ollama will actually use.
-            ensure_model_safe(
-                model,
-                role="completion",
-                requested_context=options["num_ctx"],
+            try:
+                safety = ensure_model_safe(
+                    model,
+                    role="completion",
+                    requested_context=options["num_ctx"],
+                )
+            except LocalModelSafetyError as exc:
+                failed_assessment = (
+                    exc.assessment if isinstance(exc.assessment, dict) else {})
+                _update_diagnostics(
+                    model_digest=exc.digest or None,
+                    safety_assessment=exc.assessment,
+                    resident_transition=failed_assessment.get(
+                        "resident_transition"),
+                )
+                raise
+            _update_diagnostics(
+                model_digest=safety.get("digest") or None,
+                safety_assessment=safety.get("assessment"),
+                resident_transition=safety.get("resident_transition"),
             )
     _update_diagnostics(
         function=function,
