@@ -846,6 +846,28 @@ def _split_batch(batch: list[dict]) -> tuple[list[dict], list[dict]]:
     return batch[:split_at], batch[split_at:]
 
 
+def _validated_singleton_passthrough(
+    batch: list[dict],
+    limit: int,
+) -> tuple[dict, int] | None:
+    """Return one already-valid, under-limit summary without rewriting it."""
+    if len(batch) != 1 or not isinstance(batch[0], dict):
+        return None
+    item = batch[0]
+    item_chars = len(json.dumps(item, sort_keys=True, default=str))
+    if item_chars > limit:
+        return None
+    allowed = set(_evidence_ids(item))
+    try:
+        # Validate the same evidence and content invariants required of a live
+        # reducer reply, but return the original record so no information is
+        # discarded merely because it fell at a packing boundary.
+        _sanitize_reduce(item, allowed)
+    except RepositoryReductionContractError:
+        return None
+    return item, item_chars
+
+
 def _reduction_failure(exc: Exception, call: dict) -> tuple[str, bool]:
     if isinstance(exc, LocalModelSafetyError):
         return {
@@ -892,6 +914,7 @@ def _reduce_batch_adaptive(
     model_digest: str,
     config_hash: str,
     cache_state: dict,
+    allow_singleton_passthrough: bool,
 ) -> list[dict]:
     input_json = json.dumps(
         batch, sort_keys=True, separators=(",", ":"), default=str)
@@ -908,6 +931,34 @@ def _reduce_batch_adaptive(
         "reduction": reduction_state,
         "cache": cache_state,
     })
+    if allow_singleton_passthrough:
+        passthrough = _validated_singleton_passthrough(batch, limit)
+        if passthrough is not None:
+            item, item_chars = passthrough
+            cache_state["singleton_passthroughs"] = int(
+                cache_state.get("singleton_passthroughs") or 0) + 1
+            progress(
+                job_id,
+                f"retaining valid {purpose} evidence singleton at level "
+                f"{level}, batch {batch_number}/{batch_count}",
+            )
+            _update_job_diagnostics(job_id, {
+                "reduction": reduction_state,
+                "cache": cache_state,
+                "attempts": [{
+                    "outcome": "singleton_passthrough",
+                    "level": level,
+                    "batch": batch_number,
+                    "depth": depth,
+                    "detail": (
+                        f"retained one valid {item_chars}-character evidence "
+                        f"summary unchanged within the {limit}-character limit"
+                    ),
+                }],
+                "cause": "",
+            })
+            return [item]
+
     depth_suffix = f", subdivision {depth}" if depth else ""
     progress(
         job_id,
@@ -993,6 +1044,7 @@ def _reduce_batch_adaptive(
                     provider=provider, model=model, model_digest=model_digest,
                     config_hash=config_hash,
                     cache_state=cache_state,
+                    allow_singleton_passthrough=allow_singleton_passthrough,
                 )
                 + _reduce_batch_adaptive(
                     job_id, snapshot_id, purpose, level, batch_number,
@@ -1001,6 +1053,7 @@ def _reduce_batch_adaptive(
                     provider=provider, model=model, model_digest=model_digest,
                     config_hash=config_hash,
                     cache_state=cache_state,
+                    allow_singleton_passthrough=allow_singleton_passthrough,
                 )
             )
         evidence = sorted({
@@ -1072,6 +1125,7 @@ def _hierarchical_context(
         "retained_leaf_maps": len(items),
         "reductions_reused": 0,
         "reductions_new": 0,
+        "singleton_passthroughs": 0,
     }
     _update_job_diagnostics(job_id, {
         "stage": "repository_reduce",
@@ -1117,6 +1171,8 @@ def _hierarchical_context(
             _update_job_diagnostics(job_id, {"cause": cause})
             raise RuntimeError(cause)
         reduced: list[dict] = []
+        allow_singleton_passthrough = any(
+            len(batch) > 1 for batch in batches)
         for index, batch in enumerate(batches, 1):
             reduced.extend(_reduce_batch_adaptive(
                 job_id, snapshot_id, purpose, level, index, len(batches), batch,
@@ -1124,6 +1180,7 @@ def _hierarchical_context(
                 max_depth=max_depth, provider=provider, model=model,
                 model_digest=model_digest, config_hash=config_hash,
                 cache_state=cache_state,
+                allow_singleton_passthrough=allow_singleton_passthrough,
             ))
         old_size = len(json.dumps(
             items, sort_keys=True, separators=(",", ":"), default=str))

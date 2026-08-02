@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from types import SimpleNamespace
 
 import pytest
@@ -727,9 +728,261 @@ def test_repository_final_synthesis_missing_digest_does_not_write_artifact(
         )
 
 
+def test_repository_under_limit_singleton_is_passed_through_losslessly(
+    monkeypatch,
+):
+    project, snapshot_id = _ready_snapshot("singleton-passthrough")
+    summaries = _reduction_summaries(count=5, body_chars=180)
+    singleton = summaries[-1]
+    singleton["role"] = "packing-boundary fixture"
+    singleton["facts"] = [{
+        "claim": "Retain this exact boundary summary.",
+        "kind": "architecture",
+        "evidence_ids": list(singleton["evidence_ids"]),
+    }]
+    expected_singleton = deepcopy(singleton)
+    assert [len(batch) for batch in repository_tasks._batches(
+        summaries, _reduction_limits()["reduce_batch_chars"]
+    )] == [2, 2, 1]
+
+    calls: list[list[dict]] = []
+    monkeypatch.setattr(repository_tasks, "_analysis_limits", _reduction_limits)
+    monkeypatch.setattr(
+        llm, "resolve_model",
+        lambda _function: ("ollama", "repository-reducer"),
+    )
+    monkeypatch.setattr(
+        repository_tasks,
+        "_installed_model_digest",
+        lambda *_args, **_kwargs: "digest_unavailable",
+    )
+
+    def complete_json(_function, _system, user, **_kwargs):
+        batch = json.loads(user)
+        calls.append(batch)
+        return _reduction_reply(batch)
+
+    monkeypatch.setattr(llm, "complete_json", complete_json)
+    monkeypatch.setattr(llm, "last_call_diagnostics", lambda: {
+        "attempts": [{"status": "ok"}],
+    })
+    with get_session() as session:
+        job = Job(
+            project_id=project.id, task="repo_inventory", status="running")
+        session.add(job)
+        session.commit()
+        session.refresh(job)
+        job_id = job.id
+
+    result = repository_tasks._hierarchical_context(
+        job_id, snapshot_id, summaries, "repo_inventory", {"cache": {}})
+
+    assert [len(batch) for batch in calls] == [2, 2]
+    retained = next(
+        item for item in result
+        if item.get("evidence_ids") == singleton["evidence_ids"])
+    assert retained == expected_singleton
+    assert repository_tasks._nested_evidence_ids(result) == {
+        f"EREDUCE{index:04d}" for index in range(5)
+    }
+    with get_session() as session:
+        rows = session.exec(select(RepositorySynthesisCache).where(
+            RepositorySynthesisCache.snapshot_id == snapshot_id
+        )).all()
+        assert len(rows) == 2
+        diagnostics = json.loads(session.get(Job, job_id).diagnostics)
+        outcomes = [item["outcome"] for item in diagnostics["attempts"]]
+        assert outcomes.count("singleton_passthrough") == 1
+        assert diagnostics["cache"]["singleton_passthroughs"] == 1
+        assert diagnostics["cache"]["reductions_new"] == 2
+        assert diagnostics["cause"] == ""
+        assert diagnostics["reduction"]["complete"] is True
+        job = session.get(Job, job_id)
+        job.status = "done"
+        session.add(job)
+        session.commit()
+
+
+def test_repository_subdivision_passes_through_valid_singleton(monkeypatch):
+    project, snapshot_id = _ready_snapshot("subdivision-singleton-passthrough")
+    summaries = _reduction_summaries(count=5, body_chars=150)
+    singleton = summaries[2]
+    expected_singleton = deepcopy(singleton)
+    assert [len(batch) for batch in repository_tasks._batches(
+        summaries, _reduction_limits()["reduce_batch_chars"]
+    )] == [3, 2]
+
+    calls: list[list[dict]] = []
+    monkeypatch.setattr(repository_tasks, "_analysis_limits", _reduction_limits)
+    monkeypatch.setattr(
+        llm, "resolve_model",
+        lambda _function: ("ollama", "repository-reducer"),
+    )
+    monkeypatch.setattr(
+        repository_tasks,
+        "_installed_model_digest",
+        lambda *_args, **_kwargs: "digest_unavailable",
+    )
+
+    def complete_json(_function, _system, user, **_kwargs):
+        batch = json.loads(user)
+        calls.append(batch)
+        if len(batch) == 3:
+            reply = _reduction_reply(batch)
+            reply["evidence_ids"] = reply["evidence_ids"][:1]
+            return reply
+        return _reduction_reply(batch)
+
+    monkeypatch.setattr(llm, "complete_json", complete_json)
+    monkeypatch.setattr(llm, "last_call_diagnostics", lambda: {
+        "attempts": [{"status": "ok"}],
+    })
+    with get_session() as session:
+        job = Job(
+            project_id=project.id, task="repo_inventory", status="running")
+        session.add(job)
+        session.commit()
+        session.refresh(job)
+        job_id = job.id
+
+    result = repository_tasks._hierarchical_context(
+        job_id, snapshot_id, summaries, "repo_inventory", {"cache": {}})
+
+    assert [len(batch) for batch in calls] == [3, 2, 2]
+    assert all(len(batch) != 1 for batch in calls)
+    retained = next(
+        item for item in result
+        if item.get("evidence_ids") == singleton["evidence_ids"])
+    assert retained == expected_singleton
+    assert repository_tasks._nested_evidence_ids(result) == {
+        f"EREDUCE{index:04d}" for index in range(5)
+    }
+    with get_session() as session:
+        rows = session.exec(select(RepositorySynthesisCache).where(
+            RepositorySynthesisCache.snapshot_id == snapshot_id
+        )).all()
+        assert len(rows) == 2
+        diagnostics = json.loads(session.get(Job, job_id).diagnostics)
+        outcomes = [item["outcome"] for item in diagnostics["attempts"]]
+        assert {"invalid_structure", "subdivided",
+                "singleton_passthrough", "ok"} <= set(outcomes)
+        assert diagnostics["cache"]["singleton_passthroughs"] == 1
+        assert diagnostics["cause"] == ""
+        job = session.get(Job, job_id)
+        job.status = "done"
+        session.add(job)
+        session.commit()
+
+
+def test_repository_all_singleton_level_still_uses_model_compression(monkeypatch):
+    project, snapshot_id = _ready_snapshot("all-singleton-compression")
+    summaries = _reduction_summaries(count=2, body_chars=500)
+    assert [len(batch) for batch in repository_tasks._batches(
+        summaries, _reduction_limits()["reduce_batch_chars"]
+    )] == [1, 1]
+
+    calls: list[list[dict]] = []
+    monkeypatch.setattr(repository_tasks, "_analysis_limits", _reduction_limits)
+    monkeypatch.setattr(
+        llm, "resolve_model",
+        lambda _function: ("ollama", "repository-reducer"),
+    )
+    monkeypatch.setattr(
+        repository_tasks,
+        "_installed_model_digest",
+        lambda *_args, **_kwargs: "digest_unavailable",
+    )
+
+    def complete_json(_function, _system, user, **_kwargs):
+        batch = json.loads(user)
+        calls.append(batch)
+        return _reduction_reply(batch)
+
+    monkeypatch.setattr(llm, "complete_json", complete_json)
+    monkeypatch.setattr(llm, "last_call_diagnostics", lambda: {
+        "attempts": [{"status": "ok"}],
+    })
+    with get_session() as session:
+        job = Job(
+            project_id=project.id, task="repo_inventory", status="running")
+        session.add(job)
+        session.commit()
+        session.refresh(job)
+        job_id = job.id
+
+    result = repository_tasks._hierarchical_context(
+        job_id, snapshot_id, summaries, "repo_inventory", {"cache": {}})
+
+    assert [len(batch) for batch in calls] == [1, 1]
+    assert repository_tasks._nested_evidence_ids(result) == {
+        "EREDUCE0000", "EREDUCE0001",
+    }
+    with get_session() as session:
+        diagnostics = json.loads(session.get(Job, job_id).diagnostics)
+        assert diagnostics["cache"]["singleton_passthroughs"] == 0
+        assert "singleton_passthrough" not in {
+            item["outcome"] for item in diagnostics["attempts"]
+        }
+        job = session.get(Job, job_id)
+        job.status = "done"
+        session.add(job)
+        session.commit()
+
+
+def test_repository_singleton_compression_without_progress_is_bounded(monkeypatch):
+    project, snapshot_id = _ready_snapshot("singleton-no-progress")
+    summaries = _reduction_summaries(count=2, body_chars=500)
+    assert [len(batch) for batch in repository_tasks._batches(
+        summaries, _reduction_limits()["reduce_batch_chars"]
+    )] == [1, 1]
+
+    calls: list[list[dict]] = []
+    monkeypatch.setattr(repository_tasks, "_analysis_limits", _reduction_limits)
+    monkeypatch.setattr(
+        llm, "resolve_model",
+        lambda _function: ("ollama", "repository-reducer"),
+    )
+    monkeypatch.setattr(
+        repository_tasks,
+        "_installed_model_digest",
+        lambda *_args, **_kwargs: "digest_unavailable",
+    )
+
+    def complete_json(_function, _system, user, **_kwargs):
+        batch = json.loads(user)
+        calls.append(batch)
+        return batch[0]
+
+    monkeypatch.setattr(llm, "complete_json", complete_json)
+    monkeypatch.setattr(llm, "last_call_diagnostics", lambda: {
+        "attempts": [{"status": "ok"}],
+    })
+    with get_session() as session:
+        job = Job(
+            project_id=project.id, task="repo_inventory", status="running")
+        session.add(job)
+        session.commit()
+        session.refresh(job)
+        job_id = job.id
+
+    with pytest.raises(RuntimeError, match="made no bounded progress"):
+        repository_tasks._hierarchical_context(
+            job_id, snapshot_id, summaries, "repo_inventory", {"cache": {}})
+
+    assert [len(batch) for batch in calls] == [1, 1]
+    with get_session() as session:
+        job = session.get(Job, job_id)
+        diagnostics = json.loads(job.diagnostics)
+        assert "made no bounded progress" in diagnostics["cause"]
+        assert diagnostics["cache"]["singleton_passthroughs"] == 0
+        job.status = "done"
+        session.add(job)
+        session.commit()
+
+
 def test_repository_timeout_subdivides_without_repeating_identical_batch(monkeypatch):
     project, snapshot_id = _ready_snapshot("adaptive-reduction-timeout")
-    summaries = _reduction_summaries()
+    summaries = _reduction_summaries(count=5, body_chars=150)
     attempted_inputs: list[list[dict]] = []
     latest = {"attempts": []}
     monkeypatch.setattr(repository_tasks, "_analysis_limits", _reduction_limits)
@@ -743,7 +996,7 @@ def test_repository_timeout_subdivides_without_repeating_identical_batch(monkeyp
         assert kwargs["retries"] == 0
         batch = json.loads(user)
         attempted_inputs.append(batch)
-        if len(batch) > 1:
+        if len(batch) > 2:
             latest.clear()
             latest.update({
                 "requested_context": 2_048,
@@ -788,20 +1041,22 @@ def test_repository_timeout_subdivides_without_repeating_identical_batch(monkeyp
         }},
     )
     assert repository_tasks._nested_evidence_ids(result) == {
-        f"EREDUCE{index:04d}" for index in range(4)
+        f"EREDUCE{index:04d}" for index in range(5)
     }
     attempted_hashes = [
         repository_tasks._digest(batch) for batch in attempted_inputs
     ]
     assert len(attempted_hashes) == len(set(attempted_hashes))
-    assert any(len(batch) > 1 for batch in attempted_inputs)
-    assert any(len(batch) == 1 for batch in attempted_inputs)
+    assert any(len(batch) > 2 for batch in attempted_inputs)
+    assert any(len(batch) == 2 for batch in attempted_inputs)
+    assert all(len(batch) != 1 for batch in attempted_inputs)
     with get_session() as session:
         job = session.get(Job, job_id)
         diagnostics = json.loads(job.diagnostics)
         outcomes = [item["outcome"] for item in diagnostics["attempts"]]
         assert "timeout" in outcomes
         assert "subdivided" in outcomes
+        assert "singleton_passthrough" in outcomes
         assert "ok" in outcomes
         assert diagnostics["cause"] == ""
         assert diagnostics["context"]["effective"] == 4_096
@@ -813,6 +1068,9 @@ def test_repository_timeout_subdivides_without_repeating_identical_batch(monkeyp
 def test_repository_single_item_contract_failure_is_transparent(monkeypatch):
     _project, snapshot_id = _ready_snapshot("single-reduction-failure")
     summaries = _reduction_summaries(count=1, body_chars=1_500)
+    assert repository_tasks._validated_singleton_passthrough(
+        summaries, _reduction_limits()["reduce_batch_chars"]
+    ) is None
     monkeypatch.setattr(repository_tasks, "_analysis_limits", _reduction_limits)
     monkeypatch.setattr(
         llm, "resolve_model",
