@@ -12,6 +12,7 @@ import json
 import logging
 import re
 from collections import defaultdict, deque
+from copy import deepcopy
 from pathlib import PurePosixPath
 from urllib.parse import quote
 
@@ -23,7 +24,8 @@ from ..config import advanced
 from ..db import get_session
 from ..local_model_safety import LocalModelSafetyError
 from ..models import (
-    Artifact, Job, RepositoryChunk, RepositorySynthesisCache, utcnow,
+    Artifact, Job, RepositoryChunk, RepositorySnapshot, RepositorySource,
+    RepositorySynthesisCache, utcnow,
 )
 from ..settings_store import get_setting
 from .celery_app import celery
@@ -47,6 +49,7 @@ _MANIFEST_SUFFIXES = {
 _SHARED_REDUCTION_PURPOSE = "shared_analysis"
 _MAP_CONTRACT_VERSION = 2
 _REDUCTION_CONTRACT_VERSION = 2
+_REDUCTION_PLANNER_VERSION = 2
 _MAX_REDUCTION_LEVELS = 12
 _MAX_DIAGNOSTIC_ATTEMPTS = 48
 _MAX_DIAGNOSTIC_DETAIL_CHARS = 500
@@ -117,6 +120,7 @@ def repository_analysis_signature() -> dict:
         "limits": _analysis_limits(),
         "map_contract_version": _MAP_CONTRACT_VERSION,
         "reduction_contract_version": _REDUCTION_CONTRACT_VERSION,
+        "reduction_planner_version": _REDUCTION_PLANNER_VERSION,
     }
 
 
@@ -170,8 +174,12 @@ def _ordered_evidence(evidence: list[dict]) -> list[dict]:
     return ordered
 
 
-def _select_evidence(evidence: list[dict]) -> tuple[list[dict], dict]:
-    limits = _analysis_limits()
+def _select_evidence(
+    evidence: list[dict],
+    *,
+    limits: dict[str, int] | None = None,
+) -> tuple[list[dict], dict]:
+    limits = dict(limits) if limits is not None else _analysis_limits()
     selected: list[dict] = []
     input_chars = 0
     skipped_chunks = 0
@@ -465,8 +473,14 @@ def _call_detail(exc: Exception | None, call: dict) -> str:
     return " | ".join(details)[:_MAX_DIAGNOSTIC_DETAIL_CHARS]
 
 
-def _map_evidence(job_id: int, project_id: int, evidence: list[dict]) -> tuple[list[dict], dict]:
-    selected, coverage = _select_evidence(evidence)
+def _map_evidence(
+    job_id: int,
+    project_id: int,
+    evidence: list[dict],
+    *,
+    limits: dict[str, int] | None = None,
+) -> tuple[list[dict], dict]:
+    selected, coverage = _select_evidence(evidence, limits=limits)
     provider, model = llm.resolve_model("repository_map")
     model_digest = _installed_model_digest(provider, model, refresh=True)
     config_hash = _map_config_hash(
@@ -915,6 +929,7 @@ def _reduce_batch_adaptive(
     config_hash: str,
     cache_state: dict,
     allow_singleton_passthrough: bool,
+    level_state: dict,
 ) -> list[dict]:
     input_json = json.dumps(
         batch, sort_keys=True, separators=(",", ":"), default=str)
@@ -937,6 +952,8 @@ def _reduce_batch_adaptive(
             item, item_chars = passthrough
             cache_state["singleton_passthroughs"] = int(
                 cache_state.get("singleton_passthroughs") or 0) + 1
+            level_state["singleton_passthroughs"] = int(
+                level_state.get("singleton_passthroughs") or 0) + 1
             progress(
                 job_id,
                 f"retaining valid {purpose} evidence singleton at level "
@@ -969,6 +986,8 @@ def _reduce_batch_adaptive(
     cached = _cached_reduction(snapshot_id, batch, config_hash)
     if cached is not None:
         cache_state["reductions_reused"] += 1
+        level_state["cache_hits"] = int(
+            level_state.get("cache_hits") or 0) + 1
         _update_job_diagnostics(job_id, {
             "reduction": reduction_state,
             "cache": cache_state,
@@ -976,6 +995,8 @@ def _reduce_batch_adaptive(
         return [cached]
 
     call: dict = {}
+    level_state["model_calls"] = int(
+        level_state.get("model_calls") or 0) + 1
     try:
         raw = llm.complete_json(
             "repository_reduce",
@@ -1009,6 +1030,8 @@ def _reduce_batch_adaptive(
     except Exception as exc:
         call = _last_llm_diagnostics() or call
         outcome, can_subdivide = _reduction_failure(exc, call)
+        outcomes = level_state.setdefault("outcome_counts", {})
+        outcomes[outcome] = int(outcomes.get(outcome) or 0) + 1
         detail = _call_detail(exc, call)
         _update_job_diagnostics(job_id, {
             "context": _diagnostic_context(call, max_tokens),
@@ -1024,6 +1047,8 @@ def _reduce_batch_adaptive(
         })
         if can_subdivide and len(batch) > 1 and depth < max_depth:
             left, right = _split_batch(batch)
+            level_state["subdivisions"] = int(
+                level_state.get("subdivisions") or 0) + 1
             _update_job_diagnostics(job_id, {
                 "attempts": [{
                     "outcome": "subdivided",
@@ -1045,6 +1070,7 @@ def _reduce_batch_adaptive(
                     config_hash=config_hash,
                     cache_state=cache_state,
                     allow_singleton_passthrough=allow_singleton_passthrough,
+                    level_state=level_state,
                 )
                 + _reduce_batch_adaptive(
                     job_id, snapshot_id, purpose, level, batch_number,
@@ -1054,6 +1080,7 @@ def _reduce_batch_adaptive(
                     config_hash=config_hash,
                     cache_state=cache_state,
                     allow_singleton_passthrough=allow_singleton_passthrough,
+                    level_state=level_state,
                 )
             )
         evidence = sorted({
@@ -1077,6 +1104,8 @@ def _reduce_batch_adaptive(
     _store_reduction(
         snapshot_id, batch, config_hash, provider, model, result)
     cache_state["reductions_new"] += 1
+    level_state["model_reductions_accepted"] = int(
+        level_state.get("model_reductions_accepted") or 0) + 1
     _update_job_diagnostics(job_id, {
         "context": _diagnostic_context(call, max_tokens),
         "reduction": reduction_state,
@@ -1099,9 +1128,14 @@ def _hierarchical_context(
     summaries: list[dict],
     purpose: str,
     coverage: dict,
+    *,
+    source=None,
+    snapshot=None,
+    limits: dict[str, int] | None = None,
 ) -> list[dict]:
-    limits = _analysis_limits()
-    limit = min(limits["reduce_batch_chars"], limits["final_input_chars"] // 2)
+    limits = dict(limits) if limits is not None else _analysis_limits()
+    batch_input_limit = limits["reduce_batch_chars"]
+    final_input_limit = limits["final_input_chars"]
     items = list(summaries)
     level = 0
     provider, model = llm.resolve_model("repository_reduce")
@@ -1115,7 +1149,76 @@ def _hierarchical_context(
         "model": model,
         "digest": model_digest,
         "contract_version": _REDUCTION_CONTRACT_VERSION,
+        "planner_version": _REDUCTION_PLANNER_VERSION,
     }
+    if source is None or snapshot is None:
+        with get_session() as session:
+            snapshot = session.get(RepositorySnapshot, snapshot_id)
+            if snapshot is None:
+                raise RuntimeError("repository snapshot disappeared during reduction")
+            source = session.get(RepositorySource, snapshot.source_id)
+            if source is None:
+                raise RuntimeError("repository source disappeared during reduction")
+            session.expunge(snapshot)
+            session.expunge(source)
+
+    empty_writer_base, _facts, _warning = _repository_writer_base(
+        source, snapshot, coverage, [], final_budget=final_input_limit)
+    writer_overhead_chars = len(empty_writer_base) - len("[]")
+    if writer_overhead_chars + len("[]") > final_input_limit:
+        writer_base_chars = writer_overhead_chars + len("[]")
+        cause = (
+            "repository fixed metadata and scan facts exceed the configured "
+            f"final input budget with an empty evidence list: "
+            f"{writer_base_chars}/{final_input_limit} chars; evidence "
+            "reduction cannot reduce this fixed input"
+        )
+        _update_job_diagnostics(job_id, {
+            "stage": "repository_reduce",
+            "effective_model": {
+                "provider": provider,
+                "model": model,
+                "digest": model_digest,
+            },
+            "reduction": {
+                "purpose": purpose,
+                "level": 0,
+                "batch": 0,
+                "batch_count": 0,
+                "items": len(items),
+                "input_chars": len(json.dumps(
+                    items, sort_keys=True, default=str)),
+                "subdivision_depth": 0,
+                "batch_input_limit_chars": batch_input_limit,
+                "writer_input_chars": writer_base_chars,
+                "writer_input_limit_chars": final_input_limit,
+                "writer_overhead_chars": writer_overhead_chars,
+                "complete": False,
+            },
+            "stagnation": {
+                "reason": "fixed_writer_overhead_exceeds_budget",
+                "level": 0,
+                "batch_input_limit_chars": batch_input_limit,
+                "writer_input_limit_chars": final_input_limit,
+                "evidence_context_chars": len("[]"),
+                "output_writer_chars": writer_base_chars,
+                "writer_overhead_chars": writer_overhead_chars,
+                "evidence_id_count_before": len(
+                    _nested_evidence_ids(items)),
+                "evidence_id_count_after": len(
+                    _nested_evidence_ids(items)),
+                "evidence_preserved": True,
+            },
+            "cause": cause,
+        })
+        raise RuntimeError(cause)
+
+    def writer_state(candidate: list[dict]) -> tuple[int, int]:
+        context_chars = len(json.dumps(
+            candidate, sort_keys=True, default=str))
+        return writer_overhead_chars + context_chars, context_chars
+
+    writer_input_chars, evidence_context_chars = writer_state(items)
     map_cache = coverage.get("cache") if isinstance(coverage, dict) else {}
     map_cache = map_cache if isinstance(map_cache, dict) else {}
     cache_state = {
@@ -1147,21 +1250,19 @@ def _hierarchical_context(
             "batch": 0,
             "batch_count": 0,
             "items": len(items),
-            "input_chars": len(json.dumps(items, default=str)),
+            "input_chars": evidence_context_chars,
             "subdivision_depth": 0,
+            "batch_input_limit_chars": batch_input_limit,
+            "writer_input_chars": writer_input_chars,
+            "writer_input_limit_chars": final_input_limit,
+            "writer_overhead_chars": writer_overhead_chars,
         },
         "cache": cache_state,
         "attempts": [],
         "cause": "",
     })
-    while True:
-        batches = _batches(items, limit)
-        has_oversized_item = any(
-            len(json.dumps(item, sort_keys=True, default=str)) > limit
-            for item in items
-        )
-        if len(batches) <= 1 and not has_oversized_item:
-            break
+    while writer_input_chars > final_input_limit:
+        batches = _batches(items, batch_input_limit)
         level += 1
         if level > _MAX_REDUCTION_LEVELS:
             cause = (
@@ -1171,29 +1272,118 @@ def _hierarchical_context(
             _update_job_diagnostics(job_id, {"cause": cause})
             raise RuntimeError(cause)
         reduced: list[dict] = []
+        level_state = {
+            "model_calls": 0,
+            "model_reductions_accepted": 0,
+            "cache_hits": 0,
+            "singleton_passthroughs": 0,
+            "subdivisions": 0,
+            "outcome_counts": {},
+        }
         allow_singleton_passthrough = any(
             len(batch) > 1 for batch in batches)
         for index, batch in enumerate(batches, 1):
             reduced.extend(_reduce_batch_adaptive(
                 job_id, snapshot_id, purpose, level, index, len(batches), batch,
-                depth=0, limit=limit, max_tokens=max_tokens,
+                depth=0, limit=batch_input_limit, max_tokens=max_tokens,
                 max_depth=max_depth, provider=provider, model=model,
                 model_digest=model_digest, config_hash=config_hash,
                 cache_state=cache_state,
                 allow_singleton_passthrough=allow_singleton_passthrough,
+                level_state=level_state,
             ))
         old_size = len(json.dumps(
-            items, sort_keys=True, separators=(",", ":"), default=str))
+            items, sort_keys=True, default=str))
         new_size = len(json.dumps(
-            reduced, sort_keys=True, separators=(",", ":"), default=str))
-        if len(reduced) >= len(items) and new_size >= old_size:
+            reduced, sort_keys=True, default=str))
+        new_writer_input_chars, _new_context_chars = writer_state(reduced)
+        before_ids = _nested_evidence_ids(items)
+        after_ids = _nested_evidence_ids(reduced)
+        evidence_preserved = before_ids == after_ids
+        if not evidence_preserved:
             cause = (
-                "repository reduction made no bounded progress; "
-                "a single structured summary may exceed the reduction budget"
+                f"repository reduction changed the evidence ledger at level "
+                f"{level}; before={len(before_ids)} ids, after={len(after_ids)} ids"
             )
             _update_job_diagnostics(job_id, {"cause": cause})
             raise RuntimeError(cause)
+        if (len(reduced) >= len(items) and new_size >= old_size
+                and new_writer_input_chars > final_input_limit):
+            accepted_total = (
+                int(level_state["model_reductions_accepted"])
+                + int(level_state["cache_hits"])
+            )
+            if accepted_total:
+                stagnation_reason = "accepted_reductions_did_not_shrink"
+            elif level_state["singleton_passthroughs"]:
+                stagnation_reason = "all_multi_item_reductions_failed"
+            else:
+                stagnation_reason = "no_bounded_progress"
+            outcomes = ", ".join(
+                f"{name}={count}" for name, count in sorted(
+                    level_state["outcome_counts"].items())) or "none"
+            cause = (
+                f"repository reduction made no bounded progress at level {level}: "
+                f"{len(items)} summaries ({old_size} chars) became "
+                f"{len(reduced)} ({new_size} chars); writer base "
+                f"{new_writer_input_chars}/{final_input_limit} chars; "
+                f"model_calls={level_state['model_calls']}, "
+                f"accepted={accepted_total}, "
+                f"outcomes={outcomes}; evidence retained"
+            )
+            stagnation = {
+                "reason": stagnation_reason,
+                "level": level,
+                "batch_input_limit_chars": batch_input_limit,
+                "writer_input_limit_chars": final_input_limit,
+                "input_items": len(items),
+                "output_items": len(reduced),
+                "input_chars": old_size,
+                "output_chars": new_size,
+                "input_writer_chars": writer_input_chars,
+                "output_writer_chars": new_writer_input_chars,
+                "writer_overhead_chars": writer_overhead_chars,
+                "item_delta": len(reduced) - len(items),
+                "char_delta": new_size - old_size,
+                "top_level_batches": len(batches),
+                "model_calls": level_state["model_calls"],
+                "model_reductions_accepted": level_state[
+                    "model_reductions_accepted"],
+                "cache_hits": level_state["cache_hits"],
+                "accepted_reductions_total": accepted_total,
+                # Retain the original field for older clients that already
+                # parse persisted diagnostics.
+                "accepted_reductions": accepted_total,
+                "singleton_passthroughs": level_state[
+                    "singleton_passthroughs"],
+                "subdivisions": level_state["subdivisions"],
+                "outcome_counts": level_state["outcome_counts"],
+                "evidence_id_count_before": len(before_ids),
+                "evidence_id_count_after": len(after_ids),
+                "evidence_preserved": True,
+            }
+            _update_job_diagnostics(job_id, {
+                "reduction": {
+                    "purpose": purpose,
+                    "level": level,
+                    "batch": 0,
+                    "batch_count": len(batches),
+                    "items": len(reduced),
+                    "input_chars": new_size,
+                    "subdivision_depth": 0,
+                    "batch_input_limit_chars": batch_input_limit,
+                    "writer_input_chars": new_writer_input_chars,
+                    "writer_input_limit_chars": final_input_limit,
+                    "writer_overhead_chars": writer_overhead_chars,
+                    "complete": False,
+                },
+                "stagnation": stagnation,
+                "cause": cause,
+            })
+            raise RuntimeError(cause)
         items = reduced
+        writer_input_chars = new_writer_input_chars
+        evidence_context_chars = new_size
     _update_job_diagnostics(job_id, {
         "reduction": {
             "purpose": purpose,
@@ -1201,8 +1391,12 @@ def _hierarchical_context(
             "batch": 0,
             "batch_count": 0,
             "items": len(items),
-            "input_chars": len(json.dumps(items, default=str)),
+            "input_chars": evidence_context_chars,
             "subdivision_depth": 0,
+            "batch_input_limit_chars": batch_input_limit,
+            "writer_input_chars": writer_input_chars,
+            "writer_input_limit_chars": final_input_limit,
+            "writer_overhead_chars": writer_overhead_chars,
             "complete": True,
         },
         "cache": cache_state,
@@ -1211,9 +1405,17 @@ def _hierarchical_context(
     return items
 
 
-def _repository_context(job_id: int, project_id: int, purpose: str) -> tuple[object, object, list[dict], dict]:
+def _repository_context(
+    job_id: int,
+    project_id: int,
+    purpose: str,
+    *,
+    limits: dict[str, int] | None = None,
+) -> tuple[object, object, list[dict], dict]:
+    limits = dict(limits) if limits is not None else _analysis_limits()
     source, snapshot, evidence = _snapshot_bundle(project_id)
-    summaries, coverage = _map_evidence(job_id, project_id, evidence)
+    summaries, coverage = _map_evidence(
+        job_id, project_id, evidence, limits=limits)
     scan_facts = _scan_facts(snapshot)
     scan_coverage = scan_facts.get("coverage", {})
     if not isinstance(scan_coverage, dict):
@@ -1237,7 +1439,8 @@ def _repository_context(job_id: int, project_id: int, purpose: str) -> tuple[obj
         "omitted_link_count": int(scan_coverage.get("omitted_link_count") or 0),
     })
     context = _hierarchical_context(
-        job_id, snapshot.id, summaries, purpose, coverage)
+        job_id, snapshot.id, summaries, purpose, coverage,
+        source=source, snapshot=snapshot, limits=limits)
     return source, snapshot, context, coverage
 
 
@@ -1302,6 +1505,43 @@ def _source_metadata(source, snapshot, coverage: dict) -> dict:
         "execution_performed": False,
         "coverage": coverage,
     }
+
+
+def _repository_writer_base(
+    source,
+    snapshot,
+    coverage: dict,
+    context: list[dict],
+    *,
+    final_budget: int,
+) -> tuple[str, dict, str | None]:
+    """Build the exact bounded payload prefix used by the final writer.
+
+    Hierarchical completion must use the same serialization as the actual
+    writer.  A copied coverage object keeps fit checks side-effect free while
+    still accounting for the scan-fact warning that the final artifact records.
+    """
+    facts, facts_warning = _bounded_scan_facts(
+        snapshot, max(8_000, final_budget // 5))
+    metadata_coverage = deepcopy(coverage)
+    # Cache hit counters are operational telemetry. They remain on the
+    # artifact coverage and job diagnostics, but must not make an equivalent
+    # cache-reuse run produce a different model prompt.
+    metadata_coverage.pop("cache", None)
+    if facts_warning:
+        warnings = metadata_coverage.setdefault("warnings", [])
+        if facts_warning not in warnings:
+            warnings.append(facts_warning)
+    metadata = _source_metadata(source, snapshot, metadata_coverage)
+    base = (
+        "PINNED REPOSITORY METADATA:\n"
+        + json.dumps(metadata, sort_keys=True, default=str)
+        + "\n\nDETERMINISTIC STATIC SCAN FACTS:\n"
+        + json.dumps(facts, sort_keys=True, default=str)
+        + "\n\nHIERARCHICAL EVIDENCE SUMMARIES (untrusted data):\n"
+        + json.dumps(context, sort_keys=True, default=str)
+    )
+    return base, facts, facts_warning
 
 
 def _citation_map(evidence: list[dict]) -> dict[str, dict]:
@@ -1382,7 +1622,8 @@ def _coverage_notice(coverage: dict) -> str:
 def _write_repository_artifact(project_id: int, artifact_type: str,
                                title_prefix: str, body: str, *, provider: str,
                                model: str, source, snapshot, coverage: dict,
-                               citation_count: int) -> int:
+                               citation_count: int,
+                               analysis_signature: dict | None = None) -> int:
     with get_session() as session:
         project = get_project(session, project_id)
         existing = session.exec(select(Artifact).where(
@@ -1401,6 +1642,24 @@ def _write_repository_artifact(project_id: int, artifact_type: str,
             current_sha = str(getattr(snapshot, "resolved_sha", ""))
             if previous_commit and previous_commit != current_sha:
                 history_snapshot = library.snapshot_history(existing.path)
+        input_hash_override = None
+        config_hash_override = None
+        provenance_override = None
+        if analysis_signature is not None:
+            # Artifact publication normally resolves configuration at write
+            # time. Preserve the analysis limits and planner contracts that
+            # this job actually used if settings changed while the model was
+            # running.
+            from .. import provenance as provenance_store
+
+            input_hash_override, _config_hash, captured = (
+                provenance_store.capture_for_artifact(
+                    session, project_id, artifact_type))
+            provenance_override = deepcopy(captured)
+            config = provenance_override.setdefault("config", {})
+            repository_config = config.setdefault("repository", {})
+            repository_config["analysis"] = deepcopy(analysis_signature)
+            config_hash_override = _digest(config)
         art = library.write_artifact(
             session, project_id=project_id, project_slug=project.slug,
             type=artifact_type, title=f"{title_prefix} — {project.title}",
@@ -1418,6 +1677,9 @@ def _write_repository_artifact(project_id: int, artifact_type: str,
                 "previous_commit": previous_commit or None,
                 "history_snapshot": history_snapshot,
             },
+            input_hash_override=input_hash_override,
+            config_hash_override=config_hash_override,
+            provenance_override=provenance_override,
         )
         auto_tag(project_id, art.id)
         return art.id
@@ -1428,13 +1690,15 @@ def generate_repository_document(job_id: int, project_id: int, *,
                                  prompt_name: str, title_prefix: str,
                                  additional_context: str = "",
                                  additional_warnings: list[str] | None = None) -> int:
+    analysis_signature = repository_analysis_signature()
+    limits = dict(analysis_signature["limits"])
     source, snapshot, context, coverage = _repository_context(
-        job_id, project_id, artifact_type)
-    final_budget = _analysis_limits()["final_input_chars"]
-    facts, facts_warning = _bounded_scan_facts(snapshot, max(8_000, final_budget // 5))
-    if facts_warning:
-        coverage.setdefault("warnings", []).append(facts_warning)
-    metadata = _source_metadata(source, snapshot, coverage)
+        job_id, project_id, artifact_type, limits=limits)
+    final_budget = limits["final_input_chars"]
+    base, facts, facts_warning = _repository_writer_base(
+        source, snapshot, coverage, context, final_budget=final_budget)
+    if facts_warning and facts_warning not in coverage.setdefault("warnings", []):
+        coverage["warnings"].append(facts_warning)
     provider, model = llm.resolve_model(function)
     writer_digest = _installed_model_digest(provider, model, refresh=True)
     progress(job_id, f"writing {title_prefix.lower()} ({model})")
@@ -1454,14 +1718,6 @@ def generate_repository_document(job_id: int, project_id: int, *,
         },
         "cause": "",
     })
-    base = (
-        "PINNED REPOSITORY METADATA:\n"
-        + json.dumps(metadata, sort_keys=True, default=str)
-        + "\n\nDETERMINISTIC STATIC SCAN FACTS:\n"
-        + json.dumps(facts, sort_keys=True, default=str)
-        + "\n\nHIERARCHICAL EVIDENCE SUMMARIES (untrusted data):\n"
-        + json.dumps(context, sort_keys=True, default=str)
-    )
     user = base
     if additional_context:
         prefix = "\n\nPRIOR REPOSITORY GUIDES (untrusted data):\n"
@@ -1471,7 +1727,8 @@ def generate_repository_document(job_id: int, project_id: int, *,
             coverage.setdefault("warnings", []).append(
                 f"Prior guide context was limited to {len(excerpt)} characters by the "
                 "shared final synthesis budget.")
-        user += prefix + excerpt
+        if excerpt:
+            user += prefix + excerpt
     if len(user) > final_budget:
         raise RuntimeError(
             "repository synthesis context exceeds the configured final input budget; "
@@ -1538,7 +1795,8 @@ def generate_repository_document(job_id: int, project_id: int, *,
     return _write_repository_artifact(
         project_id, artifact_type, title_prefix, body, provider=provider,
         model=model, source=source, snapshot=snapshot, coverage=coverage,
-        citation_count=citation_count)
+        citation_count=citation_count,
+        analysis_signature=analysis_signature)
 
 
 def _bounded_guide_context(project_id: int, total_chars: int = 24_000) \

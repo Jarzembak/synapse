@@ -144,6 +144,130 @@ describe("JobFailureDetails", () => {
       .toHaveTextContent("1 GiB RAM and 5 GiB VRAM reclaimable by Ollama");
   });
 
+  it("parses and presents exact repository reduction stagnation diagnostics", () => {
+    const diagnostics = parseJobDiagnostics(JSON.stringify({
+      stage: "repository_reduce",
+      stagnation: {
+        reason: "all_multi_item_reductions_failed",
+        level: "1",
+        batch_input_limit_chars: "20000",
+        writer_input_limit_chars: "64000",
+        input_items: "11",
+        output_items: "11",
+        input_chars: "51052",
+        output_chars: "51052",
+        input_writer_chars: "66179",
+        output_writer_chars: "66179",
+        writer_overhead_chars: "15127",
+        item_delta: "0",
+        char_delta: "0",
+        top_level_batches: "3",
+        model_calls: "7",
+        model_reductions_accepted: "0",
+        accepted_reductions: "0",
+        accepted_reductions_total: "0",
+        cache_hits: "0",
+        singleton_passthroughs: "11",
+        subdivisions: "7",
+        outcome_counts: { invalid_structure: "7" },
+        evidence_id_count_before: "11",
+        evidence_id_count_after: "11",
+        evidence_preserved: true,
+      },
+      cause: "Repository reduction made no bounded progress.",
+    }));
+
+    expect(diagnostics?.stagnation).toMatchObject({
+      reason: "all_multi_item_reductions_failed",
+      level: 1,
+      writer_input_limit_chars: 64000,
+      input_writer_chars: 66179,
+      output_writer_chars: 66179,
+      writer_overhead_chars: 15127,
+      item_delta: 0,
+      char_delta: 0,
+      model_calls: 7,
+      model_reductions_accepted: 0,
+      accepted_reductions_total: 0,
+      cache_hits: 0,
+      singleton_passthroughs: 11,
+      subdivisions: 7,
+      outcome_counts: { invalid_structure: 7 },
+      evidence_preserved: true,
+    });
+
+    render(<JobFailureDetails job={failedJob({
+      task: "repo_architecture",
+      error: "Repository reduction made no bounded progress.",
+      diagnostics,
+    })} />);
+
+    const summary = screen.getByText(/all multi item reductions failed at level 1/);
+    expect(summary).toHaveTextContent(
+      "writer base 66,179 to 66,179 characters against a 64,000-character limit",
+    );
+    expect(summary).toHaveTextContent(
+      "fixed writer overhead 15,127 characters within the 64,000-character limit",
+    );
+    expect(summary).toHaveTextContent("items 11 to 11 (delta 0)");
+    expect(summary).toHaveTextContent("evidence 51,052 to 51,052 characters (delta 0)");
+    expect(summary).toHaveTextContent(
+      "7 model calls; 0 model reductions accepted; 0 cached reductions reused",
+    );
+    expect(summary).toHaveTextContent("11 singleton passthroughs; 7 subdivisions");
+    expect(summary).toHaveTextContent("evidence IDs preserved (11 to 11)");
+  });
+
+  it("shows when fixed repository writer overhead exceeds the budget", () => {
+    render(<JobFailureDetails job={failedJob({
+      task: "repo_inventory",
+      error: "Repository fixed input exceeds the budget.",
+      diagnostics: {
+        stage: "repository_reduce",
+        stagnation: {
+          reason: "fixed_writer_overhead_exceeds_budget",
+          level: 0,
+          writer_input_limit_chars: 64000,
+          evidence_context_chars: 2,
+          output_writer_chars: 70117,
+          writer_overhead_chars: 70115,
+          evidence_id_count_before: 11,
+          evidence_id_count_after: 11,
+          evidence_preserved: true,
+        },
+        cause: "Repository fixed input exceeds the budget.",
+      },
+    })} />);
+
+    const summary = screen.getByText(/fixed writer overhead exceeds budget at level 0/);
+    expect(summary).toHaveTextContent(
+      "writer base 70,117 characters against a 64,000-character limit",
+    );
+    expect(summary).toHaveTextContent(
+      "fixed writer overhead 70,115 characters, exceeding the 64,000-character limit",
+    );
+    expect(summary).toHaveTextContent("evidence IDs preserved (11 to 11)");
+  });
+
+  it("uses the persisted accepted-reduction field as a compatibility fallback", () => {
+    render(<JobFailureDetails job={failedJob({
+      task: "repo_usage",
+      error: "Repository reduction stalled.",
+      diagnostics: {
+        stagnation: {
+          reason: "no_bounded_progress",
+          accepted_reductions: 3,
+          cache_hits: 2,
+        },
+      },
+    })} />);
+
+    const summary = screen.getByText(/no bounded progress/);
+    expect(summary).toHaveTextContent(
+      "2 cached reductions reused; 3 accepted reductions",
+    );
+  });
+
   it("retains useful output for old jobs and malformed diagnostic strings", () => {
     expect(parseJobDiagnostics("model returned an empty response")).toEqual({
       cause: "model returned an empty response",
