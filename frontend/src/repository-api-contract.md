@@ -55,8 +55,13 @@ steps. Search/Q&A evidence can add `repository_path` or `file_path`,
 `start_line`, `end_line`, `commit_sha`, and `immutable_url`/`permalink` to the
 existing hybrid result shape.
 
-Every repository must report `local_only: true`; the backend is responsible for
-enforcing a local/loopback Ollama endpoint for every LLM boundary regardless of
-GitHub visibility or the global model matrix. Repository-derived artifacts are
-also excluded from cloud sync. The UI presents this policy but does not serve as
-the security boundary.
+Repository sources report their real policy: `local_only`, `cloud_consent`,
+and the effective `restricted` flag. Repositories are local-only by default;
+`POST /api/repositories/{project_id}/cloud-consent` opts a project in or out
+(private repositories require `confirmation` matching `owner/repository`, and
+recorded consent is revoked automatically on visibility changes). While
+`restricted` is true the backend enforces a local/loopback Ollama endpoint
+for every LLM boundary regardless of the global model matrix.
+Repository-derived artifacts are excluded from cloud sync regardless of
+consent. The UI presents this policy but does not serve as the security
+boundary.

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 
 from fastapi import APIRouter, HTTPException, Query
@@ -26,13 +27,16 @@ from ..repository import (
     repository_scan_settings,
     repository_source_for_project,
     set_github_token,
+    source_cloud_restricted,
     validate_repository_local_model,
 )
 from ..settings_store import (
     assert_no_shared_local_model_jobs,
+    get_setting,
     set_settings_if_no_repository_jobs,
 )
 
+log = logging.getLogger("synapse.repository")
 router = APIRouter(prefix="/api/repositories", tags=["repositories"])
 
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -254,7 +258,9 @@ def _source_payload(source: RepositorySource, snapshot: RepositorySnapshot | Non
         "privacy": "private" if source.is_private else "public",
         "private": source.is_private,
         "is_private": source.is_private,
-        "local_only": True,
+        "local_only": bool(source.local_only),
+        "cloud_consent": bool(source.cloud_consent),
+        "restricted": source_cloud_restricted(source),
         "default_branch": source.default_branch,
         "requested_ref": source.requested_ref,
         "resolved_ref": commit_sha,
@@ -499,7 +505,9 @@ def prepare_update(project_id: int, req: RepositoryUpdateRequest | None = None):
         if update["changed"]:
             source.pending_sha = update["target_sha"]
             source.updated = utcnow()
-            if source.is_private:
+            # consent is privacy-event sticky: ordinary updates keep it, so
+            # only unconsented private sources re-ratchet to local-only here
+            if source.is_private and not source.cloud_consent:
                 source.local_only = True
             session.add(source)
             session.commit()
@@ -510,6 +518,95 @@ def prepare_update(project_id: int, req: RepositoryUpdateRequest | None = None):
             "source": _source_payload(source),
             "snapshot": _snapshot_payload(source, None) if update["changed"] else None,
         }
+
+
+class RepositoryCloudConsentRequest(BaseModel):
+    enabled: bool
+    confirmation: str = ""
+
+
+@router.post("/{project_id}/cloud-consent")
+def set_repository_cloud_consent(
+    project_id: int, req: RepositoryCloudConsentRequest,
+):
+    """Explicitly opt a repository in or out of cloud-provider analysis.
+
+    Enabling on a private repository requires typing the full repository
+    name, and the recorded consent is revoked automatically on any
+    visibility change. Disabling re-restricts the project immediately and
+    queues a purge of formerly-eligible cloud copies through the same
+    durable outbox the public-to-private transition uses.
+    """
+    with get_session() as session:
+        if repository_source_for_project(session, project_id) is None:
+            raise HTTPException(404, "repository project was not found")
+        # Claim SQLite's writer lease for the policy flip so a run that
+        # starts during request handling is observed before we commit
+        # (mirrors prepare_update): a mid-run policy change would mix
+        # providers inside one analysis. All validation re-runs under the
+        # lease against fresh rows.
+        session.commit()
+        session.exec(text("BEGIN IMMEDIATE"))
+        active = session.exec(select(Job).where(
+            Job.project_id == project_id,
+            Job.status.in_(("queued", "running")),
+        )).first()
+        if active:
+            session.rollback()
+            raise HTTPException(
+                409, "finish or cancel this project's active jobs before "
+                     "changing its cloud policy; a mid-run change would mix "
+                     "providers inside one analysis")
+        source = repository_source_for_project(session, project_id)
+        if not source:
+            session.rollback()
+            raise HTTPException(404, "repository project was not found")
+        if req.enabled:
+            if source.is_private:
+                expected = f"{source.owner}/{source.repository}"
+                if req.confirmation.strip() != expected:
+                    session.rollback()
+                    raise HTTPException(
+                        422, f"confirmation must exactly match {expected!r} "
+                             "to send this private repository's content to "
+                             "cloud providers")
+                source.cloud_consent = True
+            source.local_only = False
+            source.updated = utcnow()
+            session.add(source)
+            # Pre-consent artifacts carry sticky restriction; lift the
+            # project-scoped flags so regenerated artifacts and Q&A follow
+            # the new policy (shared quick references stay sticky, and
+            # already-sanitized bodies are only restored by regeneration).
+            library.mark_project_unrestricted(session, project_id)
+            session.commit()
+            session.refresh(source)
+            return {"ok": True, "source": _source_payload(source)}
+        was_cloud_eligible = not source_cloud_restricted(source)
+        source.cloud_consent = False
+        source.local_only = True
+        if was_cloud_eligible and (
+                get_setting("cloud.provider") or get_setting("cloud.last_sync")):
+            # mirror the public->private transition: formerly-eligible cloud
+            # copies must purge, tracked by the durable outbox flag
+            source.cloud_purge_pending = True
+        source.updated = utcnow()
+        session.add(source)
+        session.flush()
+        newly_restricted = library.mark_project_restricted(session, project_id)
+        session.commit()
+        session.refresh(source)
+        if newly_restricted:
+            library.sanitize_project_artifacts(project_id)
+        if source.cloud_purge_pending:
+            try:
+                from ..tasks.cloud import enqueue_privacy_purge
+
+                enqueue_privacy_purge(source.id)
+            except Exception:
+                # durable outbox: worker startup retries the purge
+                log.exception("could not queue pending cloud privacy purge")
+        return {"ok": True, "source": _source_payload(source)}
 
 
 @router.get("/{project_id}/files")

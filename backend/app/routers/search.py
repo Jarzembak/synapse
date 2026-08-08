@@ -245,9 +245,11 @@ def ask_library(req: AskRequest):
             f"{source['excerpt']}"
         )
         public_sources.append({**source, "marker": marker})
+    # Every repository project in scope has a fail-closed entry in
+    # policy_by_project (consent-aware via repository_processing_policy), so
+    # a consented or public repo no longer blanket-forces the answer local.
     local_only = bool(
-        repository_project_ids
-        or any(policy_by_project.values())
+        any(policy_by_project.values())
         or any(bool(source.get("restricted")) for source in sources))
     answer = llm.complete(
         "library_qa", get_prompt("library_qa"),

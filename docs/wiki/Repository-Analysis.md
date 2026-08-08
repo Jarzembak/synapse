@@ -39,16 +39,28 @@ written to a project, artifact, command, URL, or log.
 
 ## Local-only policy
 
-All repository analysis is local-only in this release, including public
-repositories:
+All repository analysis is local-only by default, including public
+repositories. While a project is local-only:
 
 - evidence mapping and final writing use the configured repository Ollama
   model, while hierarchical reduction has an independent local-model setting;
 - podcast audio uses local Piper TTS;
-- repository artifacts are excluded from cloud sync;
 - repository excerpts cannot be sent to cloud or OpenAI-compatible providers;
 - the Ollama endpoint must be the bundled service or loopback; and
 - model names containing a `cloud` token are rejected.
+
+**Cloud analysis is opt-in per project** from the project page. Public
+repositories opt out of local-only with one click; a private repository
+additionally requires typing its full name to record explicit consent, and
+that consent is revoked automatically whenever the repository's visibility
+changes (the project falls back to local-only until re-consented). Enabling
+cloud analysis lets steps follow the global model matrix — the cloud-default
+deep dives, merge, and quick references use frontier providers, while
+map/reduce stay on their configured (typically local) models. Repository
+artifacts remain excluded from cloud vault sync regardless of this setting,
+and disabling it re-restricts the project and purges any formerly-eligible
+cloud copies through the same durable outbox used when a public repository
+turns private.
 
 Compose sets `OLLAMA_NO_CLOUD=1`. If you provide another loopback Ollama
 daemon, launch it with the same setting. Environment HTTP proxies are bypassed

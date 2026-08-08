@@ -203,9 +203,9 @@ def _upsert_quickref(project_id: int, project_slug: str, project_title: str,
             repo = str(getattr(source, "repository", getattr(source, "name", "")))
             source_kind = "repository"
             source_label = f"{owner}/{repo} @ {sha[:12]}"
-            local_only = bool(
-                getattr(source, "local_only", False)
-                or getattr(source, "is_private", getattr(source, "private", False)))
+            from ..repository import source_cloud_restricted
+
+            local_only = source_cloud_restricted(source)
             local_only = bool(local_only or llm._repository_local_only())
         if ref is not None and not local_only:
             # A repository can be imported while public and later become

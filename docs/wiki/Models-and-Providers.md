@@ -22,8 +22,11 @@ Changing an assignment takes effect on the next run without restarting
 Synapse. You do not need accounts with every frontier provider. Reassign a
 step to a provider you have configured.
 
-Repository analysis is an exception: its privacy policy forces repository chat
-work through a local Ollama endpoint and podcast audio through Piper. Evidence
+Repository analysis is an exception: by default its privacy policy forces
+repository chat work through a local Ollama endpoint and podcast audio through
+Piper. Cloud analysis can be enabled per project from the project page
+(private repositories require typed consent — see Repository Analysis), after
+which repository steps follow the global model matrix. Evidence
 mapping/final writing and hierarchical reduction have separate local-model
 settings so a reduction-model change does not invalidate compatible leaf maps.
 On upgrade, an existing mapper selection is retained while the newly separate
