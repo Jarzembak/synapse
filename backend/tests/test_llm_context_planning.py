@@ -106,6 +106,139 @@ def test_context_plan_caps_at_known_native_window():
     assert plan["required_context"] > plan["effective_context"]
 
 
+def test_context_plan_flexible_output_fits_default_budget_to_native_window():
+    """The untuned-function fallback budget is a ceiling, not a demand: with
+    flexible_output it shrinks to fit the model instead of demanding a window
+    no <=16k-context model has."""
+    flexible = llm._ollama_context_plan(
+        "system",
+        "short question",
+        llm.MAX_TOKENS,
+        configured_context=16_384,
+        native_context=8_192,
+        flexible_output=True,
+    )
+    assert flexible["planned_output_tokens"] < llm.MAX_TOKENS
+    assert flexible["required_context"] <= flexible["effective_context"] == 8_192
+
+    rigid = llm._ollama_context_plan(
+        "system",
+        "short question",
+        llm.MAX_TOKENS,
+        configured_context=16_384,
+        native_context=8_192,
+    )
+    assert rigid["planned_output_tokens"] == llm.MAX_TOKENS
+    assert rigid["required_context"] > rigid["effective_context"]
+
+
+def test_context_plan_flexible_output_fits_the_admissible_cap_not_raw_native():
+    """A 128k-native model still admits at most the 65,536 automatic cap;
+    fitting against raw native left mid-size prompts refused with a
+    self-contradictory 'can use only 131,072' message."""
+    plan = llm._ollama_context_plan(
+        "system",
+        "x" * 128_000,
+        llm.MAX_TOKENS,
+        configured_context=8_192,
+        native_context=131_072,
+        flexible_output=True,
+    )
+    assert plan["planned_output_tokens"] < llm.MAX_TOKENS
+    assert plan["required_context"] <= plan["effective_context"] == 65_536
+
+
+def test_discovered_native_growth_revets_resources(monkeypatch):
+    """When the fresh inventory reveals a larger native window, the grown
+    num_ctx must be re-admitted even when it lands exactly on its new
+    bucket — the first admission only vetted the smaller reservation."""
+    from app import local_model_safety
+
+    vetted = []
+
+    def fake_ensure(model, **kwargs):
+        vetted.append(kwargs.get("requested_context"))
+        return {"native_context_tokens": 32_768}
+
+    monkeypatch.setattr(llm, "_known_native_context", lambda _model: 8_192)
+    monkeypatch.setattr(local_model_safety, "ensure_model_safe", fake_ensure)
+    monkeypatch.setattr(llm, "advanced", lambda _group: dict(LOCAL_CFG))
+    monkeypatch.setattr(
+        llm.httpx, "post", lambda *args, **kwargs: SuccessfulResponse())
+    monkeypatch.setattr(llm, "_record_call", lambda *args, **kwargs: None)
+    monkeypatch.setattr(llm, "_project_local_only", lambda: False)
+    monkeypatch.setattr(llm, "get_setting", lambda _key, default=None: default)
+
+    llm.complete(
+        "library_qa",
+        "system",
+        "x" * 3_000,
+        provider="ollama",
+        model="grown:latest",
+    )
+
+    assert len(vetted) == 2
+    assert vetted[1] > vetted[0]
+
+
+def test_default_budget_qa_fits_small_context_model(monkeypatch):
+    """Repository Q&A on an 8k-native model previously failed pre-request
+    with 'subdivide the input' advice that could never help; the default
+    budget now fits the window and the fitted num_predict is sent."""
+    _allow_model(monkeypatch, native_context=8_192)
+    monkeypatch.setattr(llm, "advanced", lambda _group: dict(LOCAL_CFG))
+    captured = {}
+
+    def fake_post(url, *, json=None, timeout=None, trust_env=None):
+        captured["payload"] = json
+        return SuccessfulResponse()
+
+    monkeypatch.setattr(llm.httpx, "post", fake_post)
+    monkeypatch.setattr(llm, "_record_call", lambda *args, **kwargs: None)
+    monkeypatch.setattr(llm, "_project_local_only", lambda: False)
+    monkeypatch.setattr(llm, "get_setting", lambda _key, default=None: default)
+
+    output = llm.complete(
+        "library_qa",
+        "system",
+        "one-line question",
+        provider="ollama",
+        model="gemma2:9b",
+    )
+
+    assert output == '{"ok": true}'
+    options = captured["payload"]["options"]
+    assert options["num_ctx"] <= 8_192
+    assert options["num_predict"] < llm.MAX_TOKENS
+    diagnostics = llm.last_call_diagnostics()
+    assert diagnostics["max_output_tokens"] == options["num_predict"]
+    assert diagnostics["required_context"] <= diagnostics["effective_context"]
+
+
+def test_explicit_budget_still_raises_context_window_error(monkeypatch):
+    """An explicitly requested budget is a demand: when it cannot fit the
+    model's native window the call still fails before any request is sent."""
+    _allow_model(monkeypatch, native_context=8_192)
+    monkeypatch.setattr(llm, "advanced", lambda _group: dict(LOCAL_CFG))
+    monkeypatch.setattr(
+        llm.httpx, "post",
+        lambda *args, **kwargs: pytest.fail("no request should be sent"))
+    monkeypatch.setattr(llm, "_record_call", lambda *args, **kwargs: None)
+    monkeypatch.setattr(llm, "_project_local_only", lambda: False)
+    monkeypatch.setattr(llm, "get_setting", lambda _key, default=None: default)
+
+    with pytest.raises(llm.ContextWindowError):
+        llm.complete(
+            "library_qa",
+            "system",
+            "one-line question",
+            provider="ollama",
+            model="gemma2:9b",
+            max_tokens=llm.MAX_TOKENS,
+            transient_attempts=1,
+        )
+
+
 def test_context_plan_accounts_for_dense_non_ascii_text():
     plan = llm._ollama_context_plan(
         "system",
@@ -268,7 +401,7 @@ def test_complete_exposes_call_plan_and_attempt_diagnostics(
     monkeypatch.setattr(llm, "_record_call", lambda *args, **kwargs: None)
     monkeypatch.setattr(llm, "_project_local_only", lambda: False)
     monkeypatch.setattr(llm, "get_setting", lambda _key, default=None: default)
-    monkeypatch.setattr(llm, "resolve_params", lambda _function: (None, 512))
+    monkeypatch.setattr(llm, "resolve_params", lambda _function: (None, 512, True))
 
     output = llm.complete(
         "repository_reduce",
@@ -308,7 +441,7 @@ def test_transient_attempt_override_prevents_identical_retry(monkeypatch):
     monkeypatch.setattr(llm, "_ollama", fail)
     monkeypatch.setattr(llm, "_record_call", lambda *args, **kwargs: None)
     monkeypatch.setattr(llm, "_project_local_only", lambda: False)
-    monkeypatch.setattr(llm, "resolve_params", lambda _function: (None, 512))
+    monkeypatch.setattr(llm, "resolve_params", lambda _function: (None, 512, True))
 
     with pytest.raises(llm.LLMHTTPError):
         llm.complete(

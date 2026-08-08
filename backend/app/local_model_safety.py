@@ -582,6 +582,13 @@ def model_catalog(*, refresh: bool = False) -> dict:
             requested_context=max(general_context, 32_768),
             resources=assessment_resources,
         )
+        # Three distinct context tiers: "assessment" previews typical calls
+        # (configured num_ctx), "repository_assessment" previews the 32,768
+        # repository_*/paper_* ASSIGNMENT gate (routers/repositories.py,
+        # routers/settings.py), and this worst case previews the 65,536
+        # automatic planning cap that runtime admission can still reach for
+        # huge prompts — it must stay at 65,536 because it gates the
+        # blocked-model override UI, which validates at the same ceiling.
         row["restricted_assessment"] = resource_assessment(
             model,
             requested_context=max(general_context, 65_536),

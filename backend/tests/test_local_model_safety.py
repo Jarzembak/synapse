@@ -134,6 +134,7 @@ def test_structured_catalog_and_persisted_annotation(client, monkeypatch):
     assert payload["models"][0]["capabilities"] == ["completion"]
     assert payload["models"][0]["assessment"]["tier"] == "recommended"
     assert payload["models"][0]["restricted_assessment"]["requested_context_tokens"] == 65_536
+    assert payload["models"][0]["repository_assessment"]["requested_context_tokens"] == 32_768
 
     saved = client.put(
         "/api/settings/ollama/annotation",
@@ -184,6 +185,33 @@ def test_capability_mismatches_fail_assignment(client, monkeypatch):
     )
     assert response.status_code == 422
     assert response.json()["detail"]["code"] == "ollama_capability_mismatch"
+
+
+def test_model_matrix_admission_uses_repository_context_policy(
+    client, monkeypatch,
+):
+    """repository_*/paper_* rows gate at the 32K v2 admission, not the pre-v2
+    65,536 worst case that rejected models whose real calls fit fine."""
+    from app.routers import settings as settings_router
+
+    captured = []
+    monkeypatch.setattr(
+        settings_router,
+        "ensure_model_safe",
+        lambda model, **kwargs: captured.append(kwargs) or {},
+    )
+    monkeypatch.setattr(
+        settings_router, "_set_analysis_sensitive", lambda _values: None)
+
+    for function in ("repository_map", "paper_map", "correct"):
+        response = client.put(
+            f"/api/settings/models/{function}",
+            json={"provider": "ollama", "model": "safe:latest"},
+        )
+        assert response.status_code == 200
+
+    assert [kwargs["requested_context"] for kwargs in captured] == [
+        32_768, 32_768, 16_384]
 
 
 def test_blocked_model_requires_digest_and_explicit_acknowledgement(

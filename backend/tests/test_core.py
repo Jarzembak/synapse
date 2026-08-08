@@ -639,7 +639,7 @@ def test_complete_retries_empty_responses(monkeypatch):
     outputs = iter(["", "   ", "real answer"])
     monkeypatch.setattr(llm, "_ollama", lambda *a, **k: next(outputs))
     monkeypatch.setattr(llm, "resolve_model", lambda fn: ("ollama", "m"))
-    monkeypatch.setattr(llm, "resolve_params", lambda fn: (None, 128))
+    monkeypatch.setattr(llm, "resolve_params", lambda fn: (None, 128, True))
     monkeypatch.setattr(llm, "get_setting", lambda key, default=None: default)
     monkeypatch.setattr(llm.time, "sleep", lambda seconds: None)
     assert llm.complete("tag", "s", "u") == "real answer"

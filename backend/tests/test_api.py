@@ -270,7 +270,7 @@ def test_params_and_advanced_roundtrip(client):
     assert client.get("/api/settings/params").json()["summarize"] == \
         {"temperature": 0.2, "max_tokens": 2048}
     from app.llm import resolve_params
-    assert resolve_params("summarize") == (0.2, 2048)
+    assert resolve_params("summarize") == (0.2, 2048, True)
     client.put("/api/settings/params/summarize", json={})
 
     adv = client.get("/api/settings/advanced").json()
