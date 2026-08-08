@@ -226,6 +226,26 @@ class EmptyResponseError(RuntimeError):
     it is treated as transient and retried."""
 
 
+class OutputBudgetError(RuntimeError):
+    """Generation stopped because the output-token budget ran out, not
+    because the model finished. Deterministic for a given prompt and budget,
+    so it is not transient."""
+
+    def __init__(self, *, model: str, max_tokens: int, visible_output: bool):
+        self.max_tokens = max_tokens
+        self.visible_output = visible_output
+        # No settings path in this message: pipeline steps pass explicit
+        # budgets that Settings → Advanced → Generation parameters cannot
+        # override, so naming that knob would send operators to a dead end.
+        outcome = ("its reply was cut off mid-generation" if visible_output
+                   else "no usable output was produced within the budget "
+                        "(hidden reasoning or non-content tokens consumed it)")
+        super().__init__(
+            f"{model} hit the {max_tokens:,}-token output budget before "
+            f"finishing — {outcome}; raise this step's output-token budget "
+            "or send less input")
+
+
 class ContextWindowError(RuntimeError):
     """A prompt cannot fit without truncation in the model's usable window."""
 
@@ -742,7 +762,14 @@ def _ollama(system: str, user: str, model: str, max_tokens: int,
     _usage.set((data.get("prompt_eval_count") or 0, data.get("eval_count") or 0))
     # thinking arrives in message.thinking when supported; <think> tags in
     # content still show up from GGUF imports without a structured template
-    return _strip_think((data.get("message") or {}).get("content") or "")
+    output = _strip_think((data.get("message") or {}).get("content") or "")
+    if data.get("done_reason") == "length":
+        # num_predict ran out mid-generation. Returning the truncated text
+        # would corrupt artifacts silently, and retrying with the same budget
+        # re-bills the identical truncation, so fail loud and non-transient.
+        raise OutputBudgetError(
+            model=model, max_tokens=max_tokens, visible_output=bool(output))
+    return output
 
 
 def _openai_compat(system: str, user: str, model: str, max_tokens: int,

@@ -475,6 +475,69 @@ def test_ollama_error_body_surfaces_and_is_not_transient(
     assert llm._is_transient(llm.LLMHTTPError("busy", 503))
 
 
+def test_ollama_length_stop_raises_instead_of_truncating(
+    monkeypatch, bypass_ollama_safety,
+):
+    """done_reason "length" means num_predict ran out mid-reply; the cut-off
+    text must never be returned as a successful completion."""
+    from app import llm
+
+    class FakeResponse:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"message": {"content": '{"summary": "the repo'},
+                    "done_reason": "length", "eval_count": 512}
+
+    monkeypatch.setattr(llm.httpx, "post", lambda *a, **k: FakeResponse())
+    monkeypatch.setattr(llm, "advanced", lambda group: dict(LOCAL_CFG))
+    with pytest.raises(llm.OutputBudgetError, match="cut off") as err:
+        llm._ollama("s", "u", "qwen3:8b", 512, None, json_format=True)
+    assert err.value.visible_output is True
+    assert not llm._is_transient(err.value)
+
+
+def test_ollama_length_stop_from_unfinished_thinking_is_not_retried(
+    monkeypatch, bypass_ollama_safety,
+):
+    """A budget spent entirely inside <think> strips to "", which used to fall
+    into the transient EmptyResponseError retry loop; it is deterministic."""
+    from app import llm
+
+    class FakeResponse:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"message": {"content": "<think>step 1: never finished"},
+                    "done_reason": "length"}
+
+    monkeypatch.setattr(llm.httpx, "post", lambda *a, **k: FakeResponse())
+    monkeypatch.setattr(llm, "advanced", lambda group: dict(LOCAL_CFG))
+    with pytest.raises(llm.OutputBudgetError, match="no usable output") as err:
+        llm._ollama("s", "u", "qwen3:8b", 64, None)
+    assert err.value.visible_output is False
+
+
+def test_ollama_done_reason_stop_returns_content(
+    monkeypatch, bypass_ollama_safety,
+):
+    from app import llm
+
+    class FakeResponse:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"message": {"content": "complete answer"},
+                    "done_reason": "stop"}
+
+    monkeypatch.setattr(llm.httpx, "post", lambda *a, **k: FakeResponse())
+    monkeypatch.setattr(llm, "advanced", lambda group: dict(LOCAL_CFG))
+    assert llm._ollama("s", "u", "qwen3:8b", 64, None) == "complete answer"
+
+
 def test_openai_compat_requires_base_url(monkeypatch):
     from app import llm
 
