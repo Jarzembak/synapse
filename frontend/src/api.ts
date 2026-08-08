@@ -357,6 +357,35 @@ export interface JobDiagnosticAttempt {
   detail?: string | null;
 }
 
+export interface JobDiagnosticStagnation {
+  reason?: string | null;
+  level?: number | null;
+  batch_input_limit_chars?: number | null;
+  writer_input_limit_chars?: number | null;
+  input_items?: number | null;
+  output_items?: number | null;
+  input_chars?: number | null;
+  output_chars?: number | null;
+  input_writer_chars?: number | null;
+  output_writer_chars?: number | null;
+  writer_overhead_chars?: number | null;
+  evidence_context_chars?: number | null;
+  item_delta?: number | null;
+  char_delta?: number | null;
+  top_level_batches?: number | null;
+  model_calls?: number | null;
+  model_reductions_accepted?: number | null;
+  accepted_reductions?: number | null;
+  accepted_reductions_total?: number | null;
+  cache_hits?: number | null;
+  singleton_passthroughs?: number | null;
+  subdivisions?: number | null;
+  outcome_counts?: Record<string, number> | null;
+  evidence_id_count_before?: number | null;
+  evidence_id_count_after?: number | null;
+  evidence_preserved?: boolean | null;
+}
+
 export interface JobDiagnostics {
   stage?: string | null;
   effective_model?: JobDiagnosticModel | null;
@@ -364,6 +393,7 @@ export interface JobDiagnostics {
   reduction?: JobDiagnosticReduction | null;
   cache?: JobDiagnosticCache | null;
   attempts?: JobDiagnosticAttempt[] | null;
+  stagnation?: JobDiagnosticStagnation | null;
   cause?: string | null;
 }
 

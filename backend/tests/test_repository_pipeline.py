@@ -335,7 +335,10 @@ def _reduction_limits() -> dict[str, int]:
         "reduce_batch_chars": 900,
         "reduce_max_tokens": 800,
         "reduce_max_subdivision_depth": 4,
-        "final_input_chars": 4_000,
+        # Keep the exact writer envelope tight enough that these reducer-unit
+        # fixtures exercise compression while preserving the 900-character
+        # per-call packing limit.
+        "final_input_chars": 2_000,
     }
 
 
@@ -378,6 +381,10 @@ def test_repository_provenance_records_resolved_limits_and_contract_versions():
     assert (
         analysis["reduction_contract_version"]
         == repository_tasks._REDUCTION_CONTRACT_VERSION
+    )
+    assert (
+        analysis["reduction_planner_version"]
+        == repository_tasks._REDUCTION_PLANNER_VERSION
     )
 
 
@@ -547,6 +554,397 @@ def _ready_snapshot(slug: str):
         session.add(source_row)
         session.commit()
     return project, snapshot_id
+
+
+def _padded_json_object(key: str, target_chars: int) -> dict[str, str]:
+    empty_chars = len(json.dumps(
+        {key: ""}, sort_keys=True, default=str))
+    assert target_chars >= empty_chars
+    value = {key: "x" * (target_chars - empty_chars)}
+    assert len(json.dumps(value, sort_keys=True, default=str)) == target_chars
+    return value
+
+
+def _exact_envelope_limits() -> dict[str, int]:
+    return {
+        "max_chunks": 64,
+        "max_input_chars": 800_000,
+        "max_new_map_calls": 64,
+        "reduce_batch_chars": 20_000,
+        "reduce_max_tokens": 1_600,
+        "reduce_max_subdivision_depth": 6,
+        "final_input_chars": 64_000,
+    }
+
+
+def _exact_envelope_overhead(monkeypatch) -> None:
+    facts = _padded_json_object("facts_padding", 12_840)
+    facts_warning = "bounded scan facts omitted lower-priority entries"
+
+    def source_metadata(_source, _snapshot, coverage):
+        assert facts_warning in coverage["warnings"]
+        metadata = {
+            "warnings": list(coverage["warnings"]),
+            "metadata_padding": "",
+        }
+        empty_chars = len(json.dumps(
+            metadata, sort_keys=True, default=str))
+        metadata["metadata_padding"] = "x" * (2_172 - empty_chars)
+        assert len(json.dumps(
+            metadata, sort_keys=True, default=str)) == 2_172
+        return metadata
+
+    monkeypatch.setattr(
+        repository_tasks, "_source_metadata",
+        source_metadata,
+    )
+    monkeypatch.setattr(
+        repository_tasks, "_bounded_scan_facts",
+        lambda _snapshot, _max_chars: (facts, facts_warning),
+    )
+
+
+def test_repository_writer_prompt_ignores_operational_cache_counters():
+    source = SimpleNamespace(
+        canonical_url="https://github.com/example/cache-stable",
+        owner="example",
+        repository="cache-stable",
+        requested_ref="main",
+        include_paths="[]",
+        exclude_paths="[]",
+    )
+    snapshot = SimpleNamespace(
+        resolved_sha="a" * 40,
+        commit_url="https://github.com/example/cache-stable/commit/" + "a" * 40,
+        scanner_version="test-scanner",
+        facts="{}",
+    )
+    first_coverage = {
+        "cache": {
+            "reused_chunk_summaries": 0,
+            "new_chunk_summaries": 64,
+        },
+        "warnings": [],
+    }
+    reused_coverage = {
+        "cache": {
+            "reused_chunk_summaries": 64,
+            "new_chunk_summaries": 0,
+        },
+        "warnings": [],
+    }
+
+    first = repository_tasks._repository_writer_base(
+        source, snapshot, first_coverage, [], final_budget=64_000)
+    reused = repository_tasks._repository_writer_base(
+        source, snapshot, reused_coverage, [], final_budget=64_000)
+
+    assert first == reused
+    assert first_coverage["cache"]["new_chunk_summaries"] == 64
+    assert reused_coverage["cache"]["reused_chunk_summaries"] == 64
+    assert '"cache"' not in first[0]
+
+
+def test_repository_multiple_reduce_batches_stop_when_exact_writer_envelope_fits(
+    monkeypatch,
+):
+    project, snapshot_id = _ready_snapshot("exact-writer-envelope-fit")
+    summaries = _reduction_summaries(count=11, body_chars=2_828)
+    summaries[0]["summary"] += "x"
+    expected = deepcopy(summaries)
+    context_chars = len(json.dumps(
+        summaries, sort_keys=True, default=str))
+    assert context_chars == 32_661
+    assert [len(batch) for batch in repository_tasks._batches(
+        summaries, _exact_envelope_limits()["reduce_batch_chars"]
+    )] == [6, 5]
+
+    monkeypatch.setattr(
+        repository_tasks, "_analysis_limits", _exact_envelope_limits)
+    _exact_envelope_overhead(monkeypatch)
+    monkeypatch.setattr(
+        llm, "resolve_model",
+        lambda _function: ("ollama", "repository-reducer"),
+    )
+    monkeypatch.setattr(
+        repository_tasks, "_installed_model_digest",
+        lambda *_args, **_kwargs: "digest_unavailable",
+    )
+    monkeypatch.setattr(
+        llm, "complete_json",
+        lambda *_args, **_kwargs: pytest.fail(
+            "writer-fit evidence was sent through an unnecessary reduction"),
+    )
+    with get_session() as session:
+        job = Job(
+            project_id=project.id, task="repo_inventory", status="running")
+        session.add(job)
+        session.commit()
+        session.refresh(job)
+        job_id = job.id
+
+    coverage = {"cache": {}, "warnings": []}
+    result = repository_tasks._hierarchical_context(
+        job_id, snapshot_id, summaries, "repo_inventory", coverage)
+
+    assert result == expected
+    assert coverage["warnings"] == []
+    assert repository_tasks._nested_evidence_ids(result) == {
+        f"EREDUCE{index:04d}" for index in range(11)
+    }
+    with get_session() as session:
+        diagnostics = json.loads(session.get(Job, job_id).diagnostics)
+        expected_reduction = {
+            "batch": 0,
+            "batch_count": 0,
+            "batch_input_limit_chars": 20_000,
+            "complete": True,
+            "input_chars": 32_661,
+            "items": 11,
+            "level": 0,
+            "purpose": "repo_inventory",
+            "subdivision_depth": 0,
+            "writer_input_chars": 47_788,
+            "writer_input_limit_chars": 64_000,
+            "writer_overhead_chars": 15_127,
+        }
+        assert expected_reduction.items() <= diagnostics["reduction"].items()
+        assert diagnostics["cache"]["reductions_new"] == 0
+        assert diagnostics["cache"]["reductions_reused"] == 0
+        assert diagnostics["cache"]["singleton_passthroughs"] == 0
+        assert diagnostics["cause"] == ""
+        rows = session.exec(select(RepositorySynthesisCache).where(
+            RepositorySynthesisCache.snapshot_id == snapshot_id
+        )).all()
+        assert rows == []
+
+
+def test_repository_reduction_stops_after_level_one_reaches_exact_writer_envelope(
+    monkeypatch,
+):
+    project, snapshot_id = _ready_snapshot("exact-writer-envelope-transition")
+    summaries = _reduction_summaries(count=11, body_chars=4_500)
+    target = _reduction_summaries(count=11, body_chars=2_828)
+    target[0]["summary"] += "x"
+    assert len(json.dumps(
+        summaries, sort_keys=True, default=str)) == 51_052
+    assert len(json.dumps(target, sort_keys=True, default=str)) == 32_661
+    assert [len(batch) for batch in repository_tasks._batches(
+        summaries, _exact_envelope_limits()["reduce_batch_chars"]
+    )] == [4, 4, 3]
+
+    monkeypatch.setattr(
+        repository_tasks, "_analysis_limits", _exact_envelope_limits)
+    _exact_envelope_overhead(monkeypatch)
+    monkeypatch.setattr(
+        llm, "resolve_model",
+        lambda _function: ("ollama", "repository-reducer"),
+    )
+    monkeypatch.setattr(
+        repository_tasks, "_installed_model_digest",
+        lambda *_args, **_kwargs: "digest_unavailable",
+    )
+    target_by_id = {
+        item["evidence_ids"][0]: item for item in target
+    }
+    calls: list[list[str]] = []
+
+    def compress_level_one(*args, **kwargs):
+        batch = args[6]
+        calls.append([
+            str(item["evidence_ids"][0]) for item in batch
+        ])
+        if len(calls) > 3:
+            pytest.fail(
+                "the planner started a second reduction level after the "
+                "level-one writer envelope already fit"
+            )
+        level_state = kwargs["level_state"]
+        level_state["model_calls"] += 1
+        level_state["model_reductions_accepted"] += len(batch)
+        return [
+            deepcopy(target_by_id[str(item["evidence_ids"][0])])
+            for item in batch
+        ]
+
+    monkeypatch.setattr(
+        repository_tasks, "_reduce_batch_adaptive", compress_level_one)
+    with get_session() as session:
+        job = Job(
+            project_id=project.id, task="repo_inventory", status="running")
+        session.add(job)
+        session.commit()
+        session.refresh(job)
+        job_id = job.id
+
+    result = repository_tasks._hierarchical_context(
+        job_id, snapshot_id, summaries, "repo_inventory", {
+            "cache": {}, "warnings": [],
+        })
+
+    assert result == target
+    assert [len(batch) for batch in calls] == [4, 4, 3]
+    assert repository_tasks._nested_evidence_ids(result) == {
+        f"EREDUCE{index:04d}" for index in range(11)
+    }
+    with get_session() as session:
+        diagnostics = json.loads(session.get(Job, job_id).diagnostics)
+        assert diagnostics["reduction"]["level"] == 1
+        assert diagnostics["reduction"]["complete"] is True
+        assert diagnostics["reduction"]["writer_input_chars"] == 47_788
+        assert diagnostics["reduction"]["writer_input_limit_chars"] == 64_000
+
+
+def test_repository_no_progress_over_exact_writer_envelope_still_fails(
+    monkeypatch,
+):
+    project, snapshot_id = _ready_snapshot("exact-writer-envelope-stagnation")
+    summaries = _reduction_summaries(count=11, body_chars=4_500)
+    context_chars = len(json.dumps(
+        summaries, sort_keys=True, default=str))
+    assert context_chars == 51_052
+    assert [len(batch) for batch in repository_tasks._batches(
+        summaries, _exact_envelope_limits()["reduce_batch_chars"]
+    )] == [4, 4, 3]
+
+    calls: list[list[dict]] = []
+    monkeypatch.setattr(
+        repository_tasks, "_analysis_limits", _exact_envelope_limits)
+    _exact_envelope_overhead(monkeypatch)
+    monkeypatch.setattr(
+        llm, "resolve_model",
+        lambda _function: ("ollama", "repository-reducer"),
+    )
+    monkeypatch.setattr(
+        repository_tasks, "_installed_model_digest",
+        lambda *_args, **_kwargs: "digest_unavailable",
+    )
+
+    def invalid_reduction(_function, _system, user, **_kwargs):
+        batch = json.loads(user)
+        calls.append(batch)
+        return {
+            "summary": "Evidence ledger omitted.",
+            "facts": [],
+            "symbols": [],
+            "dependencies": [],
+            "commands": [],
+            "knowledge": [],
+            "evidence_ids": [],
+        }
+
+    monkeypatch.setattr(llm, "complete_json", invalid_reduction)
+    monkeypatch.setattr(llm, "last_call_diagnostics", lambda: {
+        "attempts": [{"status": "ok"}],
+    })
+    with get_session() as session:
+        job = Job(
+            project_id=project.id, task="repo_inventory", status="running")
+        session.add(job)
+        session.commit()
+        session.refresh(job)
+        job_id = job.id
+
+    with pytest.raises(RuntimeError, match="made no bounded progress"):
+        repository_tasks._hierarchical_context(
+            job_id, snapshot_id, summaries, "repo_inventory", {"cache": {}})
+
+    assert calls
+    assert all(len(batch) > 1 for batch in calls)
+    with get_session() as session:
+        diagnostics = json.loads(session.get(Job, job_id).diagnostics)
+        stagnation = diagnostics["stagnation"]
+        assert stagnation["reason"] == "all_multi_item_reductions_failed"
+        assert stagnation["level"] == 1
+        assert stagnation["input_items"] == 11
+        assert stagnation["output_items"] == 11
+        assert stagnation["input_chars"] == 51_052
+        assert stagnation["output_chars"] == 51_052
+        assert stagnation["input_writer_chars"] == 66_179
+        assert stagnation["output_writer_chars"] == 66_179
+        assert stagnation["writer_overhead_chars"] == 15_127
+        assert stagnation["writer_input_limit_chars"] == 64_000
+        assert stagnation["top_level_batches"] == 3
+        assert stagnation["model_calls"] == len(calls)
+        assert stagnation["model_reductions_accepted"] == 0
+        assert stagnation["accepted_reductions_total"] == 0
+        assert stagnation["accepted_reductions"] == 0
+        assert stagnation["cache_hits"] == 0
+        assert stagnation["singleton_passthroughs"] == 11
+        assert stagnation["subdivisions"] == len(calls)
+        assert stagnation["outcome_counts"] == {
+            "invalid_structure": len(calls),
+        }
+        assert stagnation["evidence_id_count_before"] == 11
+        assert stagnation["evidence_id_count_after"] == 11
+        assert stagnation["evidence_preserved"] is True
+        assert diagnostics["cache"]["singleton_passthroughs"] == 11
+        assert diagnostics["reduction"]["level"] == 1
+        assert diagnostics["reduction"]["items"] == 11
+        assert diagnostics["reduction"]["complete"] is False
+        assert "writer base 66179/64000 chars" in diagnostics["cause"]
+        rows = session.exec(select(RepositorySynthesisCache).where(
+            RepositorySynthesisCache.snapshot_id == snapshot_id
+        )).all()
+        assert rows == []
+
+
+def test_repository_fixed_writer_overhead_above_budget_fails_before_reduction(
+    monkeypatch,
+):
+    project, snapshot_id = _ready_snapshot("fixed-writer-overhead")
+    summaries = _reduction_summaries(count=1, body_chars=20)
+    metadata = _padded_json_object("metadata_padding", 30_000)
+    facts = _padded_json_object("facts_padding", 40_000)
+    monkeypatch.setattr(
+        repository_tasks, "_analysis_limits", _exact_envelope_limits)
+    monkeypatch.setattr(
+        repository_tasks, "_source_metadata",
+        lambda _source, _snapshot, _coverage: metadata,
+    )
+    monkeypatch.setattr(
+        repository_tasks, "_bounded_scan_facts",
+        lambda _snapshot, _max_chars: (facts, None),
+    )
+    monkeypatch.setattr(
+        llm, "resolve_model",
+        lambda _function: ("ollama", "repository-reducer"),
+    )
+    monkeypatch.setattr(
+        repository_tasks, "_installed_model_digest",
+        lambda *_args, **_kwargs: "digest_unavailable",
+    )
+    monkeypatch.setattr(
+        llm, "complete_json",
+        lambda *_args, **_kwargs: pytest.fail(
+            "reducer ran after fixed writer overhead exhausted the budget"),
+    )
+    with get_session() as session:
+        job = Job(
+            project_id=project.id, task="repo_inventory", status="running")
+        session.add(job)
+        session.commit()
+        session.refresh(job)
+        job_id = job.id
+
+    with pytest.raises(
+        RuntimeError,
+        match="fixed metadata and scan facts exceed.*final input budget",
+    ):
+        repository_tasks._hierarchical_context(
+            job_id, snapshot_id, summaries, "repo_inventory", {"cache": {}})
+
+    with get_session() as session:
+        diagnostics = json.loads(session.get(Job, job_id).diagnostics)
+        assert "70117/64000 chars" in diagnostics["cause"]
+        assert "empty evidence list" in diagnostics["cause"]
+        stagnation = diagnostics["stagnation"]
+        assert stagnation["reason"] == "fixed_writer_overhead_exceeds_budget"
+        assert stagnation["writer_overhead_chars"] == 70_115
+        assert stagnation["evidence_context_chars"] == 2
+        assert stagnation["output_writer_chars"] == 70_117
+        assert stagnation["writer_input_limit_chars"] == 64_000
+        assert diagnostics["reduction"]["complete"] is False
 
 
 def test_repository_reductions_are_cached_across_document_purposes(monkeypatch):
@@ -728,6 +1126,136 @@ def test_repository_final_synthesis_missing_digest_does_not_write_artifact(
         )
 
 
+@pytest.mark.parametrize(("context_mode", "expected_excerpt_chars"), [
+    ("partial", 5),
+    ("zero_space", 0),
+])
+def test_repository_document_freezes_limits_and_bounds_prior_guide_context(
+    monkeypatch, context_mode, expected_excerpt_chars,
+):
+    final_budget = 300
+    prior_prefix = "\n\nPRIOR REPOSITORY GUIDES (untrusted data):\n"
+    base_chars = (
+        final_budget - len(prior_prefix) - expected_excerpt_chars
+        if context_mode == "partial"
+        else final_budget
+    )
+    resolved_limits = {
+        "max_chunks": 64,
+        "max_input_chars": 800_000,
+        "max_new_map_calls": 64,
+        "reduce_batch_chars": 20_000,
+        "reduce_max_tokens": 1_600,
+        "reduce_max_subdivision_depth": 6,
+        "final_input_chars": final_budget,
+    }
+    limit_calls = 0
+
+    def one_limit_snapshot():
+        nonlocal limit_calls
+        limit_calls += 1
+        if limit_calls > 1:
+            pytest.fail(
+                "repository settings were resolved again after planning began")
+        return dict(resolved_limits)
+
+    source = SimpleNamespace(
+        canonical_url="https://github.com/example/frozen-limits")
+    snapshot = SimpleNamespace(id=7, resolved_sha="b" * 40)
+    coverage = {"warnings": [], "cache": {}}
+    context_calls: list[dict[str, int]] = []
+
+    def repository_context(_job_id, _project_id, _purpose, *, limits):
+        context_calls.append(dict(limits))
+        return source, snapshot, [], coverage
+
+    facts_warning = "bounded deterministic facts warning"
+    captured_users: list[str] = []
+    captured_artifact: dict = {}
+    monkeypatch.setattr(
+        repository_tasks, "_analysis_limits", one_limit_snapshot)
+    monkeypatch.setattr(
+        repository_tasks, "_repository_context", repository_context)
+    monkeypatch.setattr(
+        repository_tasks,
+        "_repository_writer_base",
+        lambda *_args, **_kwargs: (
+            "b" * base_chars, {"facts": []}, facts_warning),
+    )
+    monkeypatch.setattr(
+        llm, "resolve_model", lambda _function: ("ollama", "frozen-writer"))
+    monkeypatch.setattr(
+        repository_tasks,
+        "_installed_model_digest",
+        lambda *_args, **_kwargs: "pinned-writer-digest",
+    )
+    monkeypatch.setattr(repository_tasks, "progress", lambda *_args: None)
+    monkeypatch.setattr(
+        repository_tasks, "_update_job_diagnostics", lambda *_args: None)
+    monkeypatch.setattr(repository_tasks, "get_prompt", lambda _name: "prompt")
+
+    def complete(_function, _system, user, **_kwargs):
+        captured_users.append(user)
+        return "Draft"
+
+    monkeypatch.setattr(llm, "complete", complete)
+    monkeypatch.setattr(llm, "last_call_diagnostics", lambda: {
+        "model_digest": "pinned-writer-digest",
+        "attempts": [{"status": "ok"}],
+    })
+    monkeypatch.setattr(
+        repository_tasks, "_snapshot_bundle",
+        lambda _project_id: (source, snapshot, []),
+    )
+    monkeypatch.setattr(
+        repository_tasks, "_validate_and_render_citations",
+        lambda body, *_args, **_kwargs: (body, 0),
+    )
+
+    def write_artifact(*_args, **kwargs):
+        captured_artifact.update(kwargs)
+        return 77
+
+    monkeypatch.setattr(
+        repository_tasks, "_write_repository_artifact", write_artifact)
+
+    artifact_id = repository_tasks.generate_repository_document(
+        1,
+        2,
+        artifact_type="repo_architecture",
+        function="repository_architecture",
+        prompt_name="repository_architecture",
+        title_prefix="Repository architecture",
+        additional_context="0123456789",
+    )
+
+    assert artifact_id == 77
+    assert limit_calls == 1
+    assert context_calls == [resolved_limits]
+    assert len(captured_users) == 1
+    assert len(captured_users[0]) <= final_budget
+    if expected_excerpt_chars:
+        assert captured_users[0].endswith(
+            prior_prefix + "0123456789"[:expected_excerpt_chars])
+        assert len(captured_users[0]) == final_budget
+    else:
+        assert captured_users[0] == "b" * final_budget
+        assert prior_prefix not in captured_users[0]
+    assert coverage["warnings"].count(facts_warning) == 1
+    assert any(
+        f"limited to {expected_excerpt_chars} characters" in warning
+        for warning in coverage["warnings"]
+    )
+    assert captured_artifact["analysis_signature"] == {
+        "limits": resolved_limits,
+        "map_contract_version": repository_tasks._MAP_CONTRACT_VERSION,
+        "reduction_contract_version": (
+            repository_tasks._REDUCTION_CONTRACT_VERSION),
+        "reduction_planner_version": (
+            repository_tasks._REDUCTION_PLANNER_VERSION),
+    }
+
+
 def test_repository_under_limit_singleton_is_passed_through_losslessly(
     monkeypatch,
 ):
@@ -876,7 +1404,7 @@ def test_repository_subdivision_passes_through_valid_singleton(monkeypatch):
 
 def test_repository_all_singleton_level_still_uses_model_compression(monkeypatch):
     project, snapshot_id = _ready_snapshot("all-singleton-compression")
-    summaries = _reduction_summaries(count=2, body_chars=500)
+    summaries = _reduction_summaries(count=2, body_chars=800)
     assert [len(batch) for batch in repository_tasks._batches(
         summaries, _reduction_limits()["reduce_batch_chars"]
     )] == [1, 1]
@@ -937,7 +1465,10 @@ def test_repository_singleton_compression_without_progress_is_bounded(monkeypatc
     )] == [1, 1]
 
     calls: list[list[dict]] = []
-    monkeypatch.setattr(repository_tasks, "_analysis_limits", _reduction_limits)
+    limits = _reduction_limits()
+    limits["final_input_chars"] = 1_800
+    monkeypatch.setattr(
+        repository_tasks, "_analysis_limits", lambda: dict(limits))
     monkeypatch.setattr(
         llm, "resolve_model",
         lambda _function: ("ollama", "repository-reducer"),

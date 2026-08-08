@@ -31,6 +31,16 @@ function stringArray(value: unknown): string[] | undefined {
   return values.length ? values : undefined;
 }
 
+function numberRecord(value: unknown): Record<string, number> | undefined {
+  if (!isRecord(value)) return undefined;
+  const values = Object.entries(value).reduce<Record<string, number>>((result, [key, item]) => {
+    const parsed = numberValue(item);
+    if (parsed !== undefined) result[key] = parsed;
+    return result;
+  }, {});
+  return Object.keys(values).length ? values : undefined;
+}
+
 function parseResidentTransition(value: unknown) {
   if (!isRecord(value)) return undefined;
   const transition = {
@@ -123,6 +133,36 @@ function parseDiagnosticsObject(value: UnknownRecord): JobDiagnostics | null {
   const attempts = Array.isArray(value.attempts)
     ? value.attempts.map(parseAttempt).filter((item): item is JobDiagnosticAttempt => item !== null)
     : undefined;
+  const stagnation = isRecord(value.stagnation)
+    ? {
+        reason: textValue(value.stagnation.reason),
+        level: numberValue(value.stagnation.level),
+        batch_input_limit_chars: numberValue(value.stagnation.batch_input_limit_chars),
+        writer_input_limit_chars: numberValue(value.stagnation.writer_input_limit_chars),
+        input_items: numberValue(value.stagnation.input_items),
+        output_items: numberValue(value.stagnation.output_items),
+        input_chars: numberValue(value.stagnation.input_chars),
+        output_chars: numberValue(value.stagnation.output_chars),
+        input_writer_chars: numberValue(value.stagnation.input_writer_chars),
+        output_writer_chars: numberValue(value.stagnation.output_writer_chars),
+        writer_overhead_chars: numberValue(value.stagnation.writer_overhead_chars),
+        evidence_context_chars: numberValue(value.stagnation.evidence_context_chars),
+        item_delta: numberValue(value.stagnation.item_delta),
+        char_delta: numberValue(value.stagnation.char_delta),
+        top_level_batches: numberValue(value.stagnation.top_level_batches),
+        model_calls: numberValue(value.stagnation.model_calls),
+        model_reductions_accepted: numberValue(value.stagnation.model_reductions_accepted),
+        accepted_reductions: numberValue(value.stagnation.accepted_reductions),
+        accepted_reductions_total: numberValue(value.stagnation.accepted_reductions_total),
+        cache_hits: numberValue(value.stagnation.cache_hits),
+        singleton_passthroughs: numberValue(value.stagnation.singleton_passthroughs),
+        subdivisions: numberValue(value.stagnation.subdivisions),
+        outcome_counts: numberRecord(value.stagnation.outcome_counts),
+        evidence_id_count_before: numberValue(value.stagnation.evidence_id_count_before),
+        evidence_id_count_after: numberValue(value.stagnation.evidence_id_count_after),
+        evidence_preserved: booleanValue(value.stagnation.evidence_preserved),
+      }
+    : undefined;
   const diagnostics: JobDiagnostics = {
     stage: textValue(value.stage),
     effective_model: effectiveModel
@@ -139,6 +179,9 @@ function parseDiagnosticsObject(value: UnknownRecord): JobDiagnostics | null {
       ? cache
       : undefined,
     attempts: attempts?.length ? attempts : undefined,
+    stagnation: stagnation && Object.values(stagnation).some((item) => item !== undefined)
+      ? stagnation
+      : undefined,
     cause: textValue(value.cause),
   };
   return Object.values(diagnostics).some((item) => item !== undefined) ? diagnostics : null;
@@ -304,6 +347,123 @@ function cacheSummary(diagnostics: JobDiagnostics): string | null {
   return parts.length ? parts.join("; ") : null;
 }
 
+function signedCount(value: number): string {
+  return value > 0 ? `+${formatCount(value)}` : formatCount(value);
+}
+
+function stagnationSummary(diagnostics: JobDiagnostics): string | null {
+  const stagnation = diagnostics.stagnation;
+  if (!stagnation) return null;
+  const acceptedTotal = stagnation.accepted_reductions_total
+    ?? stagnation.accepted_reductions;
+  const hasWriterRange = stagnation.input_writer_chars !== undefined
+    && stagnation.input_writer_chars !== null
+    && stagnation.output_writer_chars !== undefined
+    && stagnation.output_writer_chars !== null;
+  const hasItemRange = stagnation.input_items !== undefined
+    && stagnation.input_items !== null
+    && stagnation.output_items !== undefined
+    && stagnation.output_items !== null;
+  const hasCharacterRange = stagnation.input_chars !== undefined
+    && stagnation.input_chars !== null
+    && stagnation.output_chars !== undefined
+    && stagnation.output_chars !== null;
+  const hasEvidenceRange = stagnation.evidence_id_count_before !== undefined
+    && stagnation.evidence_id_count_before !== null
+    && stagnation.evidence_id_count_after !== undefined
+    && stagnation.evidence_id_count_after !== null;
+  const parts = [
+    stagnation.reason
+      ? `${formatName(stagnation.reason)}${
+          stagnation.level !== undefined && stagnation.level !== null
+            ? ` at level ${formatCount(stagnation.level)}`
+            : ""
+        }`
+      : stagnation.level !== undefined && stagnation.level !== null
+        ? `level ${formatCount(stagnation.level)}`
+        : "",
+    hasWriterRange
+      ? `writer base ${formatCount(stagnation.input_writer_chars!)} to ${formatCount(
+          stagnation.output_writer_chars!,
+        )} characters${
+          stagnation.writer_input_limit_chars !== undefined
+            && stagnation.writer_input_limit_chars !== null
+            ? ` against a ${formatCount(stagnation.writer_input_limit_chars)}-character limit`
+            : ""
+        }`
+      : stagnation.output_writer_chars !== undefined && stagnation.output_writer_chars !== null
+        ? `writer base ${formatCount(stagnation.output_writer_chars)} characters${
+            stagnation.writer_input_limit_chars !== undefined
+              && stagnation.writer_input_limit_chars !== null
+              ? ` against a ${formatCount(stagnation.writer_input_limit_chars)}-character limit`
+              : ""
+          }`
+        : "",
+    stagnation.writer_overhead_chars !== undefined && stagnation.writer_overhead_chars !== null
+      ? `fixed writer overhead ${formatCount(stagnation.writer_overhead_chars)} characters${
+          stagnation.writer_input_limit_chars !== undefined
+            && stagnation.writer_input_limit_chars !== null
+            ? stagnation.writer_overhead_chars > stagnation.writer_input_limit_chars
+              ? `, exceeding the ${formatCount(
+                  stagnation.writer_input_limit_chars,
+                )}-character limit`
+              : ` within the ${formatCount(
+                  stagnation.writer_input_limit_chars,
+                )}-character limit`
+            : ""
+        }`
+      : "",
+    hasItemRange
+      ? `items ${formatCount(stagnation.input_items!)} to ${formatCount(stagnation.output_items!)}${
+          stagnation.item_delta !== undefined && stagnation.item_delta !== null
+            ? ` (delta ${signedCount(stagnation.item_delta)})`
+            : ""
+        }`
+      : "",
+    hasCharacterRange
+      ? `evidence ${formatCount(stagnation.input_chars!)} to ${formatCount(
+          stagnation.output_chars!,
+        )} characters${
+          stagnation.char_delta !== undefined && stagnation.char_delta !== null
+            ? ` (delta ${signedCount(stagnation.char_delta)})`
+            : ""
+        }`
+      : "",
+    stagnation.model_calls !== undefined && stagnation.model_calls !== null
+      ? `${formatCount(stagnation.model_calls)} model calls`
+      : "",
+    stagnation.model_reductions_accepted !== undefined
+      && stagnation.model_reductions_accepted !== null
+      ? `${formatCount(stagnation.model_reductions_accepted)} model reductions accepted`
+      : "",
+    stagnation.cache_hits !== undefined && stagnation.cache_hits !== null
+      ? `${formatCount(stagnation.cache_hits)} cached reductions reused`
+      : "",
+    (stagnation.model_reductions_accepted === undefined
+      || stagnation.model_reductions_accepted === null)
+      && acceptedTotal !== undefined && acceptedTotal !== null
+      ? `${formatCount(acceptedTotal)} accepted reductions`
+      : "",
+    stagnation.singleton_passthroughs !== undefined
+      && stagnation.singleton_passthroughs !== null
+      ? `${formatCount(stagnation.singleton_passthroughs)} singleton passthroughs`
+      : "",
+    stagnation.subdivisions !== undefined && stagnation.subdivisions !== null
+      ? `${formatCount(stagnation.subdivisions)} subdivisions`
+      : "",
+    stagnation.evidence_preserved !== undefined && stagnation.evidence_preserved !== null
+      ? `evidence IDs ${stagnation.evidence_preserved ? "preserved" : "changed"}${
+          hasEvidenceRange
+            ? ` (${formatCount(stagnation.evidence_id_count_before!)} to ${formatCount(
+                stagnation.evidence_id_count_after!,
+              )})`
+            : ""
+        }`
+      : "",
+  ].filter(Boolean);
+  return parts.length ? parts.join("; ") : null;
+}
+
 function attemptSummary(attempt: JobDiagnosticAttempt): string {
   const location = [
     attempt.level !== undefined && attempt.level !== null
@@ -346,6 +506,7 @@ export default function JobFailureDetails({ job }: { job: Job }) {
   const residentTransition = diagnostics ? residentTransitionSummary(diagnostics) : null;
   const reduction = diagnostics ? reductionSummary(diagnostics) : null;
   const cache = diagnostics ? cacheSummary(diagnostics) : null;
+  const stagnation = diagnostics ? stagnationSummary(diagnostics) : null;
   const technicalError = job.error.trim();
   const hasStructuredDetails = Boolean(
     diagnostics?.stage
@@ -355,6 +516,7 @@ export default function JobFailureDetails({ job }: { job: Job }) {
     || residentTransition
     || reduction
     || cache
+    || stagnation
     || diagnostics?.attempts?.length,
   );
   const showTechnicalError = Boolean(
@@ -411,6 +573,12 @@ export default function JobFailureDetails({ job }: { job: Job }) {
             <>
               <dt>Cached work</dt>
               <dd>{cache}</dd>
+            </>
+          )}
+          {stagnation && (
+            <>
+              <dt>Reduction stagnation</dt>
+              <dd>{stagnation}</dd>
             </>
           )}
         </dl>
