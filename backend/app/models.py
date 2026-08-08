@@ -100,6 +100,10 @@ class Job(SQLModel, table=True):
     progress: str = ""
     error: str = ""
     celery_id: str = ""
+    # Broker queue the task was dispatched to ("" = default queue). Worker
+    # startup recovery partitions running-job ownership by this value, so a
+    # restart of one worker cannot reset live jobs running on another.
+    queue: str = ""
     parent_job_id: int | None = Field(default=None, index=True)
     options: str = "{}"  # JSON run options (profile / explicit step set)
     # Structured, user-displayable execution details. This remains separate

@@ -12,7 +12,8 @@ The standard stack is orchestrated by `docker-compose.yml`.
 |---|---|
 | `frontend` | nginx serving the React application and proxying `/api` |
 | `api` | FastAPI REST endpoints, server-sent job events, library access |
-| `worker` | Celery media, model, TTS, indexing, and general pipeline work |
+| `worker` | Celery media, TTS, cloud-model, and general pipeline work |
+| `llm-worker` | Concurrency-one consumer of the serial `local_llm` queue: steps that generate or embed on the bundled Ollama server |
 | `paper-worker` | Concurrency-one, CPU-only Docling/Tesseract PDF extraction |
 | `beat` | Periodic backup-schedule checks |
 | `redis` | Celery broker and result backend |
@@ -21,10 +22,12 @@ The standard stack is orchestrated by `docker-compose.yml`.
 | `auth-egress` | DNS-pinned public-web-only HTTP/HTTPS proxy for Chromium and yt-dlp |
 | `auth-bridge` | Fixed WebDriver/noVNC bridge back to the API |
 
-`api`, `worker`, and `beat` use the same backend image but run different
-processes. Slow model or transcription calls therefore do not block the web
-interface. `paper-worker` consumes only the paper extraction queue and uses a
-dedicated image with its parser models baked in.
+`api`, `worker`, `llm-worker`, and `beat` use the same backend image but run
+different processes. Slow model or transcription calls therefore do not block
+the web interface. `llm-worker` serializes local-model work to match the
+Ollama server's one-generation-at-a-time capacity, while cloud-provider steps
+keep real parallelism on `worker`. `paper-worker` consumes only the paper
+extraction queue and uses a dedicated image with its parser models baked in.
 
 The authentication browser is used only when a source requires sign-in and
 holds no application volumes. Its Docker-internal network has no direct

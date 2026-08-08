@@ -44,6 +44,84 @@ def _repository_project(slug: str, *, private: bool = False):
         return project, source
 
 
+def test_step_queue_serializes_local_llm_steps():
+    from app.tasks import common
+
+    project, _source = _repository_project("queue-routing")
+    # A local-only repository project forces even the cloud-default deep
+    # dives onto Ollama, so they must serialize on the local_llm queue.
+    assert common.step_queue("deepdive_claude", project.id) == "local_llm"
+    assert common.step_queue("repo_inventory", project.id) == "local_llm"
+    # Non-LLM steps and the orchestrator stay on the default queue: run_all
+    # waits on children that need the serial queue, so routing it there
+    # would deadlock the pipeline.
+    assert common.step_queue("repo_snapshot", project.id) is None
+    assert common.step_queue("run_all", project.id) is None
+
+
+def test_step_queue_keeps_cloud_steps_parallel(monkeypatch):
+    from app import llm
+    from app.tasks import common
+
+    monkeypatch.setattr(llm, "resolve_model", lambda _fn: ("anthropic", "m"))
+    assert common.step_queue("deepdive_claude", None) is None
+    monkeypatch.setattr(llm, "resolve_model", lambda _fn: ("ollama", "m"))
+    assert common.step_queue("summarize", None) == "local_llm"
+
+    def broken(_fn):
+        raise RuntimeError("invalid local model setting")
+
+    # a broken local-model setting fails the task with the same error either
+    # way; the serialized queue is the safe default
+    monkeypatch.setattr(llm, "resolve_model", broken)
+    assert common.step_queue("repo_inventory", None) == "local_llm"
+
+
+def test_dispatch_step_records_serial_queue(monkeypatch):
+    from app.tasks import orchestrate
+
+    project, _source = _repository_project("queue-dispatch")
+    sent = {}
+
+    class FakeResult:
+        id = "celery-task-id"
+
+    def fake_send(step, args=None, queue=None):
+        sent["step"], sent["queue"] = step, queue
+        return FakeResult()
+
+    monkeypatch.setattr(orchestrate.celery, "send_task", fake_send)
+    with get_session() as session:
+        parent = Job(project_id=project.id, task="run_all", status="running")
+        session.add(parent)
+        session.commit()
+        session.refresh(parent)
+        parent_id = parent.id
+
+    job, err = orchestrate._dispatch_step(
+        parent_id, project.id, "deepdive_claude")
+    assert err is None
+    assert sent["step"] == "deepdive_claude"
+    assert sent["queue"] == "local_llm"
+    with get_session() as session:
+        stored = session.get(Job, job.id)
+        assert stored.queue == "local_llm"
+        assert stored.celery_id == "celery-task-id"
+
+    def failing_send(step, args=None, queue=None):
+        raise RuntimeError("broker down")
+
+    monkeypatch.setattr(orchestrate.celery, "send_task", failing_send)
+    job2, err2 = orchestrate._dispatch_step(parent_id, project.id, "quickref")
+    assert err2 is not None
+    with get_session() as session:
+        stored = session.get(Job, job2.id)
+        # ownership was durable before the publish attempt: a worker restart
+        # in the send window can never misclassify this job
+        assert stored.queue == "local_llm"
+        assert stored.status == "error"
+
+
 def test_repository_graph_is_source_aware_and_omits_media_steps():
     project = Project(
         slug="repo-graph", title="Repo Graph",

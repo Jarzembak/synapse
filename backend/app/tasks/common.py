@@ -17,6 +17,79 @@ from ..security import redact_urls
 log = logging.getLogger("synapse.pipeline")
 TERMINAL_JOB_STATES = {"done", "error", "canceled"}
 
+# The bundled Ollama server generates one completion at a time
+# (OLLAMA_NUM_PARALLEL=1), so dispatching several local-LLM steps to
+# concurrent worker slots only parks them in Ollama's queue while their HTTP
+# read timeouts keep ticking. Steps that will generate on the local server are
+# routed to this queue, consumed by the concurrency-one llm-worker; steps on
+# cloud providers keep real parallelism on the default queue.
+LOCAL_LLM_QUEUE = "local_llm"
+
+# The pipeline function whose resolved provider decides where a step's
+# generation load lands. Steps that call several functions are represented by
+# the one that dominates their runtime.
+STEP_LLM_FUNCTIONS = {
+    "repo_inventory": "repository_map",
+    "repo_usage": "repository_map",
+    "repo_architecture": "repository_map",
+    "repo_expertise": "repository_map",
+    "repo_environment": "repository_map",
+    "correct": "correct",
+    "summarize": "summarize",
+    "deepdive_claude": "deepdive_claude",
+    "deepdive_gemini": "deepdive_gemini",
+    "merge": "merge",
+    "quickref": "quickref",
+    "podcast_script": "podcast_script",
+    "mindmap": "mindmap",
+    "trim": "trim_spans",
+    "tag_artifact": "tag",
+    "tag_project": "tag",
+    "paper_analyze": "paper_map",
+    "paper_plan": "paper_plan",
+    "paper_series_run": "paper_synthesis",
+    "paper_part_step": "paper_synthesis",
+    "paper_rebuild_following": "paper_synthesis",
+}
+# The dominant-function approximation is deliberate: a step may mix
+# providers (e.g. cloud paper synthesis plus the always-local paper_memory
+# pass), and its residual short local calls stay on the default queue. The
+# bulk generations are what burn timeouts behind Ollama's one-at-a-time
+# server, and those follow the dominant function.
+
+
+def step_queue(step: str, project_id: int | None) -> str | None:
+    """Return the broker queue for a step, or None for the default queue.
+
+    Resolution happens inside the project's privacy scope, so a private or
+    local-only project forces its cloud-default steps (deep dives, merge,
+    quickref, …) onto Ollama and therefore onto the serial queue, while the
+    same steps on a cloud-eligible project stay parallel.
+    """
+    function = STEP_LLM_FUNCTIONS.get(step)
+    if not function:
+        return None
+    from .. import llm
+
+    try:
+        with llm.project_scope(project_id):
+            provider, _model = llm.resolve_model(function)
+    except Exception:
+        # a broken local-model setting fails the task itself with the same
+        # error; running it serialized is the safe default
+        return LOCAL_LLM_QUEUE
+    return LOCAL_LLM_QUEUE if provider == "ollama" else None
+
+
+def embedding_queue() -> str | None:
+    """Queue for search-embedding tasks: serial when they hit local Ollama."""
+    from ..settings_store import get_setting
+
+    if not get_setting("search.semantic_enabled", False):
+        return None
+    provider = get_setting("search.embedding_provider", "ollama")
+    return LOCAL_LLM_QUEUE if provider == "ollama" else None
+
 
 class JobCanceled(RuntimeError):
     pass
@@ -252,9 +325,13 @@ def auto_tag(project_id: int | None, artifact_id: int) -> None:
         return
     try:
         if art and art.type.startswith("quickref_"):
-            tag_task.delay(artifact_id)
+            tag_task.apply_async(
+                args=[artifact_id],
+                queue=step_queue("tag_artifact", project_id))
         elif project_id:
-            tag_project.delay(project_id)
+            tag_project.apply_async(
+                args=[project_id],
+                queue=step_queue("tag_project", project_id))
     except Exception:
         log.warning("could not queue automatic tagging for artifact %s",
                     artifact_id, exc_info=True)
