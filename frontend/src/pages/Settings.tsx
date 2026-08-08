@@ -1174,7 +1174,7 @@ export default function Settings() {
                       formatBytes(ollamaInventory.resources.ram_total_bytes)
                     }.`
                   : `Local resource assessment unavailable: ${ollamaInventory.resources.reason}`
-                : "This Ollama server is remote. Configure its resource profile before relying on fit estimates."}
+                : "Synapse cannot see this Ollama server's RAM or GPU, so resource-fit estimates are unavailable; capability and installation checks still run."}
             </p>
             <div className="ollama-model-grid">
               {ollamaInventory.models.map((model) => {

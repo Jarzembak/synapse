@@ -91,7 +91,7 @@ def _resources(*, available: bool = True) -> dict:
     if not available:
         return {
             "available": False,
-            "reason": "remote Ollama resources are not visible to Synapse",
+            "reason": "the Ollama host's resources are not visible to Synapse",
             "ram_total_bytes": 0,
             "ram_available_bytes": 0,
             "vram_total_bytes": 0,
@@ -293,7 +293,39 @@ def test_remote_ollama_does_not_use_local_resource_numbers(monkeypatch):
         requested_context=65_536,
     )
     assert result["assessment"]["tier"] == "unavailable"
-    assert "remote Ollama" in result["assessment"]["message"]
+    assert "not visible" in result["assessment"]["message"]
+
+
+def test_endpoint_is_local_excludes_host_docker_internal():
+    from app import local_model_safety as safety
+
+    assert safety._endpoint_is_local("http://ollama:11434")
+    assert safety._endpoint_is_local("http://localhost:11434")
+    assert safety._endpoint_is_local("http://127.0.0.1:11434")
+    assert not safety._endpoint_is_local("http://host.docker.internal:11434")
+    assert not safety._endpoint_is_local("http://10.0.0.5:11434")
+
+
+def test_host_gateway_ollama_degrades_to_unavailable_instead_of_blocking(
+    monkeypatch,
+):
+    """A daemon reached via host.docker.internal must not be scored with this
+    container's RAM/GPU: Docker Desktop exposes the VM's memory and no
+    nvidia-smi, which blocked models that fit comfortably on the host GPU."""
+    from app import local_model_safety as safety
+
+    monkeypatch.setattr(
+        safety.settings, "ollama_base_url", "http://host.docker.internal:11434")
+    huge = _row(name="host-gpu-model:latest", size=120 * GIB)
+    monkeypatch.setattr(
+        safety, "_fetch_inventory", lambda refresh=False: _inventory(huge))
+
+    assert safety.runtime_resources()["available"] is False
+
+    result = safety.ensure_model_safe(
+        huge["name"], role="completion", requested_context=65_536)
+    assert result["available"] is True
+    assert result["assessment"]["tier"] == "unavailable"
 
 
 def test_catalog_reports_residency_and_unload_releases_only_selected_model(

@@ -37,6 +37,13 @@ reducer starts with the Qwen 3.5 4B default.
 - an Ollama daemon on the Docker host; or
 - for ordinary media workflows, another machine on a trusted network.
 
+Resource-fit admission (the blocked/recommended tiers in the model catalog)
+applies only when Synapse can measure the Ollama host's memory — the bundled
+container or a same-machine daemon. For `host.docker.internal` or a remote
+address the Synapse containers cannot see that machine's RAM or GPU, so the
+catalog reports resource status as unavailable and requests proceed;
+capability and installation checks still run.
+
 `openai_compat` can similarly point to a compatible server on the host or
 network. It is for OpenAI-compatible engines that are not OpenAI itself.
 Select `openai` for OpenAI's cloud API because its current request formats,
