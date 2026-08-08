@@ -93,7 +93,11 @@ def _endpoint_is_local(base_url: str | None = None) -> bool:
         host = (parsed.hostname or "").rstrip(".").casefold()
         if parsed.scheme not in {"http", "https"}:
             return False
-        if host in {"localhost", "ollama", "host.docker.internal"}:
+        # host.docker.internal is deliberately absent: it names the machine
+        # OUTSIDE this container's sandbox, so psutil RAM and nvidia-smi here
+        # describe the Docker Desktop VM — not the host actually running
+        # Ollama, which may hold a GPU this container cannot see.
+        if host in {"localhost", "ollama"}:
             return True
         return ipaddress.ip_address(host).is_loopback
     except (ValueError, TypeError):
@@ -212,7 +216,7 @@ def runtime_resources() -> dict:
     if not local:
         return {
             "available": False,
-            "reason": "remote Ollama resources are not visible to Synapse",
+            "reason": "the Ollama host's resources are not visible to Synapse",
             "ram_total_bytes": 0,
             "ram_available_bytes": 0,
             "vram_total_bytes": 0,
@@ -667,7 +671,8 @@ def acknowledge_blocked_model(
     resources = _resources_with_resident_capacity(runtime_resources(), running)
     if not resources["available"]:
         raise ValueError(
-            "remote Ollama resource overrides require a configured remote resource profile"
+            "the Ollama host's resources are not visible to Synapse, so no "
+            "model is resource-blocked here and there is nothing to override"
         )
     assessment = resource_assessment(
         row,
