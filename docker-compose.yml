@@ -130,9 +130,16 @@ services:
 
   worker:
     build: ./backend
-    # concurrency 4: run-all's orchestrator occupies one slot while the
-    # parallel branches (e.g. both deep dives) run in the others
-    command: celery -A app.tasks.celery_app.celery worker --loglevel=info --concurrency=4
+    # concurrency 4: run-all's orchestrator occupies one slot while parallel
+    # cloud branches (e.g. both deep dives on frontier APIs) run in the
+    # others. Steps that generate on the bundled Ollama server are routed to
+    # the serial local_llm queue below instead — the server generates one
+    # completion at a time, so parallel slots would only burn read timeouts.
+    # -Q celery is explicit and load-bearing: a worker without -Q rebuilds
+    # its consumption list from every queue it has ever PRODUCED to when the
+    # broker connection is re-established, which would silently make this
+    # worker a local_llm consumer after a Redis blip.
+    command: celery -A app.tasks.celery_app.celery worker --loglevel=info --concurrency=4 -Q celery
     env_file: .env
     environment:
       - REDIS_URL=redis://redis:6379/0
@@ -165,6 +172,41 @@ services:
     networks:
       - default
       - media-egress
+    restart: unless-stopped
+
+  llm-worker:
+    build: ./backend
+    # One local generation at a time, matching OLLAMA_NUM_PARALLEL=1: steps
+    # whose resolved provider is the local Ollama server queue here instead
+    # of parking in Ollama's own queue while their HTTP read timeouts tick.
+    command: >-
+      celery -A app.tasks.celery_app.celery worker --loglevel=info
+      --concurrency=1 -Q local_llm
+    env_file: .env
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://ollama:11434}
+      - LIBRARY_DIR=/data/library
+      - MEDIA_DIR=/data/media
+      - REPOSITORY_DIR=/data/repositories
+      - DB_PATH=/data/db/vst.sqlite3
+      - BACKUP_DIR=/data/backups
+      - LOG_DIR=/data/logs
+      - LOG_NAME=llm-worker
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - SYNAPSE_LOCAL_LLM_WORKER=1
+    volumes:
+      - ./data/library:/data/library
+      - ./data/media:/data/media
+      - ./data/repositories:/data/repositories
+      - ./data/db:/data/db
+      - ./data/backups:/data/backups
+      - ./data/logs:/data/logs
+    depends_on:
+      redis:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
     restart: unless-stopped
 
   paper-worker:

@@ -925,6 +925,50 @@ def test_reset_orphaned_jobs_unblocks_queue(client):
         assert job.status == "error" and "interrupted" in job.error
 
 
+def test_reset_orphaned_jobs_partitions_by_queue(client, monkeypatch):
+    """A local-LLM worker restart must not reset the ordinary worker's live
+    jobs, and an ordinary-worker restart must not reset serial-queue jobs."""
+    from app.models import Job
+    from app.tasks import celery_app as capp
+
+    with get_session() as session:
+        local = Job(project_id=None, task="deepdive_claude",
+                    status="running", queue="local_llm")
+        ordinary = Job(project_id=None, task="transcribe", status="running")
+        session.add(local)
+        session.add(ordinary)
+        session.commit()
+        session.refresh(local)
+        session.refresh(ordinary)
+        local_id, ordinary_id = local.id, ordinary.id
+
+    monkeypatch.setattr(capp, "LOCAL_LLM_WORKER", True)
+    capp._reset_orphaned_jobs()
+    with get_session() as session:
+        assert session.get(Job, local_id).status == "error"
+        assert session.get(Job, ordinary_id).status == "running"
+
+    monkeypatch.setattr(capp, "LOCAL_LLM_WORKER", False)
+    capp._reset_orphaned_jobs()
+    with get_session() as session:
+        assert session.get(Job, ordinary_id).status == "error"
+
+
+def test_embedding_queue_follows_search_settings(monkeypatch):
+    from app import settings_store
+    from app.tasks import common
+
+    values = {"search.semantic_enabled": True,
+              "search.embedding_provider": "ollama"}
+    monkeypatch.setattr(settings_store, "get_setting",
+                        lambda key, default=None: values.get(key, default))
+    assert common.embedding_queue() == "local_llm"
+    values["search.embedding_provider"] = "openai_compat"
+    assert common.embedding_queue() is None
+    values["search.semantic_enabled"] = False
+    assert common.embedding_queue() is None
+
+
 def test_reset_orphaned_jobs_preserves_media_auth_leases(
     client, monkeypatch,
 ):

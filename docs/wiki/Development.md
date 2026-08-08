@@ -27,8 +27,13 @@ npm run build
 Start backend services with the development overlay:
 
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.dev.yml up api redis ollama worker beat
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up api redis ollama worker llm-worker beat
 ```
+
+`llm-worker` is required even in development: steps whose resolved provider
+is the local Ollama server (media correction, tagging, repository analysis,
+semantic indexing with the default embedding provider) queue on `local_llm`
+and will sit queued forever without its consumer.
 
 Then start Vite in another terminal:
 

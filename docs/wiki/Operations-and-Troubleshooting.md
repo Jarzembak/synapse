@@ -24,6 +24,7 @@ files:
 ```text
 data/logs/synapse-api.log
 data/logs/synapse-worker.log
+data/logs/synapse-llm-worker.log
 data/logs/synapse-beat.log
 ```
 
@@ -170,8 +171,13 @@ same-name copy.
   available triggers.
 - Two-way sync applies only to the Markdown library; archived media remains
   push-only.
-- Job recovery assumes the ordinary worker and paper worker topology in
-  Compose. Scaling a queue to independent replicas needs distributed leasing.
+- Job recovery partitions running-job ownership by dispatch queue: the
+  ordinary worker, the `llm-worker` (serial `local_llm` queue), and the paper
+  worker each reset only their own jobs on restart. Scaling a queue to
+  independent replicas needs distributed leasing.
+- If local-model steps (media correction, repository analysis, tagging,
+  semantic indexing) sit queued while cloud steps run, check that
+  `llm-worker` is up — it is the only consumer of the `local_llm` queue.
 - Embeddings are stored in SQLite and scored in process. A very large
   multi-user library would need a dedicated vector index.
 - Paper v1 does not interpret charts or diagrams, search external scholarly

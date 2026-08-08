@@ -35,6 +35,10 @@ celery.conf.beat_schedule = {
 }
 
 PAPER_WORKER = os.environ.get("SYNAPSE_PAPER_WORKER", "").strip() == "1"
+# The concurrency-one worker consuming the serial local-LLM queue; it runs
+# the same task modules as the ordinary worker but only receives steps whose
+# resolved provider is the bundled Ollama server (see common.step_queue).
+LOCAL_LLM_WORKER = os.environ.get("SYNAPSE_LOCAL_LLM_WORKER", "").strip() == "1"
 
 from ..db import init_db  # noqa: E402
 
@@ -72,15 +76,25 @@ def _reset_orphaned_jobs(**_kwargs):
     from ..task_names import MEDIA_AUTH_LEASE_TASK
 
     try:
+        from .common import LOCAL_LLM_QUEUE
+
         paper_recovery = {"series": 0, "parts": 0}
         with get_session() as session:
-            owned_task = (
-                Job.task == "paper_extract" if PAPER_WORKER
-                else Job.task.not_in((
-                    "paper_extract",
-                    MEDIA_AUTH_LEASE_TASK,
-                ))
-            )
+            if PAPER_WORKER:
+                owned_task = Job.task == "paper_extract"
+            elif LOCAL_LLM_WORKER:
+                # Only jobs dispatched to the serial local-LLM queue belong to
+                # this worker; the ordinary worker's live jobs must survive a
+                # restart here, and vice versa.
+                owned_task = Job.queue == LOCAL_LLM_QUEUE
+            else:
+                owned_task = (
+                    Job.task.not_in((
+                        "paper_extract",
+                        MEDIA_AUTH_LEASE_TASK,
+                    ))
+                    & (Job.queue != LOCAL_LLM_QUEUE)
+                )
             stale = session.exec(select(Job).where(
                 Job.status == "running", owned_task,
             )).all()
@@ -92,17 +106,23 @@ def _reset_orphaned_jobs(**_kwargs):
                 session.add(job)
             # Planned child rows that never reached the broker are distinguishable
             # from durable queued Celery messages by their empty celery id.
-            ghost_scope = (
-                Job.task == "paper_extract" if PAPER_WORKER
-                else Job.task.not_in((
-                    "run_all",
-                    "paper_extract",
-                    MEDIA_AUTH_LEASE_TASK,
-                ))
-            )
-            ghosts = session.exec(select(Job).where(
-                Job.status == "queued", ghost_scope, Job.celery_id == "",
-            )).all()
+            # Ghosts were never dispatched, so erroring them needs no
+            # coordination with the worker that would have run them — the
+            # always-present ordinary worker owns every non-paper ghost
+            # regardless of the queue recorded on the row.
+            ghosts = []
+            if not LOCAL_LLM_WORKER:
+                ghost_scope = (
+                    Job.task == "paper_extract" if PAPER_WORKER
+                    else Job.task.not_in((
+                        "run_all",
+                        "paper_extract",
+                        MEDIA_AUTH_LEASE_TASK,
+                    ))
+                )
+                ghosts = session.exec(select(Job).where(
+                    Job.status == "queued", ghost_scope, Job.celery_id == "",
+                )).all()
             for job in ghosts:
                 job.status = "error"
                 job.error = "interrupted before broker dispatch"
@@ -119,6 +139,18 @@ def _reset_orphaned_jobs(**_kwargs):
                 logging.getLogger("synapse.pipeline").warning(
                     "reset %d running and %d undispatched paper job(s)",
                     len(stale), len(ghosts))
+            return
+        if LOCAL_LLM_WORKER:
+            # Staging cleanup, media recovery, purge sweeps, and the run-all
+            # kick remain the ordinary worker's startup duties.
+            if stale:
+                logging.getLogger("synapse.pipeline").warning(
+                    "reset %d running local-LLM job(s) on worker start",
+                    len(stale))
+            if paper_recovery["series"] or paper_recovery["parts"]:
+                logging.getLogger("synapse.pipeline").warning(
+                    "reconciled %d interrupted paper series and %d part(s)",
+                    paper_recovery["series"], paper_recovery["parts"])
             return
         from ..repository import cleanup_repository_staging
 

@@ -326,7 +326,10 @@ def ollama_benchmark(req: OllamaBenchmark):
             progress = existing.progress or ""
             if progress == model or progress.startswith(model + ": "):
                 return existing.model_dump()
-        job = Job(project_id=None, task="ollama_benchmark", progress=model)
+        from ..tasks.common import LOCAL_LLM_QUEUE
+
+        job = Job(project_id=None, task="ollama_benchmark", progress=model,
+                  queue=LOCAL_LLM_QUEUE)
         session.add(job)
         session.commit()
         session.refresh(job)
@@ -334,6 +337,7 @@ def ollama_benchmark(req: OllamaBenchmark):
             async_result = celery.send_task(
                 "ollama_benchmark",
                 args=[job.id, model],
+                queue=LOCAL_LLM_QUEUE,
             )
             job.celery_id = async_result.id
         except Exception as exc:

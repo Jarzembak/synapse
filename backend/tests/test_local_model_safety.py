@@ -756,7 +756,7 @@ def test_post_pull_benchmark_invalidates_inventory_and_queues_separate_job(
     monkeypatch.setattr(
         localmodels.celery,
         "send_task",
-        lambda name, args=None: sent.append((name, args))
+        lambda name, args=None, queue=None: sent.append((name, args, queue))
         or types.SimpleNamespace(id="benchmark-celery-id"),
     )
 
@@ -772,8 +772,11 @@ def test_post_pull_benchmark_invalidates_inventory_and_queues_separate_job(
         assert job is not None
         assert json.loads(job.options) == {"automatic": True}
         assert job.celery_id == "benchmark-celery-id"
+        # the probe generates on Ollama, so it must wait its turn behind any
+        # running analysis instead of colliding with it
+        assert job.queue == "local_llm"
         job_id = job.id
         job.status = "done"
         session.add(job)
         session.commit()
-    assert sent == [("ollama_benchmark", [job_id, row["name"]])]
+    assert sent == [("ollama_benchmark", [job_id, row["name"]], "local_llm")]
