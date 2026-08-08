@@ -335,12 +335,17 @@ def resolve_model(function: str) -> tuple[str, str]:
     return _enforce_local_provider(function, d["provider"], d["model"])
 
 
-def resolve_params(function: str) -> tuple[float | None, int]:
-    """Per-function generation params (Settings → Advanced, key params.<fn>)."""
+def resolve_params(function: str) -> tuple[float | None, int, bool]:
+    """Per-function generation params (Settings → Advanced, key params.<fn>).
+
+    The third element reports whether max_tokens was explicitly configured —
+    the module-wide MAX_TOKENS fallback is a ceiling local planning may fit
+    to the model, while a configured value is a demand."""
     p = get_setting(f"params.{function}") or {}
     temperature = p.get("temperature")
+    explicit = bool(p.get("max_tokens"))
     max_tokens = int(p.get("max_tokens") or MAX_TOKENS)
-    return temperature, max_tokens
+    return temperature, max_tokens, explicit
 
 
 def complete(
@@ -360,9 +365,14 @@ def complete(
         provider, model = resolve_model(function)
     provider, model = _enforce_local_provider(
         function, provider, model, local_only=restricted)
-    temperature, cfg_max = resolve_params(function)
+    temperature, cfg_max, cfg_explicit = resolve_params(function)
+    default_budget = False
     if max_tokens is None:
         max_tokens = cfg_max
+        # Untuned functions fall back to the module-wide MAX_TOKENS ceiling;
+        # local context planning may fit that ceiling to the model instead of
+        # charging all 16k output tokens against a small context window.
+        default_budget = not cfg_explicit
 
     log.debug("completing %s via %s/%s (max_tokens=%s, temperature=%s)",
               function, provider, model, max_tokens, temperature)
@@ -399,7 +409,8 @@ def complete(
                 if provider == "ollama":
                     output = _ollama(system, user, model, max_tokens, temperature,
                                      json_format, restricted=restricted,
-                                     function=function)
+                                     function=function,
+                                     default_budget=default_budget)
                 elif provider == "openai_compat":
                     output = _openai_compat(system, user, model, max_tokens,
                                             temperature, json_format)
@@ -554,16 +565,36 @@ def _ollama_context_plan(
     *,
     configured_context: int,
     native_context: int = 0,
+    flexible_output: bool = False,
 ) -> dict[str, int]:
     input_tokens = _estimate_input_tokens(system, user)
     output_tokens = max(1, int(max_tokens))
+    configured_minimum = max(1_024, int(configured_context))
+    if flexible_output and native_context:
+        # The module-default budget (MAX_TOKENS) is a ceiling for functions
+        # nobody has tuned, not a demand: charged in full it exceeds any
+        # <=16k-context model's whole window, refusing every call with
+        # "subdivide the input" advice that cannot help. Fit the default to
+        # the window the planner can actually grant — requested context is
+        # bucketed and capped, so a 128k-native model still admits at most
+        # the automatic cap; fitting against raw native would leave mid-size
+        # prompts refused with a self-contradictory message. Solving
+        # input + out + margin(out) <= ceiling with margin >= out/10 gives
+        # out <= (ceiling - input - prompt margin)/1.1.
+        ceiling = min(
+            native_context,
+            max(configured_minimum, LOCAL_AUTOMATIC_CONTEXT_CAP),
+        )
+        prompt_margin = max(512, math.ceil(input_tokens * 0.10))
+        fitted = math.floor((ceiling - input_tokens - prompt_margin) / 1.1)
+        if fitted >= 256:
+            output_tokens = min(output_tokens, fitted)
     safety_margin = max(
         512,
         math.ceil(input_tokens * 0.10),
         math.ceil(output_tokens * 0.10),
     )
     required = input_tokens + output_tokens + safety_margin
-    configured_minimum = max(1_024, int(configured_context))
     requested = _bucket_context(
         max(configured_minimum, required),
         configured_minimum=configured_minimum,
@@ -576,12 +607,14 @@ def _ollama_context_plan(
         "requested_context": requested,
         "effective_context": effective,
         "native_context": native_context,
+        "planned_output_tokens": output_tokens,
     }
 
 
 def _ollama(system: str, user: str, model: str, max_tokens: int,
             temperature: float | None, json_format: bool = False,
-            *, restricted: bool = False, function: str = "") -> str:
+            *, restricted: bool = False, function: str = "",
+            default_budget: bool = False) -> str:
     """Ollama's native /api/chat. The native API (unlike its OpenAI-compat
     shim) accepts per-call options — critically num_ctx, without which long
     transcript chunks are silently truncated at the server's default window."""
@@ -593,9 +626,10 @@ def _ollama(system: str, user: str, model: str, max_tokens: int,
         max_tokens,
         configured_context=int(cfg["num_ctx"]),
         native_context=native_context,
+        flexible_output=default_budget,
     )
     options: dict = {
-        "num_predict": max_tokens,
+        "num_predict": context_plan["planned_output_tokens"],
         "num_ctx": context_plan["effective_context"],
     }
     timeout_seconds = float(cfg["timeout_seconds"])
@@ -610,7 +644,7 @@ def _ollama(system: str, user: str, model: str, max_tokens: int,
         effective_context=context_plan["effective_context"],
         native_context=context_plan["native_context"] or None,
         timeout_seconds=timeout_seconds,
-        max_output_tokens=max_tokens,
+        max_output_tokens=context_plan["planned_output_tokens"],
         estimated_input_tokens=context_plan["estimated_input_tokens"],
         safety_margin_tokens=context_plan["safety_margin_tokens"],
         required_context=context_plan["required_context"],
@@ -649,6 +683,7 @@ def _ollama(system: str, user: str, model: str, max_tokens: int,
         safety_assessment=safety.get("assessment"),
         resident_transition=safety.get("resident_transition"),
     )
+    vetted_context = int(options["num_ctx"])
     fresh_native_context = int(safety.get("native_context_tokens") or 0)
     discovered_native = fresh_native_context or native_context
     if discovered_native and discovered_native != native_context:
@@ -658,10 +693,16 @@ def _ollama(system: str, user: str, model: str, max_tokens: int,
             max_tokens,
             configured_context=int(cfg["num_ctx"]),
             native_context=discovered_native,
+            flexible_output=default_budget,
         )
+        options["num_predict"] = context_plan["planned_output_tokens"]
         options["num_ctx"] = context_plan["effective_context"]
-        if options["num_ctx"] != context_plan["requested_context"]:
-            # Reassess resources against the context Ollama will actually use.
+        if options["num_ctx"] != vetted_context:
+            # Reassess resources against the context Ollama will actually
+            # use. Compare against the context the first admission vetted,
+            # not the plan's own requested bucket — a discovered-larger
+            # native window can grow the KV reservation past what was
+            # admitted while landing exactly on its new bucket.
             try:
                 safety = ensure_model_safe(
                     model,
@@ -689,7 +730,7 @@ def _ollama(system: str, user: str, model: str, max_tokens: int,
         effective_context=context_plan["effective_context"],
         native_context=context_plan["native_context"] or None,
         timeout_seconds=timeout_seconds,
-        max_output_tokens=max_tokens,
+        max_output_tokens=context_plan["planned_output_tokens"],
         estimated_input_tokens=context_plan["estimated_input_tokens"],
         safety_margin_tokens=context_plan["safety_margin_tokens"],
         required_context=context_plan["required_context"],
@@ -768,7 +809,8 @@ def _ollama(system: str, user: str, model: str, max_tokens: int,
         # would corrupt artifacts silently, and retrying with the same budget
         # re-bills the identical truncation, so fail loud and non-transient.
         raise OutputBudgetError(
-            model=model, max_tokens=max_tokens, visible_output=bool(output))
+            model=model, max_tokens=int(options["num_predict"]),
+            visible_output=bool(output))
     return output
 
 

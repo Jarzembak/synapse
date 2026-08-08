@@ -1102,9 +1102,10 @@ export default function Settings() {
                         const label = model.annotation.label
                           ? `${model.annotation.label} — `
                           : "";
-                        const assessment = fn.startsWith("paper_")
-                          ? model.restricted_assessment ?? model.assessment
-                          : model.assessment;
+                        const assessment =
+                          fn.startsWith("paper_") || fn.startsWith("repository_")
+                            ? model.repository_assessment ?? model.assessment
+                            : model.assessment;
                         return `${label}${modelName} [${RESOURCE_TIER_LABELS[assessment.tier]}]`;
                       }
                     : undefined}
