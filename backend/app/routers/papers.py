@@ -503,6 +503,13 @@ def _paper_payload(session, project: Project, source: PaperSource) -> dict:
 
 def _dispatch_job(session, job: Job, task_name: str, args: list) -> Job:
     """Commit the durable job before dispatch and fail it closed on broker errors."""
+    from ..tasks.common import step_queue
+
+    # None leaves task_routes in charge (paper_extract -> paper queue);
+    # local-LLM steps serialize on local_llm. Ownership must be durable
+    # before the message is consumable (recovery partitions on Job.queue).
+    queue = step_queue(task_name, job.project_id)
+    job.queue = queue or ""
     session.add(job)
     try:
         session.commit()
@@ -514,7 +521,7 @@ def _dispatch_job(session, job: Job, task_name: str, args: list) -> Job:
         # Kept local so API imports do not load the parser/model task tree.
         from ..tasks.celery_app import celery
 
-        result = celery.send_task(task_name, args=args)
+        result = celery.send_task(task_name, args=args, queue=queue)
     except Exception as exc:
         job.status = "error"
         job.error = f"could not dispatch to worker: {exc}"

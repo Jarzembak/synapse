@@ -981,7 +981,17 @@ def paper_series_run(job_id: int, project_id: int, series_id: int):
             _generate_suite_item(
                 job_id, project_id, series_id, artifact_type, title, directive)
         parts = _series_parts(series_id)
-        with ThreadPoolExecutor(max_workers=min(3, max(1, len(parts)))) as executor:
+        # The thread fan-out only helps cloud providers: the local Ollama
+        # server generates one completion at a time, so three concurrent
+        # part guides would just park in its queue burning read timeouts —
+        # from inside the serial local_llm slot this task occupies.
+        try:
+            with llm.project_scope(project_id):
+                guide_provider, _model = llm.resolve_model("paper_synthesis")
+        except Exception:
+            guide_provider = "ollama"
+        workers = 1 if guide_provider == "ollama" else min(3, max(1, len(parts)))
+        with ThreadPoolExecutor(max_workers=workers) as executor:
             list(executor.map(
                 lambda part: _threaded_guide(
                     job_id, project_id, series_id, part.id),

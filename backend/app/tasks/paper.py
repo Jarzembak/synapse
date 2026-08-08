@@ -2279,9 +2279,11 @@ def paper_extract(job_id: int, project_id: int):
             source_id = source.id
         if get_setting("search.semantic_enabled", False):
             try:
+                from .common import embedding_queue
                 from .search import index_paper_chunks
 
-                index_paper_chunks.delay(source_id)
+                index_paper_chunks.apply_async(
+                    args=[source_id], queue=embedding_queue())
             except Exception:
                 log.warning(
                     "could not queue semantic indexing for paper source %s",

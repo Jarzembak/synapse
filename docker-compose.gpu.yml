@@ -24,6 +24,19 @@ services:
               count: all
               capabilities: [gpu]
 
+  # llm-worker gets the GPU reservation — not for compute, but because the
+  # model-safety preflight (ensure_model_safe) runs nvidia-smi inside the
+  # container making the call; without it this worker would score the GPU
+  # host with vram_total=0 and wrongly block models that fit.
+  llm-worker:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
   # api also gets the GPU reservation — not for compute, but so the resource
   # monitor's nvidia-smi call can report GPU utilization/VRAM from this container.
   api:

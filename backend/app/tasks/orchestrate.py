@@ -17,7 +17,7 @@ from ..db import get_session
 from ..models import Artifact, Job, Project
 from ..settings_store import get_setting
 from .celery_app import celery
-from .common import TERMINAL_JOB_STATES, set_job, transition_job
+from .common import TERMINAL_JOB_STATES, set_job, step_queue, transition_job
 
 log = logging.getLogger("synapse.pipeline")
 
@@ -519,8 +519,15 @@ def _dispatch_step(parent_id: int, project_id: int, step: str) -> tuple[Job | No
         return None, RuntimeError("could not claim an active step job")
     if job.celery_id or job.status == "running":
         return job, None
+    queue = step_queue(step, project_id)
+    with get_session() as session:
+        # Ownership must be durable before the message is consumable: worker
+        # restart recovery partitions running jobs by Job.queue, so a job the
+        # llm-worker picks up before this row said "local_llm" could be
+        # falsely reset by an ordinary-worker restart.
+        set_job(session, job.id, queue=queue or "")
     try:
-        result = celery.send_task(step, args=[job.id, project_id])
+        result = celery.send_task(step, args=[job.id, project_id], queue=queue)
         with get_session() as session:
             set_job(session, job.id, celery_id=result.id)
             return session.get(Job, job.id), None

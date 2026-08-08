@@ -674,8 +674,10 @@ def _queue_semantic_index(artifact: Artifact) -> None:
         return
     try:
         from .tasks.celery_app import celery
+        from .tasks.common import embedding_queue
 
-        celery.send_task("index_artifact_chunks", args=[artifact.id])
+        celery.send_task("index_artifact_chunks", args=[artifact.id],
+                         queue=embedding_queue())
     except Exception:
         log.warning("could not queue semantic indexing for %s", artifact.path,
                     exc_info=True)

@@ -28,6 +28,7 @@ from ..security import redact_url, validate_source_url
 from ..trusted_origin import require_trusted_frontend
 from ..tasks import media
 from ..tasks.celery_app import celery
+from ..tasks.common import step_queue
 from ..tasks.ingest import cookies_path
 
 from ..tasks.orchestrate import (  # noqa: E402
@@ -462,7 +463,10 @@ def run_step(project_id: int, step: str):
         missing = missing_deps(session, project, step)
         if missing:
             raise HTTPException(409, f"{step} requires: {', '.join(missing)}")
-        job = Job(project_id=project_id, task=step)
+        # Ownership must be durable before the message is consumable: worker
+        # restart recovery partitions running jobs by Job.queue.
+        queue = step_queue(step, project_id)
+        job = Job(project_id=project_id, task=step, queue=queue or "")
         session.add(job)
         try:
             session.commit()
@@ -471,7 +475,8 @@ def run_step(project_id: int, step: str):
             raise HTTPException(409, f"{step} was started concurrently")
         session.refresh(job)
         try:
-            async_result = celery.send_task(step, args=[job.id, project_id])
+            async_result = celery.send_task(
+                step, args=[job.id, project_id], queue=queue)
         except Exception as exc:
             job.status = "error"
             job.error = f"could not dispatch to worker: {exc}"

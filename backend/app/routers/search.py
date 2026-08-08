@@ -268,12 +268,16 @@ def rebuild_index():
         ).first()
         if existing:
             raise HTTPException(409, "search rebuild is already active")
-        job = Job(task="rebuild_search")
+        from ..tasks.common import embedding_queue
+
+        queue = embedding_queue()
+        job = Job(task="rebuild_search", queue=queue or "")
         session.add(job)
         session.commit()
         session.refresh(job)
         try:
-            result = celery.send_task("rebuild_search", args=[job.id])
+            result = celery.send_task("rebuild_search", args=[job.id],
+                                      queue=queue)
             job.celery_id = result.id
             session.add(job)
             session.commit()

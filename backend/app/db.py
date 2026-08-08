@@ -64,6 +64,7 @@ def _migrate(conn) -> None:
     _add_column(conn, "job", "diagnostics", "VARCHAR NOT NULL DEFAULT '{}'")
     _add_column(conn, "job", "paper_series_id", "INTEGER")
     _add_column(conn, "job", "paper_part_id", "INTEGER")
+    _add_column(conn, "job", "queue", "VARCHAR NOT NULL DEFAULT ''")
     for name in ("started", "finished", "heartbeat"):
         _add_column(conn, "job", name, "DATETIME")
     # Development builds may already have an early repository schema.  Keep

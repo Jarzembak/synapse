@@ -22,7 +22,7 @@ from ..local_model_safety import (
 )
 from ..models import Job
 from .celery_app import celery
-from .common import set_job, transition_job
+from .common import LOCAL_LLM_QUEUE, set_job, transition_job
 
 log = logging.getLogger("synapse.localmodels")
 
@@ -45,6 +45,7 @@ def _queue_automatic_benchmark(model: str) -> None:
                 task="ollama_benchmark",
                 progress=model,
                 options=json.dumps({"automatic": True}),
+                queue=LOCAL_LLM_QUEUE,
             )
             session.add(job)
             session.commit()
@@ -53,6 +54,7 @@ def _queue_automatic_benchmark(model: str) -> None:
                 result = celery.send_task(
                     "ollama_benchmark",
                     args=[job.id, model],
+                    queue=LOCAL_LLM_QUEUE,
                 )
                 job.celery_id = result.id
             except Exception as exc:

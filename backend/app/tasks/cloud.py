@@ -399,8 +399,13 @@ def _sync_all_bisync(job_id: int) -> None:
         session.refresh(rebuild)
         rebuild_id = rebuild.id
         search_id = None
+        search_queue = None
         if get_setting("search.semantic_enabled", False):
-            search_job = Job(project_id=None, task="rebuild_search")
+            from .common import embedding_queue
+
+            search_queue = embedding_queue()
+            search_job = Job(project_id=None, task="rebuild_search",
+                             queue=search_queue or "")
             session.add(search_job)
             session.commit()
             session.refresh(search_job)
@@ -409,11 +414,14 @@ def _sync_all_bisync(job_id: int) -> None:
         rebuild_sig = celery.signature(
             "rebuild_library", args=[rebuild_id, True], immutable=True)
         if search_id is not None:
-            # chain: embeddings must rebuild AFTER the vault reindex finishes
-            result = celery_chain(
-                rebuild_sig,
-                celery.signature("rebuild_search", args=[search_id], immutable=True),
-            ).apply_async()
+            # chain: embeddings must rebuild AFTER the vault reindex finishes;
+            # Ollama embeddings serialize on the local_llm queue like every
+            # other local-model workload
+            search_sig = celery.signature(
+                "rebuild_search", args=[search_id], immutable=True)
+            if search_queue:
+                search_sig = search_sig.set(queue=search_queue)
+            result = celery_chain(rebuild_sig, search_sig).apply_async()
         else:
             result = rebuild_sig.apply_async()
         with get_session() as session:
