@@ -174,7 +174,7 @@ def test_evidence_map_cache_reuses_structured_summary(monkeypatch):
 
 @pytest.mark.parametrize(("runtime_digest", "error_pattern"), [
     ("changed-map-digest", "changed digest"),
-    (None, "did not report a digest"),
+    (None, None),
 ])
 def test_repository_map_unverified_digest_does_not_write_cache(
     monkeypatch, runtime_digest, error_pattern,
@@ -248,8 +248,14 @@ def test_repository_map_unverified_digest_does_not_write_cache(
         "attempts": [{"status": "ok"}],
     })
 
-    with pytest.raises(RuntimeError, match=error_pattern):
-        repository_tasks._map_evidence(0, project.id, evidence)
+    if error_pattern:
+        with pytest.raises(RuntimeError, match=error_pattern):
+            repository_tasks._map_evidence(0, project.id, evidence)
+    else:
+        # a missing runtime digest keeps the completed output, skips the cache
+        summaries, _coverage = repository_tasks._map_evidence(
+            0, project.id, evidence)
+        assert len(summaries) == 1
 
     with get_session() as session:
         stored = session.get(RepositoryChunk, chunk_id)
@@ -1037,7 +1043,7 @@ def test_repository_reductions_are_cached_across_document_purposes(monkeypatch):
 
 @pytest.mark.parametrize(("runtime_digest", "error_pattern"), [
     ("changed-reducer-digest", "changed digest"),
-    (None, "did not report a digest"),
+    (None, None),
 ])
 def test_repository_reduction_unverified_digest_does_not_write_cache(
     monkeypatch, runtime_digest, error_pattern,
@@ -1064,15 +1070,92 @@ def test_repository_reduction_unverified_digest_does_not_write_cache(
         "attempts": [{"status": "ok"}],
     })
 
-    with pytest.raises(RuntimeError, match=error_pattern):
-        repository_tasks._hierarchical_context(
+    if error_pattern:
+        with pytest.raises(RuntimeError, match=error_pattern):
+            repository_tasks._hierarchical_context(
+                0, snapshot_id, summaries, "repo_inventory", {"cache": {}})
+    else:
+        # a missing runtime digest keeps the completed reductions, skips cache
+        context = repository_tasks._hierarchical_context(
             0, snapshot_id, summaries, "repo_inventory", {"cache": {}})
+        assert repository_tasks._nested_evidence_ids(context)
 
     with get_session() as session:
         rows = session.exec(select(RepositorySynthesisCache).where(
             RepositorySynthesisCache.snapshot_id == snapshot_id
         )).all()
         assert rows == []
+
+
+def test_repository_reduction_retries_single_empty_reply(monkeypatch):
+    """An empty reply on an over-limit singleton — where neither subdivision
+    nor passthrough can help — must be recovered by the in-place retry."""
+    _project, snapshot_id = _ready_snapshot("reduction-empty-retry")
+    summaries = _reduction_summaries(count=1, body_chars=1_500)
+    monkeypatch.setattr(repository_tasks, "_analysis_limits", _reduction_limits)
+    monkeypatch.setattr(
+        llm, "resolve_model", lambda _function: ("ollama", "flaky-reducer"))
+    monkeypatch.setattr(
+        repository_tasks,
+        "_installed_model_digest",
+        lambda _provider, _model, **_kwargs: "pinned-reducer-digest",
+    )
+    calls = {"count": 0}
+
+    def flaky_complete_json(_function, _system, user, **_kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise llm.EmptyResponseError(
+                "ollama/flaky-reducer returned an empty response")
+        return _reduction_reply(json.loads(user))
+
+    monkeypatch.setattr(llm, "complete_json", flaky_complete_json)
+    monkeypatch.setattr(llm, "last_call_diagnostics", lambda: {
+        "model_digest": "pinned-reducer-digest",
+        "attempts": [{"status": "ok"}],
+    })
+
+    context = repository_tasks._hierarchical_context(
+        0, snapshot_id, summaries, "repo_inventory", {"cache": {}})
+    assert calls["count"] == 2
+    assert repository_tasks._nested_evidence_ids(context) == {"EREDUCE0000"}
+
+
+def test_repository_reduction_singleton_empty_replies_fail_transparently(
+    monkeypatch,
+):
+    """A second consecutive empty reply gives up after exactly two calls with
+    the singleton boundary and the empty_response outcome."""
+    _project, snapshot_id = _ready_snapshot("reduction-empty-giveup")
+    summaries = _reduction_summaries(count=1, body_chars=1_500)
+    monkeypatch.setattr(repository_tasks, "_analysis_limits", _reduction_limits)
+    monkeypatch.setattr(
+        llm, "resolve_model", lambda _function: ("ollama", "flaky-reducer"))
+    monkeypatch.setattr(
+        repository_tasks,
+        "_installed_model_digest",
+        lambda _provider, _model, **_kwargs: "pinned-reducer-digest",
+    )
+    calls = {"count": 0}
+
+    def always_empty(_function, _system, _user, **_kwargs):
+        calls["count"] += 1
+        raise llm.EmptyResponseError(
+            "ollama/flaky-reducer returned an empty response")
+
+    monkeypatch.setattr(llm, "complete_json", always_empty)
+    monkeypatch.setattr(llm, "last_call_diagnostics", lambda: {
+        "model_digest": "pinned-reducer-digest",
+        "attempts": [{"status": "error", "error_type": "EmptyResponseError"}],
+    })
+
+    with pytest.raises(
+        RuntimeError,
+        match="single evidence summary cannot be reduced.*outcome=empty_response",
+    ):
+        repository_tasks._hierarchical_context(
+            0, snapshot_id, summaries, "repo_inventory", {"cache": {}})
+    assert calls["count"] == 2
 
 
 def test_repository_final_synthesis_missing_digest_does_not_write_artifact(
@@ -1694,6 +1777,40 @@ def test_repository_output_budget_failures_are_subdividable():
 
     assert repository_tasks._reduction_failure(error, {}) == (
         "output_budget", True)
+
+
+def test_repository_empty_reply_failures_are_subdividable():
+    from app.llm import EmptyResponseError
+
+    error = EmptyResponseError("ollama/fixture returned an empty response")
+
+    assert repository_tasks._reduction_failure(error, {}) == (
+        "empty_response", True)
+
+
+def test_execution_digest_verdicts():
+    require = repository_tasks._require_execution_digest
+
+    # a sentinel stage identity uses a later-learned digest without caching:
+    # the sentinel cache key must never hold known-weight output
+    assert require("ollama", "m", "digest_unavailable",
+                   {"model_digest": "sha256:now-known"}, stage="map") is False
+    # neither side observable: the sentinel-keyed cache signature exists for
+    # exactly this case and is recomputed once the digest becomes known
+    assert require("ollama", "m", "digest_unavailable", {}, stage="map") is True
+    # verified match: cacheable
+    assert require("ollama", "m", "sha256:pinned",
+                   {"model_digest": "sha256:pinned"}, stage="map") is True
+    # missing runtime digest: completed output is usable but not cacheable
+    assert require("ollama", "m", "sha256:pinned", {}, stage="map") is False
+    # a confirmed mid-stage weight change still refuses outright
+    with pytest.raises(RuntimeError, match="changed digest"):
+        require("ollama", "m", "sha256:pinned",
+                {"model_digest": "sha256:other"}, stage="map")
+    # final artifacts still demand verified provenance
+    with pytest.raises(RuntimeError, match="did not report a digest"):
+        require("ollama", "m", "sha256:pinned", {}, stage="final synthesis",
+                require_digest=True)
 
 
 def test_v4_upgrade_adds_repository_cache_and_diagnostics_without_losing_rows(

@@ -267,21 +267,51 @@ def _require_execution_digest(
     call: dict,
     *,
     stage: str,
-) -> None:
-    """Refuse to cache work executed by weights other than the stage identity."""
+    require_digest: bool = False,
+) -> bool:
+    """Refuse to cache work executed by weights other than the stage identity.
+
+    Returns whether the result may be persisted under the stage's cache
+    signature. A digest missing on either side is inventory visibility loss
+    (a transient /api/tags failure), not evidence of change, so the completed
+    output is still used — only verified work, or work keyed under the
+    recompute-later sentinel, is cached. Final artifacts pass
+    require_digest=True because their provenance must record verified weights.
+    """
     if provider != "ollama":
-        return
+        return True
     actual_digest = str(call.get("model_digest") or "").strip()
-    if expected_digest != "digest_unavailable" and not actual_digest:
-        raise RuntimeError(
-            f"Ollama model {model!r} did not report a digest during {stage}; "
-            "no repository cache entry or artifact was written; rerun the step"
-        )
-    if actual_digest and actual_digest != expected_digest:
+    if expected_digest == "digest_unavailable":
+        if actual_digest:
+            # The stage identity was never observed, so this real digest
+            # cannot be verified against it — and filing known-weight output
+            # under the unknown-weights cache key would let a later outage
+            # run reuse it against different installed weights.
+            log.warning(
+                "Ollama model %r reported a digest during %s but the stage "
+                "identity was unavailable; using the completed output "
+                "without writing a repository cache entry", model, stage)
+            return False
+        # Neither side is observable: the sentinel-keyed cache signature
+        # exists for exactly this case and is recomputed once known.
+        return True
+    if not actual_digest:
+        if require_digest:
+            raise RuntimeError(
+                f"Ollama model {model!r} did not report a digest during {stage}; "
+                "no repository cache entry or artifact was written; rerun the step"
+            )
+        log.warning(
+            "Ollama model %r did not report a digest during %s; using the "
+            "completed output without writing a repository cache entry",
+            model, stage)
+        return False
+    if actual_digest != expected_digest:
         raise RuntimeError(
             f"Ollama model {model!r} changed digest during {stage}; "
             "no repository cache entry was written; rerun the step"
         )
+    return True
 
 
 def _map_config_hash(
@@ -492,6 +522,7 @@ def _map_evidence(
     reused = 0
     legacy_reused = 0
     skipped_uncached = 0
+    unverified = 0
     max_new_calls = coverage["limits"]["max_new_map_calls"]
     _update_job_diagnostics(job_id, {
         "stage": "repository_map",
@@ -569,7 +600,7 @@ def _map_evidence(
                 max_tokens=1_600, provider=provider, model=model,
             )
             call = _last_llm_diagnostics()
-            _require_execution_digest(
+            cacheable = _require_execution_digest(
                 provider,
                 model,
                 model_digest,
@@ -593,14 +624,18 @@ def _map_evidence(
                 "cause": detail or outcome,
             })
             raise
-        with get_session() as session:
-            chunk = _chunk_for_item(session, item)
-            if chunk is None:
-                raise RuntimeError("repository evidence disappeared during analysis")
-            repository_store.set_chunk_summary(
-                session, chunk.id, text_value=summary["summary"],
-                data=summary, config_hash=item_config_hash)
-            session.commit()
+        if cacheable:
+            with get_session() as session:
+                chunk = _chunk_for_item(session, item)
+                if chunk is None:
+                    raise RuntimeError(
+                        "repository evidence disappeared during analysis")
+                repository_store.set_chunk_summary(
+                    session, chunk.id, text_value=summary["summary"],
+                    data=summary, config_hash=item_config_hash)
+                session.commit()
+        else:
+            unverified += 1
         summaries.append(summary)
         new_calls += 1
         call = _last_llm_diagnostics()
@@ -623,6 +658,11 @@ def _map_evidence(
             f"{legacy_reused} compatible pre-v5 leaf maps were reused. Their "
             "historical Ollama digest was not recorded; newly generated maps "
             "are pinned to the current model digest.")
+    if unverified:
+        coverage["warnings"].append(
+            f"{unverified} evidence summaries were generated while the Ollama "
+            "model digest could not be verified; they were used for this run "
+            "but not cached.")
     coverage["analyzed_evidence_chunks"] = len(summaries)
     coverage["skipped_evidence_chunks"] = len(evidence) - len(summaries)
     coverage["analyzed_files"] = len({item.get("path") for item in summaries})
@@ -630,6 +670,7 @@ def _map_evidence(
         "reused_chunk_summaries": reused,
         "new_chunk_summaries": new_calls,
         "legacy_chunk_summaries": legacy_reused,
+        "unverified_chunk_summaries": unverified,
         "summary_config_hash": config_hash,
     }
     coverage.setdefault("model_execution", {})["map"] = {
@@ -894,6 +935,10 @@ def _reduction_failure(exc: Exception, call: dict) -> tuple[str, bool]:
         return "invalid_structure", True
     if isinstance(exc, RepositoryReductionOversizedError):
         return "oversized", True
+    if exc.__class__.__name__ == "EmptyResponseError":
+        # sporadic with local models (see llm.EmptyResponseError); a smaller
+        # batch is a fresh sample, so subdivision is a real remedy
+        return "empty_response", True
     if exc.__class__.__name__ == "ContextWindowError":
         return "context_window", True
     if exc.__class__.__name__ == "OutputBudgetError":
@@ -1003,18 +1048,32 @@ def _reduce_batch_adaptive(
     level_state["model_calls"] = int(
         level_state.get("model_calls") or 0) + 1
     try:
-        raw = llm.complete_json(
-            "repository_reduce",
-            get_prompt("repository_reduce"),
-            input_json,
-            max_tokens=max_tokens,
-            provider=provider,
-            model=model,
-            retries=0,
-            transient_attempts=1,
-        )
+        for empty_retry in range(2):
+            try:
+                raw = llm.complete_json(
+                    "repository_reduce",
+                    get_prompt("repository_reduce"),
+                    input_json,
+                    max_tokens=max_tokens,
+                    provider=provider,
+                    model=model,
+                    retries=0,
+                    transient_attempts=1,
+                )
+                break
+            except llm.EmptyResponseError:
+                # transient_attempts=1 keeps timeout recovery on the
+                # subdivision ladder, but an empty reply returns fast and can
+                # hit a singleton batch subdivision cannot help — one cheap
+                # in-place retry before the failure classifier sees it
+                if empty_retry:
+                    raise
+                log.warning(
+                    "repository reduction level %s batch %s/%s returned an "
+                    "empty reply; retrying the batch once",
+                    level, batch_number, batch_count)
         call = _last_llm_diagnostics()
-        _require_execution_digest(
+        cacheable = _require_execution_digest(
             provider,
             model,
             model_digest,
@@ -1106,8 +1165,12 @@ def _reduce_batch_adaptive(
             f"detail={detail or str(exc)[:_MAX_DIAGNOSTIC_DETAIL_CHARS]}"
         ) from exc
 
-    _store_reduction(
-        snapshot_id, batch, config_hash, provider, model, result)
+    if cacheable:
+        _store_reduction(
+            snapshot_id, batch, config_hash, provider, model, result)
+    else:
+        cache_state["reductions_unverified"] = int(
+            cache_state.get("reductions_unverified") or 0) + 1
     cache_state["reductions_new"] += 1
     level_state["model_reductions_accepted"] = int(
         level_state.get("model_reductions_accepted") or 0) + 1
@@ -1233,6 +1296,7 @@ def _hierarchical_context(
         "retained_leaf_maps": len(items),
         "reductions_reused": 0,
         "reductions_new": 0,
+        "reductions_unverified": 0,
         "singleton_passthroughs": 0,
     }
     _update_job_diagnostics(job_id, {
@@ -1407,6 +1471,12 @@ def _hierarchical_context(
         "cache": cache_state,
         "cause": "",
     })
+    unverified_reductions = int(cache_state.get("reductions_unverified") or 0)
+    if unverified_reductions:
+        coverage.setdefault("warnings", []).append(
+            f"{unverified_reductions} reductions ran while the Ollama model "
+            "digest could not be verified; their output was used for this "
+            "run but not cached.")
     return items
 
 
@@ -1749,6 +1819,7 @@ def generate_repository_document(job_id: int, project_id: int, *,
             writer_digest,
             call,
             stage="repository final synthesis",
+            require_digest=True,
         )
     except Exception as exc:
         call = _last_llm_diagnostics()
