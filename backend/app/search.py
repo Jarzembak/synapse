@@ -54,11 +54,12 @@ def embed_texts(values: list[str], model: str | None = None, *,
             requested_context=2_048,
             refresh=True,
         )
-        # Restricted embeddings must not inherit an outbound proxy. Keep public
-        # remote-Ollama compatibility while explicitly bypassing proxy env vars
-        # for the local-only path.
-        with httpx.Client(
-                trust_env=not local_only, follow_redirects=False) as client:
+        # Ollama is a local transport boundary — never route it through
+        # HTTP(S)_PROXY (see llm._ollama). A remote Ollama must be directly
+        # routable, exactly as the chat path has always required; inheriting
+        # the proxy here broke embeddings for Compose-internal hostnames
+        # whenever a corporate proxy leaked into the container.
+        with httpx.Client(trust_env=False, follow_redirects=False) as client:
             response = client.post(
                 f"{settings.ollama_base_url}/api/embed",
                 json={"model": selected_model, "input": values},

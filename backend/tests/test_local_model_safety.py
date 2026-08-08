@@ -636,6 +636,9 @@ def test_benchmark_is_single_bounded_json_probe_and_persisted(monkeypatch):
     calls = []
 
     class Response:
+        status_code = 200
+        text = ""
+
         def raise_for_status(self):
             return None
 
@@ -664,6 +667,7 @@ def test_benchmark_is_single_bounded_json_probe_and_persisted(monkeypatch):
     result = safety.run_compatibility_benchmark(row["name"])
     assert result["completion"] is True
     assert result["structured_json"] is True
+    assert ("client", {"trust_env": False}) in calls
     posts = [entry for entry in calls if entry[0] == "post"]
     assert len(posts) == 1
     assert posts[0][2]["options"] == {
@@ -672,9 +676,63 @@ def test_benchmark_is_single_bounded_json_probe_and_persisted(monkeypatch):
         "temperature": 0,
     }
     assert posts[0][2]["keep_alive"] == 0
+    # the probe must never spend its 48-token budget on hidden reasoning
+    assert posts[0][2]["think"] is False
     assert safety.model_catalog()["models"][0]["benchmark"][
         "structured_json"
     ] is True
+
+
+def test_benchmark_drops_think_flag_when_model_rejects_it(monkeypatch):
+    """Non-thinking models 400 on the flag; one retry without it, mirroring
+    llm._ollama's fallback."""
+    from app import local_model_safety as safety
+
+    row = _row()
+    _install_fixture(monkeypatch, row)
+    sent = []
+
+    class Rejected:
+        status_code = 400
+        text = 'registry model does not support thinking'
+
+        def raise_for_status(self):
+            raise AssertionError("the rejected response must not be used")
+
+        def json(self):
+            return {"error": self.text}
+
+    class Accepted:
+        status_code = 200
+        text = ""
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"message": {"content": '{"synapse_compatibility":true}'}}
+
+    class Client:
+        def __init__(self, **kwargs):
+            assert kwargs.get("trust_env") is False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def post(self, _url, *, json, timeout):
+            sent.append(dict(json))
+            return Rejected() if "think" in json else Accepted()
+
+    monkeypatch.setattr(safety.httpx, "Client", Client)
+    result = safety.run_compatibility_benchmark(row["name"])
+    assert result["completion"] is True
+    assert result["structured_json"] is True
+    assert len(sent) == 2
+    assert sent[0]["think"] is False
+    assert "think" not in sent[1]
 
 
 def test_post_pull_benchmark_invalidates_inventory_and_queues_separate_job(

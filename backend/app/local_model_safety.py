@@ -873,6 +873,12 @@ def run_compatibility_benchmark(model: str) -> dict:
         "stream": False,
         "format": "json",
         "keep_alive": 0,
+        # Qwen3-family defaults think by default and num_predict caps TOTAL
+        # generated tokens including the hidden reasoning trace — without
+        # this the 48-token budget is spent before any JSON appears and the
+        # recommended models get recorded as incompatible (llm._ollama sets
+        # the same flag for repository JSON).
+        "think": False,
         "options": {
             "num_ctx": 2_048,
             "num_predict": 48,
@@ -892,11 +898,19 @@ def run_compatibility_benchmark(model: str) -> dict:
     result = {"completion": False, "structured_json": False, "error": ""}
     try:
         with httpx.Client(trust_env=False) as client:
-            response = client.post(
-                f"{_base_url()}/api/chat",
-                json=payload,
-                timeout=httpx.Timeout(90, connect=10),
-            )
+            for _ in range(2):
+                response = client.post(
+                    f"{_base_url()}/api/chat",
+                    json=payload,
+                    timeout=httpx.Timeout(90, connect=10),
+                )
+                # models without the thinking capability reject the flag
+                # outright; drop it and retry once (mirrors llm._ollama)
+                if (response.status_code == 400 and "think" in payload
+                        and "think" in response.text.lower()):
+                    payload.pop("think")
+                    continue
+                break
             response.raise_for_status()
             content = str((response.json().get("message") or {}).get("content") or "")
             result["completion"] = bool(content.strip())

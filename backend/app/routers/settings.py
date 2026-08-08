@@ -67,7 +67,8 @@ def provider_models():
     reports ok=False rather than erroring the whole endpoint."""
     out: dict[str, dict] = {}
     try:
-        response = httpx.get(f"{settings.ollama_base_url}/api/tags", timeout=3)
+        response = httpx.get(f"{settings.ollama_base_url}/api/tags", timeout=3,
+                             trust_env=False)
         response.raise_for_status()
         names = sorted(item.get("name", "") for item in response.json().get("models", []))
         out["ollama"] = {"configured": True, "ok": True,

@@ -87,6 +87,9 @@ def ollama_pull(job_id: int, model: str):
             # no read timeout: big models download for a long time between
             # progress lines; celery's task time limit is the backstop
             timeout=httpx.Timeout(None, connect=10),
+            # Ollama is a local transport boundary; HTTP(S)_PROXY must not
+            # redirect Compose-internal hostnames (see llm._ollama)
+            trust_env=False,
         ) as response:
             if response.status_code >= 400:
                 response.read()

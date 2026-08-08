@@ -1608,9 +1608,13 @@ def test_provider_models_endpoint(client, monkeypatch):
             return {"models": [{"name": "qwen3:8b"},
                                {"name": "nomic-embed-text:latest"}]}
 
-    monkeypatch.setattr(settings_router.httpx, "get",
-                        lambda url, **kw: FakeResponse())
+    seen_kwargs = []
+    monkeypatch.setattr(
+        settings_router.httpx, "get",
+        lambda url, **kw: seen_kwargs.append(kw) or FakeResponse())
     out = client.get("/api/settings/provider-models").json()
+    # local transport boundary: the dropdown must not route via HTTP(S)_PROXY
+    assert seen_kwargs[0]["trust_env"] is False
     assert out["ollama"]["ok"] is True
     assert out["ollama"]["models"] == ["nomic-embed-text:latest", "qwen3:8b"]
     # unconfigured providers are reported, not errors
@@ -1623,7 +1627,7 @@ def test_provider_models_endpoint_openai_compat(client, monkeypatch):
     from app.config import settings as app_settings
     from app.routers import settings as settings_router
 
-    def fake_get(url, headers=None, timeout=None):
+    def fake_get(url, headers=None, timeout=None, trust_env=None):
         class FakeResponse:
             @staticmethod
             def raise_for_status():
@@ -2291,7 +2295,7 @@ def test_ollama_pull_task_success_error_and_cancel(client, monkeypatch):
     streamed = []
     monkeypatch.setattr(
         localmodels.httpx, "stream",
-        lambda *a, **k: streamed.append(1) or fake_stream([
+        lambda *a, **k: streamed.append(k) or fake_stream([
             '{"status": "pulling manifest"}',
             '{"status": "downloading", "total": 100, "completed": 50}',
             '{"status": "success"}',
@@ -2305,6 +2309,8 @@ def test_ollama_pull_task_success_error_and_cancel(client, monkeypatch):
         assert job.status == "done"
         assert job.progress == "qwen3:8b: installed"
     assert automatic_benchmarks == ["qwen3:8b"]
+    # local transport boundary: a corporate proxy must not intercept pulls
+    assert streamed[0]["trust_env"] is False
 
     # an error line in the stream fails the job with Ollama's message
     monkeypatch.setattr(
