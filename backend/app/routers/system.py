@@ -89,7 +89,8 @@ def _ollama_models() -> list[dict]:
     """Resident models from Ollama's /api/ps, with a GPU/CPU/hybrid tag derived
     from how much of each model is loaded into VRAM."""
     try:
-        r = httpx.get(f"{settings.ollama_base_url}/api/ps", timeout=1.5)
+        r = httpx.get(f"{settings.ollama_base_url}/api/ps", timeout=1.5,
+                      trust_env=False)
         r.raise_for_status()
         out = []
         for m in r.json().get("models", []):
@@ -362,7 +363,8 @@ def _preflight() -> dict:
         add(command, bool(path), path or "not installed", required=command != "rclone")
     ollama_models: list[str] | None = None
     try:
-        response = httpx.get(f"{settings.ollama_base_url}/api/tags", timeout=2)
+        response = httpx.get(f"{settings.ollama_base_url}/api/tags", timeout=2,
+                             trust_env=False)
         response.raise_for_status()
         ollama_models = [item.get("name", "") for item in response.json().get("models", [])]
         add("ollama", True, f"{len(ollama_models)} model(s) installed", required=False)
