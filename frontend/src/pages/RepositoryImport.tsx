@@ -340,14 +340,17 @@ export default function RepositoryImport() {
               <li><b>Immutable:</b> this analysis is pinned to <code>{shortSha(inspection.source.commit_sha)}</code>.</li>
               <li><b>Secrets:</b> likely credentials are excluded before model context is built and their values are never displayed.</li>
               <li>
-                <b>Local-only:</b> public and private repository excerpts stay on this machine.
-                {" "}Mapping and final writing are forced through Ollama
+                <b>Local-only by default:</b> repository excerpts stay on this machine unless
+                you later enable cloud analysis from the project page (private repositories
+                require typed consent, revoked automatically on visibility changes).
+                {" "}Until then, mapping and final writing are forced through Ollama
                 {inspection.local_model ? <> using <code>{inspection.local_model}</code></> : null},
                 {" "}and hierarchical reductions use
                 {inspection.reduce_model
                   ? <> <code>{inspection.reduce_model}</code></>
                   : " the configured local reducer"},
-                regardless of the global model matrix, and derived artifacts are not cloud-synced.
+                regardless of the global model matrix. Derived artifacts are never cloud-synced
+                either way.
               </li>
               <li><b>Git features:</b> submodules and Git LFS pointers are reported but their contents are not fetched.</li>
             </ul>

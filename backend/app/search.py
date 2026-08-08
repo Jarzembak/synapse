@@ -235,6 +235,8 @@ def repository_fts_chunks(session: Session, query: str, project_id: int,
 def repository_results(session: Session, query: str, project_id: int,
                        limit: int = 12) -> list[dict]:
     """Render line-addressed results from a repository's active snapshot."""
+    from .repository import source_cloud_restricted
+
     source = session.exec(
         select(RepositorySource).where(RepositorySource.project_id == project_id)
     ).first()
@@ -298,7 +300,7 @@ def repository_results(session: Session, query: str, project_id: int,
             },
             "excerpt": chunk.body,
             "tags": [],
-            "restricted": bool(source.local_only or source.is_private),
+            "restricted": source_cloud_restricted(source),
             "score": 1.4 / (60 + position),
         })
     out.sort(key=lambda item: item["score"], reverse=True)
@@ -600,7 +602,9 @@ def hybrid_chunks(session: Session, query: str, limit: int = 12,
             "source_kind": "artifact",
             "restricted": bool(
                 library.artifact_is_restricted(session, artifact)
-                or library.artifact_is_repository_derived(session, artifact)),
+                or (library.artifact_is_repository_derived(session, artifact)
+                    and library.project_is_restricted(
+                        session, artifact.project_id))),
             "score": scores[chunk.id],
         })
     out.extend(repo_out)

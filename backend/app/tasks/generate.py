@@ -367,8 +367,9 @@ def tag_project(project_id: int):
         if project and project.source_type == "github":
             from ..repository import repository_processing_policy
 
-            repository_processing_policy(project_id)
-            policy_local = True
+            # fail-closed at start; False (public or consented private)
+            # leaves tag calls to the per-call DB policy
+            policy_local = bool(repository_processing_policy(project_id))
         elif project and project.source_type == "paper":
             with get_session() as policy_session:
                 policy_local = library.project_is_restricted(

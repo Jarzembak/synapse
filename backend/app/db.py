@@ -69,8 +69,14 @@ def _migrate(conn) -> None:
     # Development builds may already have an early repository schema.  Keep
     # these additive migrations idempotent so those databases remain usable.
     if _columns(conn, "repositorysource"):
-        _add_column(conn, "repositorysource", "local_only", "BOOLEAN NOT NULL DEFAULT 1")
-        conn.exec_driver_sql("UPDATE repositorysource SET local_only=1")
+        if "local_only" not in _columns(conn, "repositorysource"):
+            # Backfill exactly once, when the column is first created. This
+            # UPDATE used to run on every startup pass, which would now wipe
+            # the cloud-consent endpoint's opt-outs at every boot.
+            conn.exec_driver_sql(
+                'ALTER TABLE "repositorysource" ADD COLUMN "local_only" '
+                "BOOLEAN NOT NULL DEFAULT 1")
+            conn.exec_driver_sql("UPDATE repositorysource SET local_only=1")
         _add_column(conn, "repositorysource", "pending_sha", "VARCHAR NOT NULL DEFAULT ''")
         _add_column(conn, "repositorysource", "current_snapshot_id", "INTEGER")
         _add_column(conn, "repositorysource", "description", "VARCHAR NOT NULL DEFAULT ''")
@@ -78,6 +84,8 @@ def _migrate(conn) -> None:
         _add_column(conn, "repositorysource", "exclude_paths", "VARCHAR NOT NULL DEFAULT '[]'")
         _add_column(conn, "repositorysource", "coverage_preview", "VARCHAR NOT NULL DEFAULT '{}'")
         _add_column(conn, "repositorysource", "cloud_purge_pending",
+                    "BOOLEAN NOT NULL DEFAULT 0")
+        _add_column(conn, "repositorysource", "cloud_consent",
                     "BOOLEAN NOT NULL DEFAULT 0")
     if _columns(conn, "repositorysnapshot"):
         _add_column(conn, "repositorysnapshot", "archive_bytes", "INTEGER NOT NULL DEFAULT 0")

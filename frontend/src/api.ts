@@ -119,6 +119,8 @@ export interface GitHubSource {
   private?: boolean;
   is_private?: boolean;
   local_only?: boolean;
+  cloud_consent?: boolean;
+  restricted?: boolean;
   default_branch: string;
   requested_ref?: string | null;
   resolved_ref?: string;

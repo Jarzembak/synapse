@@ -549,3 +549,191 @@ def test_restricted_markdown_neutralizes_parser_and_obsidian_bypasses():
     assert "```text" in clean and "```dataviewjs" not in clean
     assert "$=" not in clean and "&#36;=" in clean
     assert "<!--E:ABC123-->" in clean
+
+
+def _consent_project(slug: str, *, private: bool = True):
+    with get_session() as session:
+        project = Project(
+            slug=slug, title=slug, source=f"https://github.com/example/{slug}",
+            source_type="github")
+        session.add(project)
+        session.commit()
+        session.refresh(project)
+        source = RepositorySource(
+            project_id=project.id, owner="example", repository=slug,
+            canonical_url=project.source, requested_ref="main",
+            default_branch="main", is_private=private, local_only=True)
+        session.add(source)
+        session.commit()
+        session.refresh(project)
+        session.refresh(source)
+        session.expunge(project)
+        session.expunge(source)
+        return project, source
+
+
+def test_source_cloud_restricted_fails_closed():
+    from types import SimpleNamespace
+
+    restricted = repository.source_cloud_restricted
+    assert restricted(SimpleNamespace()) is True  # nothing known: restricted
+    assert restricted(SimpleNamespace(
+        local_only=False, is_private=False)) is False  # opted-out public
+    assert restricted(SimpleNamespace(
+        local_only=False, is_private=True)) is True  # private without consent
+    assert restricted(SimpleNamespace(
+        local_only=False, is_private=True, cloud_consent=True)) is False
+    assert restricted(SimpleNamespace(
+        local_only=True, is_private=True, cloud_consent=True)) is True
+
+
+def test_private_repo_cloud_consent_flow(client):
+    from app import llm
+
+    project, source = _consent_project(f"consent-{uuid.uuid4().hex[:8]}")
+
+    denied = client.post(f"/api/repositories/{project.id}/cloud-consent",
+                         json={"enabled": True})
+    assert denied.status_code == 422
+    denied = client.post(f"/api/repositories/{project.id}/cloud-consent",
+                         json={"enabled": True, "confirmation": "wrong/name"})
+    assert denied.status_code == 422
+
+    granted = client.post(
+        f"/api/repositories/{project.id}/cloud-consent",
+        json={"enabled": True,
+              "confirmation": f"example/{source.repository}"})
+    assert granted.status_code == 200
+    payload = granted.json()["source"]
+    assert payload["cloud_consent"] is True
+    assert payload["local_only"] is False
+    assert payload["restricted"] is False
+
+    # the LLM privacy boundary honors the recorded consent
+    with llm.project_scope(project.id):
+        assert llm._project_local_only() is False
+
+    # revocation restores the fail-closed default
+    revoked = client.post(f"/api/repositories/{project.id}/cloud-consent",
+                          json={"enabled": False})
+    assert revoked.status_code == 200
+    payload = revoked.json()["source"]
+    assert payload["cloud_consent"] is False
+    assert payload["restricted"] is True
+    with llm.project_scope(project.id):
+        assert llm._project_local_only() is True
+
+
+def test_cloud_consent_refused_while_jobs_active(client):
+    from app.models import Job
+
+    project, source = _consent_project(f"consent-busy-{uuid.uuid4().hex[:8]}")
+    with get_session() as session:
+        job = Job(project_id=project.id, task="repo_inventory",
+                  status="running")
+        session.add(job)
+        session.commit()
+        session.refresh(job)
+        job_id = job.id
+
+    try:
+        response = client.post(
+            f"/api/repositories/{project.id}/cloud-consent",
+            json={"enabled": True,
+                  "confirmation": f"example/{source.repository}"})
+        assert response.status_code == 409
+    finally:
+        # the running row must not leak into later module-scoped tests
+        with get_session() as session:
+            job = session.get(Job, job_id)
+            job.status = "done"
+            session.add(job)
+            session.commit()
+
+
+def test_visibility_change_revokes_cloud_consent(client, monkeypatch):
+    project, source = _consent_project(f"consent-flip-{uuid.uuid4().hex[:8]}")
+    client.post(
+        f"/api/repositories/{project.id}/cloud-consent",
+        json={"enabled": True,
+              "confirmation": f"example/{source.repository}"})
+
+    # unchanged visibility keeps consent (privacy-event sticky)
+    monkeypatch.setattr(repository, "_github_json",
+                        lambda *a, **k: {"private": True})
+    with get_session() as session:
+        stored = session.exec(select(RepositorySource).where(
+            RepositorySource.project_id == project.id)).first()
+        policy = repository._refresh_repository_visibility(
+            session, stored, "token")
+    assert policy["cloud_consent"] is True
+    assert policy["restricted"] is False
+
+    # a visibility flip revokes it and fails back to local-only
+    monkeypatch.setattr(repository, "_github_json",
+                        lambda *a, **k: {"private": False})
+    with get_session() as session:
+        stored = session.exec(select(RepositorySource).where(
+            RepositorySource.project_id == project.id)).first()
+        policy = repository._refresh_repository_visibility(
+            session, stored, "token")
+    assert policy["cloud_consent"] is False
+    assert policy["restricted"] is True
+
+
+def test_migration_backfill_does_not_wipe_consent_optout():
+    from app.db import _migrate, engine
+
+    project, _source = _consent_project(
+        f"consent-boot-{uuid.uuid4().hex[:8]}", private=False)
+    with get_session() as session:
+        stored = session.exec(select(RepositorySource).where(
+            RepositorySource.project_id == project.id)).first()
+        stored.local_only = False
+        session.add(stored)
+        session.commit()
+
+    # the startup migration pass must never re-ratchet stored opt-outs
+    with engine.begin() as conn:
+        _migrate(conn)
+
+    with get_session() as session:
+        stored = session.exec(select(RepositorySource).where(
+            RepositorySource.project_id == project.id)).first()
+        assert stored.local_only is False
+
+
+def test_consent_enable_lifts_project_artifact_restriction(client):
+    from app.models import Artifact
+
+    project, source = _consent_project(f"consent-lift-{uuid.uuid4().hex[:8]}")
+    with get_session() as session:
+        artifact = Artifact(
+            project_id=project.id, type="deepdive_merged", title="Guide",
+            path=f"projects/{project.slug}/deepdive.md",
+            restricted=True, repository_derived=True)
+        session.add(artifact)
+        session.commit()
+        session.refresh(artifact)
+        artifact_id = artifact.id
+
+    granted = client.post(
+        f"/api/repositories/{project.id}/cloud-consent",
+        json={"enabled": True,
+              "confirmation": f"example/{source.repository}"})
+    assert granted.status_code == 200
+
+    with get_session() as session:
+        stored = session.get(Artifact, artifact_id)
+        # the sticky pre-consent flag lifts so regenerated artifacts and Q&A
+        # follow the new policy...
+        assert stored.restricted is False
+        # ...but cloud-sync exclusion for repository-derived content stays
+        assert stored.repository_derived is True
+
+    revoked = client.post(f"/api/repositories/{project.id}/cloud-consent",
+                          json={"enabled": False})
+    assert revoked.status_code == 200
+    with get_session() as session:
+        stored = session.get(Artifact, artifact_id)
+        assert stored.restricted is True

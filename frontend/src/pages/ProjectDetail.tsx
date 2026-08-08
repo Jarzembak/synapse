@@ -111,6 +111,7 @@ export default function ProjectDetail() {
   const [repositoryError, setRepositoryError] = useState("");
   const [checkingUpdate, setCheckingUpdate] = useState(false);
   const [updatingRepository, setUpdatingRepository] = useState(false);
+  const [updatingConsent, setUpdatingConsent] = useState(false);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState("");
   const [actionError, setActionError] = useState("");
@@ -426,6 +427,48 @@ export default function ProjectDetail() {
     }
   }
 
+  async function setCloudConsent(enabled: boolean) {
+    if (!repository) return;
+    const source = repository.source;
+    let confirmation = "";
+    const isPrivate = source.private || source.is_private
+      || source.privacy === "private";
+    if (enabled && isPrivate) {
+      const typed = prompt(
+        "Cloud analysis sends this PRIVATE repository's content to the "
+        + "configured cloud providers.\n\nType "
+        + source.full_name
+        + " to confirm. Consent is revoked automatically if the repository's "
+        + "visibility changes.",
+      );
+      if (typed === null) return;
+      confirmation = typed.trim();
+    } else if (!enabled) {
+      const confirmed = confirm(
+        "Disable cloud analysis? The project returns to local-only "
+        + "processing and formerly-eligible cloud copies are purged.",
+      );
+      if (!confirmed) return;
+    }
+    beginAction();
+    setUpdatingConsent(true);
+    try {
+      await api(`/repositories/${id}/cloud-consent`, {
+        method: "POST",
+        body: JSON.stringify({ enabled, confirmation }),
+      });
+      if (!isCurrentRoute()) return;
+      setNotice(enabled
+        ? "Cloud analysis enabled: cloud-default steps (deep dives, merge, quick references) may use frontier providers on the next run."
+        : "Cloud analysis disabled: this repository is local-only again.");
+      await load();
+    } catch (caught) {
+      if (isCurrentRoute()) setActionError(`Cloud policy change failed: ${errorMessage(caught)}`);
+    } finally {
+      if (isCurrentRoute()) setUpdatingConsent(false);
+    }
+  }
+
   if (!detail || detail.project.id !== Number(id)) {
     return (
       <section className="loading-state" aria-live="polite">
@@ -548,6 +591,9 @@ export default function ProjectDetail() {
                 <a href={repository.source.canonical_url ?? repository.source.url}
                   target="_blank" rel="noreferrer">{repository.source.full_name}</a>
                 <span>{repository.source.private || repository.source.privacy === "private" ? "Private" : "Public"}</span>
+                <span>{repository.source.restricted === false
+                  ? "Cloud analysis enabled"
+                  : "Local-only processing"}</span>
                 <span>Ref <b>{repository.source.requested_ref || repository.source.resolved_ref || repository.source.default_branch}</b></span>
                 <span>Commit <code>{shortSha(repository.snapshot.commit_sha || repository.source.commit_sha)}</code></span>
               </>
@@ -573,6 +619,17 @@ export default function ProjectDetail() {
               disabled={checkingUpdate || updatingRepository}>
               {checkingUpdate ? "Checking..." : "Check for updates"}
             </button>
+            {repository && (
+              <button type="button"
+                onClick={() => void setCloudConsent(repository.source.restricted !== false)}
+                disabled={updatingConsent || updatingRepository}>
+                {updatingConsent
+                  ? "Updating policy..."
+                  : repository.source.restricted === false
+                    ? "Disable cloud analysis"
+                    : "Enable cloud analysis"}
+              </button>
+            )}
             {hasRepositoryUpdate(repository?.update) && (
               <button type="button" className="primary" onClick={() => void updateRepositorySnapshot()}
                 disabled={updatingRepository}>
