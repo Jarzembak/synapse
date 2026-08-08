@@ -1686,6 +1686,16 @@ def test_repository_model_safety_outcomes_are_precise(code, outcome):
     assert repository_tasks._reduction_failure(error, {}) == (outcome, False)
 
 
+def test_repository_output_budget_failures_are_subdividable():
+    from app.llm import OutputBudgetError
+
+    error = OutputBudgetError(
+        model="fixture", max_tokens=1_600, visible_output=True)
+
+    assert repository_tasks._reduction_failure(error, {}) == (
+        "output_budget", True)
+
+
 def test_v4_upgrade_adds_repository_cache_and_diagnostics_without_losing_rows(
         tmp_path):
     upgrade_engine = create_engine(f"sqlite:///{tmp_path / 'v4-repository.sqlite3'}")

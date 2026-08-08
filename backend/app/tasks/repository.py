@@ -896,6 +896,11 @@ def _reduction_failure(exc: Exception, call: dict) -> tuple[str, bool]:
         return "oversized", True
     if exc.__class__.__name__ == "ContextWindowError":
         return "context_window", True
+    if exc.__class__.__name__ == "OutputBudgetError":
+        # smaller reduce batches need shorter merged summaries, so the same
+        # subdivision that fixes an over-full context fixes an over-full
+        # output budget
+        return "output_budget", True
     text_parts = [exc.__class__.__name__, str(exc)]
     for attempt in call.get("attempts", []) if isinstance(call, dict) else []:
         if isinstance(attempt, dict):
