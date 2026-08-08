@@ -373,7 +373,10 @@ def set_model(function: str, req: ModelOverride):
     if provider == "ollama":
         requested_context = int(advanced("local")["num_ctx"])
         if function.startswith(("repository_", "paper_")):
-            requested_context = max(requested_context, 65_536)
+            # Same 32K admission policy as the repository settings endpoint:
+            # calls size context to the actual prompt, so gating on the pre-v2
+            # 65,536 worst case rejected models whose real requests fit fine.
+            requested_context = max(requested_context, 32_768)
         try:
             safety = ensure_model_safe(
                 model,
