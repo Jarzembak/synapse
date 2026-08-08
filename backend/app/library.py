@@ -162,11 +162,12 @@ def project_is_restricted(session: Session, project_id: int | None) -> bool:
     if project.source_type != "github":
         return False
     try:
-        from .repository import repository_source_for_project
+        from .repository import (
+            repository_source_for_project, source_cloud_restricted)
 
         source = repository_source_for_project(session, project_id)
         # Missing policy for a GitHub project fails closed.
-        return source is None or bool(source.local_only or source.is_private)
+        return source is None or source_cloud_restricted(source)
     except Exception:
         return True
 
@@ -250,6 +251,34 @@ def mark_project_restricted(session: Session, project_id: int) -> int:
             session.add(tag)
     session.flush()
     return marked
+
+
+def mark_project_unrestricted(session: Session, project_id: int) -> int:
+    """Lift DB restriction from a project's own artifacts after cloud consent.
+
+    Shared quick references stay sticky-restricted: they may merge material
+    from other, still-restricted projects. Bodies sanitized while restricted
+    are not restored here — regenerating an artifact rewrites it from source.
+    ``repository_derived`` (cloud-sync exclusion) and tag restriction are
+    deliberately untouched: consent covers providers, not vault sync or the
+    cross-project tag vocabulary.
+    """
+    contributed_paths = set(session.exec(
+        select(QuickRef.path)
+        .join(QuickRefSource, QuickRefSource.quickref_id == QuickRef.id)
+        .where(QuickRefSource.project_id == project_id)
+    ).all())
+    cleared = 0
+    for artifact in session.exec(
+            select(Artifact).where(Artifact.project_id == project_id)).all():
+        if artifact.path in contributed_paths:
+            continue
+        if getattr(artifact, "restricted", False):
+            artifact.restricted = False
+            session.add(artifact)
+            cleared += 1
+    session.flush()
+    return cleared
 
 
 def sanitize_project_artifacts(project_id: int) -> None:
@@ -539,15 +568,15 @@ def write_artifact(
         if project.source_type == "github":
             project_repository_derived = True
             try:
-                from .repository import repository_source_for_project
+                from .repository import (
+                    repository_source_for_project, source_cloud_restricted)
 
                 source = repository_source_for_project(session, project_id)
                 # Missing policy metadata fails closed.  Once restricted, an
                 # artifact remains restricted even if a later contributor is
                 # public (important for shared quick-reference paths).
-                project_restricted = source is None or bool(
-                    getattr(source, "local_only", False)
-                    or getattr(source, "is_private", getattr(source, "private", False)))
+                project_restricted = (
+                    source is None or source_cloud_restricted(source))
                 if not project_restricted:
                     from . import llm
 

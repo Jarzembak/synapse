@@ -114,12 +114,15 @@ def pipeline_task(fn):
                     and fn.__name__ != "repo_snapshot"):
                 from ..repository import repository_processing_policy
 
-                # Repository analysis is deliberately local-only in v1 for
-                # public and private sources alike. Visibility refresh still
-                # escalates durable privacy, but no timing race can expose a
-                # repository excerpt to a cloud model.
-                repository_processing_policy(project_id)
-                local_only_policy = True
+                # Fail-closed policy check at job start: the visibility
+                # refresh escalates durable privacy first, so no timing race
+                # can expose a repository excerpt to a cloud model. True pins
+                # the whole job local; False (public or explicitly consented
+                # private) falls through to the per-call DB policy, which
+                # re-checks consent on every completion.
+                local_only_policy = (
+                    True if repository_processing_policy(project_id)
+                    else None)
             elif policy_project and policy_project.source_type == "paper":
                 from sqlmodel import select
 

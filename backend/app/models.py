@@ -241,6 +241,11 @@ class RepositorySource(SQLModel, table=True):
     default_branch: str = ""
     is_private: bool = Field(default=False, index=True)
     local_only: bool = Field(default=True, index=True)
+    # Explicit, revocable user consent to run this PRIVATE repository's
+    # analysis on configured cloud providers. Never set implicitly: only the
+    # typed-confirmation consent endpoint may enable it, and any visibility
+    # transition revokes it. Public repositories don't consult it.
+    cloud_consent: bool = Field(default=False, index=True)
     credential_ref: str = ""
     include_paths: str = "[]"  # JSON list of relative glob/prefix filters
     exclude_paths: str = "[]"  # JSON list of relative glob/prefix filters

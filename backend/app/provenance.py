@@ -291,9 +291,10 @@ def effective_config(step: str, project: Project | None = None) -> dict:
     functions = REPOSITORY_STEP_FUNCTION if repository else STEP_FUNCTION
     function = functions.get(step)
     if function:
-        with llm.project_scope(
-                project.id if project else None,
-                local_only=(True if repository else None)):
+        # local_only=None lets the scoped DB policy decide, so a consented
+        # repository records the provider its calls actually use instead of
+        # a hardcoded local claim.
+        with llm.project_scope(project.id if project else None):
             provider, model = llm.resolve_model(function)
         value.update({
             "function": function,
@@ -348,7 +349,7 @@ def effective_config(step: str, project: Project | None = None) -> dict:
     if repository:
         from .tasks.repository import repository_analysis_signature
 
-        with llm.project_scope(project.id, local_only=True):
+        with llm.project_scope(project.id):
             map_provider, map_model = llm.resolve_model("repository_map")
             reduce_provider, reduce_model = llm.resolve_model("repository_reduce")
         value["repository"] = {

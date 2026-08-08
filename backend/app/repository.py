@@ -507,6 +507,20 @@ def preflight_repository(value: str, ref: str = "", *,
     }
 
 
+def source_cloud_restricted(source) -> bool:
+    """Single source of truth for repository cloud policy.
+
+    Restricted (local-only) unless the user cleared local_only AND — for a
+    private repository — recorded explicit cloud consent through the typed
+    consent endpoint. Missing attributes fail closed: a row without policy
+    fields must never become cloud-eligible by accident.
+    """
+    local_only = bool(getattr(source, "local_only", True))
+    private = bool(getattr(source, "is_private", True))
+    consent = bool(getattr(source, "cloud_consent", False))
+    return local_only or (private and not consent)
+
+
 def _refresh_repository_visibility(session: Session, source: RepositorySource,
                                    token: str) -> dict:
     """Refresh mutable GitHub visibility before any new source is accepted.
@@ -526,20 +540,30 @@ def _refresh_repository_visibility(session: Session, source: RepositorySource,
         raise RepositoryError("GitHub returned repository metadata without visibility")
     prior_private = bool(source.is_private)
     prior_local_only = bool(source.local_only)
+    prior_restricted = source_cloud_restricted(source)
     source.is_private = visibility
-    source.local_only = True
+    if prior_private != visibility:
+        # A privacy-relevant transition revokes any standing cloud consent
+        # and fails back to local-only until the user re-consents. Ordinary
+        # updates of an unchanged-visibility source keep the stored policy.
+        source.cloud_consent = False
+        source.local_only = True
+    elif visibility and not source.cloud_consent:
+        # unconsented private sources keep the v1 ratchet
+        source.local_only = True
     if visibility:
         if not token:
             raise RepositoryError(
                 "this private repository requires a configured read-only GitHub credential")
         source.credential_ref = GITHUB_CREDENTIAL_KEY
-        if (not prior_private and not prior_local_only and
-                (get_setting("cloud.provider") or get_setting("cloud.last_sync"))):
+        if (not prior_restricted and
+                (get_setting("cloud.provider") or get_setting("cloud.last_sync"))
+                and source_cloud_restricted(source)):
             source.cloud_purge_pending = True
     source.updated = utcnow()
     session.add(source)
     session.flush()
-    if source.local_only or visibility:
+    if source_cloud_restricted(source):
         from . import library
 
         newly_restricted = library.mark_project_restricted(
@@ -565,7 +589,9 @@ def _refresh_repository_visibility(session: Session, source: RepositorySource,
                 log.exception("could not queue pending cloud privacy purge")
     return {
         "is_private": visibility,
-        "local_only": bool(source.local_only or visibility),
+        "local_only": bool(source.local_only),
+        "cloud_consent": bool(source.cloud_consent),
+        "restricted": source_cloud_restricted(source),
         "privacy_changed": prior_private != visibility,
         "cloud_purge_pending": bool(source.cloud_purge_pending),
     }
@@ -639,12 +665,12 @@ def repository_processing_policy(project_id: int) -> bool:
         source = repository_source_for_project(session, project_id)
         if source is None:
             return True
-        if source.is_private or source.local_only:
+        if source_cloud_restricted(source):
             return True
         try:
             policy = _refresh_repository_visibility(
                 session, source, get_github_token())
-            return bool(policy["local_only"] or policy["is_private"])
+            return bool(policy["restricted"])
         except Exception as exc:
             session.rollback()
             log.warning(
@@ -2177,7 +2203,8 @@ def scan_repository_snapshot(session: Session, source: RepositorySource,
     source.current_snapshot_id = snapshot.id
     if (source.pending_sha or "").lower() == snapshot.resolved_sha:
         source.pending_sha = ""
-    source.local_only = bool(source.is_private) or source.local_only
+    source.local_only = source.local_only or (
+        source.is_private and not source.cloud_consent)
     source.updated = utcnow()
     session.add(snapshot)
     session.add(source)

@@ -117,9 +117,9 @@ def _project_local_only() -> bool:
                 # must not become cloud-eligible by accident.
                 if source is None:
                     return True
-                private = bool(getattr(source, "is_private",
-                                       getattr(source, "private", False)))
-                return private or bool(getattr(source, "local_only", False))
+                from .repository import source_cloud_restricted
+
+                return source_cloud_restricted(source)
             if project.source_type == "paper":
                 from .models import PaperSource
 

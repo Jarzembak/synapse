@@ -280,7 +280,7 @@ def _active_local_model_jobs() -> list[dict]:
             from .. import llm
 
             local_only = (
-                True
+                None  # scoped DB policy decides; consent-aware for repos
                 if project and project.source_type == "github"
                 else paper_local_only.get(project.id, True)
                 if project and project.source_type == "paper"
