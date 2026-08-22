@@ -324,7 +324,7 @@ websockets==16.1
     #   -r requirements.txt
     #   google-genai
     #   uvicorn
-yt-dlp==2026.7.4
+yt-dlp==2026.8.19
     # via -r requirements.txt
 
 # The following packages are considered to be unsafe in a requirements file:
