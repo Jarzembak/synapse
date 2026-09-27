@@ -107,7 +107,7 @@ services:
   # its profile, X display, and viewer connections are discarded after one
   # session by restarting the container.
   auth-browser:
-    image: selenium/standalone-chromium:151.0-20260808@sha256:1d3d834a2ce93f26cc0d0ae3c61abd189755b32649f5c356c6c5cf9502aa397e
+    image: selenium/standalone-chromium:152.0-20260909@sha256:08fd293648e126275782c616a61f4ee1d90cf413b1972ebc35dbd054d6789f55
     shm_size: 2gb
     environment:
       - SE_NODE_MAX_SESSIONS=1
