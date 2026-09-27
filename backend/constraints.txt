@@ -234,7 +234,7 @@ requests==2.34.2
     # via
     #   google-auth
     #   google-genai
-rfc3986==1.5.0
+rfc3986==2.0.0
     # via csvw
 rich==15.0.0
     # via curl-cffi
