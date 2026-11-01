@@ -1,4 +1,4 @@
-FROM python:3.12-slim@sha256:423ed6ab25b1921a477529254bfeeabf5855151dc2c3141699a1bfc852199fbf
+FROM python:3.15-slim@sha256:94d3426f1def7db4a106a232ac121bfd975393e5dfd40a619b955fae45fe7913
 
 # Tesseract CLI is Docling's OCR fallback. Install only the four v1 language
 # packs plus the native libraries required by the CPU layout/table models.
